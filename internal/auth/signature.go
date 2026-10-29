@@ -1,0 +1,211 @@
+package auth
+
+import (
+	"crypto/ed25519"
+	"crypto/sha256"
+	"crypto/x509"
+	"encoding/base64"
+	"encoding/hex"
+	"encoding/pem"
+	"errors"
+	"fmt"
+	"net/http"
+	"os"
+	"strings"
+	"sync"
+	"time"
+)
+
+// HubVerifier 校验 Homehub 宿主发来的入站请求签名。
+//
+// 这是"双向"里的第二个方向。Extension 主动抓 RSS 时是出站请求，不需要签名；
+// 而 Homehub 推送订阅、查询状态时是入站请求，必须证明它持有私钥。
+type HubVerifier struct {
+	pub   ed25519.PublicKey
+	skew  time.Duration
+	guard *ReplayGuard
+}
+
+var (
+	ErrClockSkew = errors.New("timestamp outside allowed window")
+	ErrReplayed  = errors.New("nonce already used")
+	ErrNoHubKey  = errors.New("hub public key not configured")
+)
+
+// LoadHubPublicKey 读取 PEM（PKIX 或 raw Ed25519 字节）。
+// 也接受裸 base64，方便部署时直接从别处复制。
+func LoadHubPublicKey(path string) (ed25519.PublicKey, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read hub public key: %w", err)
+	}
+	return ParseHubPublicKey(raw)
+}
+
+// ParseHubPublicKey 解析宿主公钥，接受 PEM、裸 base64 或指向文件的路径。
+func ParseHubPublicKey(raw []byte) (ed25519.PublicKey, error) {
+	if block, _ := pem.Decode(raw); block != nil {
+		if key, err := x509.ParsePKIXPublicKey(block.Bytes); err == nil {
+			if ed, ok := key.(ed25519.PublicKey); ok {
+				return ed, nil
+			}
+			return nil, fmt.Errorf("hub public key: expected Ed25519, got %T", key)
+		}
+		if len(block.Bytes) == ed25519.PublicKeySize {
+			return ed25519.PublicKey(block.Bytes), nil
+		}
+		return nil, errors.New("hub public key: unsupported PEM block")
+	}
+
+	trimmed := strings.TrimSpace(string(raw))
+	if decoded, err := base64.StdEncoding.DecodeString(trimmed); err == nil && len(decoded) == ed25519.PublicKeySize {
+		return ed25519.PublicKey(decoded), nil
+	}
+	if b, err := os.ReadFile(strings.TrimSpace(string(raw))); err == nil {
+		return ParseHubPublicKey(b)
+	}
+	return nil, errors.New("hub public key: not PEM, base64, or a readable path")
+}
+
+// NewHubVerifier 构造入站签名校验器。skew 与 nonceTTL 为 0 时使用默认值。
+func NewHubVerifier(pub ed25519.PublicKey, skew, nonceTTL time.Duration) *HubVerifier {
+	if skew <= 0 {
+		skew = 60 * time.Second
+	}
+	if nonceTTL <= 0 {
+		nonceTTL = 2 * time.Minute
+	}
+	return &HubVerifier{pub: pub, skew: skew, guard: NewReplayGuard(nonceTTL, 100_000)}
+}
+
+// RequestMessage 构造待签名字符串。
+//
+// 把 method/path/query/body 摘要一起签进去，任何一个被改动签名都会失效。
+// 只签 body 不签 path 的话，一条合法的写请求可以被重放到另一个端点。
+func RequestMessage(r *http.Request, body []byte) string {
+	sum := sha256.Sum256(body)
+	path := r.URL.EscapedPath()
+	if path == "" {
+		path = "/"
+	}
+	return strings.Join([]string{
+		reqDomain,
+		r.Method,
+		path,
+		r.URL.RawQuery,
+		hex.EncodeToString(sum[:]),
+		r.Header.Get("X-HH-Timestamp"),
+		r.Header.Get("X-HH-Nonce"),
+	}, "\n")
+}
+
+// Verify 校验签名头。body 必须是与请求体完全一致的原始字节。
+func (v *HubVerifier) Verify(r *http.Request, body []byte) error {
+	if v == nil || len(v.pub) == 0 {
+		return ErrNoHubKey
+	}
+	tsStr := r.Header.Get("X-HH-Timestamp")
+	nonce := r.Header.Get("X-HH-Nonce")
+	sigStr := r.Header.Get("X-HH-Signature")
+	if tsStr == "" || nonce == "" || sigStr == "" {
+		return ErrBadSig
+	}
+
+	var ts int64
+	if _, err := fmt.Sscanf(tsStr, "%d", &ts); err != nil {
+		return ErrBadSig
+	}
+	now := time.Now()
+	skew := now.Sub(time.Unix(ts, 0))
+	if skew < 0 {
+		skew = -skew
+	}
+	if skew > v.skew {
+		return ErrClockSkew
+	}
+
+	sig, err := base64.StdEncoding.DecodeString(sigStr)
+	if err != nil {
+		if sig, err = base64.RawURLEncoding.DecodeString(sigStr); err != nil {
+			return ErrBadSig
+		}
+	}
+	if !ed25519.Verify(v.pub, []byte(RequestMessage(r, body)), sig) {
+		return ErrBadSig
+	}
+
+	// 验签之后才登记 nonce：未通过签名的请求不该污染去重表，
+	// 否则攻击者可以用垃圾请求把表撑满，把合法请求挤成"已重放"。
+	if !v.guard.Allow(nonce) {
+		return ErrReplayed
+	}
+	return nil
+}
+
+// ReplayGuard 是带 TTL 的 nonce 去重表。
+// 单实例部署不需要跨节点共享；进程重启后计数清零可以接受——
+// 时间戳窗口本身只有 60 秒。
+type ReplayGuard struct {
+	mu        sync.Mutex
+	seen      map[string]time.Time
+	ttl       time.Duration
+	limit     int
+	lastSweep time.Time
+}
+
+// NewReplayGuard 构造防重放表。ttl 是 nonce 的有效期，limit 是容量上限。
+func NewReplayGuard(ttl time.Duration, limit int) *ReplayGuard {
+	return &ReplayGuard{seen: make(map[string]time.Time), ttl: ttl, limit: limit}
+}
+
+// Allow 在 nonce 首次出现时返回 true；重复则返回 false。
+//
+// 过期项由这里按时间驱动清理，不依赖外部调度——
+// 之前的实现只在表满（10 万条）时才清理，意味着低频部署会让
+// 2 分钟就该失效的 nonce 一直留在内存里，直到某天表被填满。
+// 那种"只在压力下才回收"的设计等于在小流量下持续泄漏。
+func (g *ReplayGuard) Allow(nonce string) bool {
+	if nonce == "" {
+		return false
+	}
+	now := time.Now()
+
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	// 每 ttl/4 清理一次。选这个频率是因为：太频繁会浪费 CPU，
+	// 太稀疏则内存会短暂高于"一个 ttl 窗口内应有的量"。
+	if now.Sub(g.lastSweep) > g.ttl/4 {
+		g.sweepLocked(now)
+		g.lastSweep = now
+	}
+
+	if _, ok := g.seen[nonce]; ok {
+		return false
+	}
+	// 清理后仍然满，说明短时间内请求量真的超过了容量上限。
+	// 此时拒绝而不是无限增长：宁可让合法请求重试，也不要 OOM。
+	if len(g.seen) >= g.limit {
+		return false
+	}
+	g.seen[nonce] = now
+	return true
+}
+
+func (g *ReplayGuard) sweepLocked(now time.Time) int {
+	n := 0
+	for k, t := range g.seen {
+		if now.Sub(t) > g.ttl {
+			delete(g.seen, k)
+			n++
+		}
+	}
+	return n
+}
+
+// Size 返回当前记录的 nonce 数量，供测试与诊断使用。
+func (g *ReplayGuard) Size() int {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return len(g.seen)
+}
