@@ -1,0 +1,192 @@
+package httpapi
+
+import (
+	"net/http"
+	"strings"
+	"time"
+
+	"github.com/ignvex/HomehubExtension/internal/auth"
+
+	"github.com/gin-gonic/gin"
+)
+
+type enrollRequest struct {
+	Token     string `json:"token" binding:"required"`
+	Name      string `json:"name"`
+	Algorithm string `json:"algorithm"`
+	PublicKey string `json:"public_key" binding:"required"`
+}
+
+func (s *server) handleEnroll(c *gin.Context) {
+	var req enrollRequest
+	if !bindJSON(c, &req) {
+		return
+	}
+	res, err := s.Auth.Enroll(c.Request.Context(), req.Token, req.Name, req.Algorithm, req.PublicKey)
+	if err != nil {
+		fail(c, err)
+		return
+	}
+	c.JSON(http.StatusCreated, gin.H{
+		"client_id":  res.Client.ID,
+		"name":       res.Client.Name,
+		"server_key": res.ServerKey,
+		"kid":        res.KID,
+		"algorithm":  res.Client.Algorithm,
+	})
+}
+
+type challengeRequest struct {
+	ClientID string `json:"client_id" binding:"required"`
+}
+
+func (s *server) handleChallenge(c *gin.Context) {
+	var req challengeRequest
+	if !bindJSON(c, &req) {
+		return
+	}
+	res, err := s.Auth.Challenge(c.Request.Context(), req.ClientID)
+	if err != nil {
+		fail(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"nonce":      res.Nonce,
+		"expires_at": res.ExpiresAt.Unix(),
+		// 客户端要用它拼签名消息，回显能减少前端拼错的机会。
+		"message": string(auth.AuthMessage(req.ClientID, res.Nonce)),
+	})
+}
+
+type tokenRequest struct {
+	ClientID   string `json:"client_id" binding:"required"`
+	Nonce      string `json:"nonce" binding:"required"`
+	Signature  string `json:"signature" binding:"required"`
+	ClientKind string `json:"client_kind"`
+}
+
+func (s *server) handleToken(c *gin.Context) {
+	var req tokenRequest
+	if !bindJSON(c, &req) {
+		return
+	}
+	tokens, err := s.Auth.Exchange(c.Request.Context(), req.ClientID, req.Nonce, req.Signature, c.Request.UserAgent())
+	if err != nil {
+		fail(c, err)
+		return
+	}
+	s.respondTokens(c, tokens, req.ClientKind == "machine")
+}
+
+func (s *server) handleRefresh(c *gin.Context) {
+	refresh, err := c.Cookie(cookieSession)
+	if err != nil || refresh == "" {
+		failWith(c, http.StatusUnauthorized, "unauthenticated", "会话不存在")
+		return
+	}
+	tokens, err := s.Auth.Refresh(c.Request.Context(), refresh, c.Request.UserAgent())
+	if err != nil {
+		s.clearAuthCookies(c)
+		fail(c, err)
+		return
+	}
+	s.respondTokens(c, tokens, false)
+}
+
+// respondTokens 统一签发响应。
+//
+// refresh_token 默认只写 HttpOnly cookie，不进响应体：
+// 放进 JSON 的话 XSS 一个 fetch 就能带走长期凭证，HttpOnly 就白设了。
+// 机器客户端显式声明 client_kind=machine 时才在 body 里返回。
+func (s *server) respondTokens(c *gin.Context, t *auth.Tokens, machine bool) {
+	secure := c.Request.TLS != nil || strings.HasPrefix(s.Cfg.Server.PublicURL, "https://")
+	sessionTTL := int(s.Cfg.Auth.SessionTTL.Duration / time.Second)
+
+	body := gin.H{
+		"access_token": t.AccessToken,
+		"token_type":   "Bearer",
+		"expires_in":   int(s.Auth.AccessTTL() / time.Second),
+		"expires_at":   t.AccessExpires.Unix(),
+		"csrf_token":   t.CSRF,
+		"client":       gin.H{"id": t.Client.ID, "name": t.Client.Name},
+	}
+
+	if machine {
+		body["refresh_token"] = t.RefreshToken
+		c.JSON(http.StatusOK, body)
+		return
+	}
+
+	c.SetSameSite(http.SameSiteLaxMode)
+	c.SetCookie(cookieSession, t.RefreshToken, sessionTTL, "/", "", secure, true)
+	c.SetCookie(cookieCSRF, t.CSRF, sessionTTL, "/", "", secure, false)
+	c.JSON(http.StatusOK, body)
+}
+
+func (s *server) clearAuthCookies(c *gin.Context) {
+	secure := c.Request.TLS != nil
+	c.SetSameSite(http.SameSiteLaxMode)
+	c.SetCookie(cookieSession, "", -1, "/", "", secure, true)
+	c.SetCookie(cookieCSRF, "", -1, "/", "", secure, false)
+}
+
+func (s *server) handleLogout(c *gin.Context) {
+	if refresh, err := c.Cookie(cookieSession); err == nil {
+		_ = s.Auth.Logout(c.Request.Context(), refresh)
+	}
+	s.clearAuthCookies(c)
+	c.Status(http.StatusNoContent)
+}
+
+func (s *server) handleMe(c *gin.Context) {
+	cl := clientFrom(c)
+	if cl == nil {
+		fail(c, auth.ErrBadCredentials)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"client":     gin.H{"id": cl.ID, "name": cl.Name},
+		"expires_in": int(s.Auth.AccessTTL() / time.Second),
+	})
+}
+
+func (s *server) handleServerKey(c *gin.Context) {
+	signer := s.Auth.Signer()
+	c.JSON(http.StatusOK, gin.H{
+		"kid":        signer.KID(),
+		"algorithm":  auth.AlgEd25519,
+		"public_key": b64Std(signer.PublicKey()),
+	})
+}
+
+func (s *server) handleListClients(c *gin.Context) {
+	clients, err := s.Store.Auth().ListClients(c.Request.Context())
+	if err != nil {
+		fail(c, err)
+		return
+	}
+	out := make([]gin.H, 0, len(clients))
+	for _, cl := range clients {
+		item := gin.H{
+			"id":         cl.ID,
+			"name":       cl.Name,
+			"algorithm":  cl.Algorithm,
+			"created_at": ts(cl.CreatedAt),
+			"revoked":    !cl.Active(),
+		}
+		if cl.LastSeenAt != nil {
+			item["last_seen_at"] = ts(*cl.LastSeenAt)
+		}
+		out = append(out, item)
+	}
+	c.JSON(http.StatusOK, gin.H{"items": out})
+}
+
+func (s *server) handleRevokeClient(c *gin.Context) {
+	id := c.Param("id")
+	if err := s.Store.Auth().RevokeClient(c.Request.Context(), id, time.Now().Unix()); err != nil {
+		fail(c, err)
+		return
+	}
+	c.Status(http.StatusNoContent)
+}
