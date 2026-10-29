@@ -1,0 +1,45 @@
+[Unit]
+Description=HomehubExtension
+Documentation=https://github.com/ignvex/HomehubExtension
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=homehub
+Group=homehub
+
+# 密钥通过环境文件注入，config.json 里用 ${VAR} 引用。
+EnvironmentFile=-/etc/homehub-extension/env
+
+ExecStart=/usr/local/bin/homehub-extension serve -config /etc/homehub-extension/config.json
+ExecReload=/bin/kill -HUP $MAINPID
+
+Restart=on-failure
+RestartSec=5s
+# 必须大于应用内部的 20 秒关闭预算，否则 WAL 来不及 checkpoint。
+TimeoutStopSec=25s
+
+# ---- 加固 ----
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+# ProtectSystem=strict 会把根文件系统挂成只读。
+# 数据目录必须在这里显式放行，否则启动即失败（日志只有 permission denied）。
+ReadWritePaths=/var/lib/homehub-extension
+
+# ---- 资源 ----
+MemoryMax=512M
+LimitNOFILE=4096
+
+[Install]
+WantedBy=multi-user.target

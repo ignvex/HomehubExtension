@@ -1,0 +1,50 @@
+# HomehubExtension — Caddy 反代
+#
+# 替换 homehub.example.com 为实际域名。Caddy 会自动申请并续期证书。
+# 后端只监听 127.0.0.1:8080，不直接暴露。
+
+homehub.example.com {
+	encode zstd gzip
+
+	# flush_interval -1 关掉反向代理的响应缓冲。
+	#
+	# SSE 必须有它：默认的 flush_interval 5s 会把事件攒成一批发，
+	# 前端看起来就是"实时更新坏了"。这个坑排查起来很费时间。
+	#
+	# 全局开启的代价只是普通响应少了一层攒批，对这种以 API 和
+	# 静态资源为主的服务可以忽略，换来的是配置简单、不会因为
+	# 路径写错而只在 SSE 上出问题。
+	reverse_proxy 127.0.0.1:8080 {
+		flush_interval -1
+	}
+
+	# 单个请求体上限。Paste 的实际限制更小（256 KB），这里只挡住明显异常。
+	request_body {
+		max_size 2MB
+	}
+
+	# CSP 由 Go 中间件按响应下发，此处不重复设置，避免覆盖。
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		Permissions-Policy "geolocation=(), microphone=(), camera=()"
+		-Server
+	}
+
+	log {
+		output file /var/log/caddy/homehub.log {
+			roll_size 20MB
+			roll_keep 5
+		}
+		format json
+	}
+}
+
+# 访问日志目录需要提前创建并交给 caddy 用户：
+#   sudo install -d -o caddy -g caddy -m 0750 /var/log/caddy
+#
+# encode 不会压缩 text/event-stream（Caddy 默认按 content-type 过滤），
+# 所以不需要为 SSE 单独关压缩。若实测仍有缓冲，先用 curl -N 确认
+# Go 侧确实在逐事件 Flush，再怀疑 Caddy。
