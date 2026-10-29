@@ -1,0 +1,24 @@
+{
+  "name": "homehub-extension-web",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@12.6.0",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "dev": "vite",
+    "build": "node scripts/clean-dist.mjs && tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "check": "tsc --noEmit",
+    "check:dist": "node scripts/check-dist.mjs",
+    "test:crypto": "node scripts/test-crypto.mjs",
+    "verify": "pnpm run check && pnpm run build && pnpm run check:dist && pnpm run test:crypto"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.6",
+    "typescript": "^5.9.3",
+    "vite": "^7.3.7"
+  }
+}

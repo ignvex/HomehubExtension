@@ -1,0 +1,47 @@
+@layer utilities {
+  .visually-hidden {
+    position: absolute !important;
+    width: 1px !important;
+    height: 1px !important;
+    padding: 0 !important;
+    margin: -1px !important;
+    overflow: hidden !important;
+    clip: rect(0 0 0 0) !important;
+    clip-path: inset(50%) !important;
+    white-space: nowrap !important;
+    border: 0 !important;
+  }
+
+  .mono {
+    font-family: var(--font-mono);
+  }
+
+  .muted {
+    color: var(--text-muted);
+  }
+
+  .small {
+    font-size: var(--text-xs);
+  }
+
+  .break-all {
+    overflow-wrap: anywhere;
+    word-break: break-word;
+  }
+
+  .nowrap {
+    white-space: nowrap;
+  }
+
+  .stack {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-3);
+  }
+
+  .stack-lg {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-6);
+  }
+}
