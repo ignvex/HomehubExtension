@@ -1,0 +1,155 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GO_VERSION: "1.27"
+  NODE_VERSION: "22"
+
+jobs:
+  go:
+    name: Go（vet + test）
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: go.sum
+
+      # go:embed all:web/dist 要求目录存在且非空。
+      # 仓库里提交了 web/dist/.gitkeep，所以这里不需要先构建前端。
+      - name: 规范检查
+        run: make lint
+
+      - name: 静态检查
+        run: go vet ./...
+
+      - name: 测试
+        run: go test ./... -count=1
+
+      - name: 并发路径测试
+        run: |
+          go test -race -count=1 \
+            -run "Concurrent|BurnAfterRead" \
+            ./internal/paste/ ./internal/httpapi/
+          go test -race -count=1 \
+            ./internal/auth/ ./internal/rss/ ./internal/scheduler/ \
+            ./internal/app/ ./internal/store/sqlite/ ./internal/blob/
+
+  web:
+    name: 前端（类型 + 构建 + 产物规则）
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 12
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+          cache-dependency-path: web/pnpm-lock.yaml
+
+      - name: 安装依赖
+        run: pnpm --dir web install --frozen-lockfile
+
+      - name: 类型检查
+        run: pnpm --dir web exec tsc --noEmit
+
+      - name: 构建
+        run: pnpm --dir web build
+
+      # 断言产物里没有内联 <script>/style 且体积在预算内。
+      # CSP 是 script-src 'self'，内联片段会让生产环境直接失效。
+      - name: 产物检查
+        run: pnpm --dir web run check:dist
+
+      - name: 签名一致性
+        run: pnpm --dir web run test:crypto
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: web-dist
+          path: web/dist
+          retention-days: 7
+
+  build:
+    name: 交叉编译 linux/amd64
+    needs: [go, web]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: go.sum
+
+      # 必须在前端产物就位后再编译：go:embed 在编译期读取 web/dist，
+      # 顺序错了会产出一个只有占位页的二进制。
+      - uses: actions/download-artifact@v4
+        with:
+          name: web-dist
+          path: web/dist
+
+      - name: 编译
+        env:
+          CGO_ENABLED: "0"
+          GOOS: linux
+          GOARCH: amd64
+        run: |
+          go build -trimpath \
+            -ldflags "-s -w \
+              -X main.version=${GITHUB_REF_NAME} \
+              -X main.commit=${GITHUB_SHA::7} \
+              -X main.buildTime=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            -o homehub-extension .
+
+      - name: 冒烟测试
+        run: |
+          ./homehub-extension version
+          # 二进制必须真的带上前端，而不只是占位页。
+          grep -qa "_app/" homehub-extension && echo "前端已嵌入"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: homehub-extension-linux-amd64
+          path: homehub-extension
+          retention-days: 30
+
+  docker:
+    name: 镜像构建（仅验证，不推送）
+    needs: [build]
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: web-dist
+          path: web/dist
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: 构建
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          tags: homehub-extension:ci
