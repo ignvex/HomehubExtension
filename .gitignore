@@ -1,0 +1,27 @@
+# 构建产物
+/bin/
+/homehub-extension
+*.test
+*.out
+
+# 运行时数据（绝不应提交）
+/config.json
+*.db
+*.db-wal
+*.db-shm
+/server.key
+/blobs/
+
+# 前端
+web/node_modules/
+# dist 里只有 .gitkeep 进版本库：它让 //go:embed all:web/dist 在全新
+# clone 上也能编译。构建产物一律不提交。
+web/dist/*
+!web/dist/.gitkeep
+web/*.local
+
+# 编辑器与系统
+.DS_Store
+.idea/
+.vscode/
+*.swp
