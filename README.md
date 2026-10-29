@@ -1,2 +1,274 @@
 # HomehubExtension
-Extra Functions for Homehub
+
+Homehub 的扩展服务：一个 Go 单二进制后端 + TypeScript 前端，为 Homehub 宿主叠加若干自托管功能。
+
+功能模块：
+
+- **工具台首页** —— 应用卡片网格，由 `GET /api/v1/apps` 驱动。新增模块只需在代码里注册，首页自动多出一张卡。
+- **Pastebin** —— 自托管文本片段，支持过期时间、语言标记、口令保护、一次性读取与无需 JS 的公开分享页。
+- **RSS 阅读器（资源本地化）** —— 订阅由 **Homehub 宿主主动推送**（地址 + 更新间隔 + 启停）；抓取后把正文涉及的所有媒体下载到本地，无法本地化、但会让浏览器对外发起请求的元素一律抹除。验收标准是可执行的：**读完一篇文章，浏览器没有向第三方发出任何请求**。
+
+> 状态：后端可用，测试全绿。前端工程在 `web/` 下进行中。
+
+## 设计约束
+
+整套设计由部署环境倒推：
+
+| 约束 | 取值 | 影响 |
+| --- | --- | --- |
+| CPU | 1 vCPU amd64 | 并发靠限流而非加核；不在服务器上编译 |
+| 内存 | 2 GB | 进程硬上限 512 MB，`GOMEMLIMIT=256MiB` |
+| 磁盘 | 20 GB | blob 配额 5 GB；事件/条目保留期 + 定期 GC |
+| 入口 | Caddy 反代，自动 HTTPS | Go 只监听 `127.0.0.1:8080`，不终止 TLS |
+| 交付 | 单二进制 + systemd | 前端构建产物 `go:embed` 进可执行文件 |
+
+时间表示全局统一：**Unix 秒**（SQLite `INTEGER` → Go `int64` → JSON number → JS number），只在 `lib/format.ts` 一处乘 1000。未设置是 `null` 而不是 `0`——`0` 在 Unix 时间里是 1970-01-01。时长（`"30m"`）与时刻不混用。
+
+## 架构
+
+```text
+                         ┌──────────────────────────────┐
+   浏览器 / API 客户端 ──► │  Caddy :443                  │
+                         │  自动证书 · gzip/zstd · 安全头 │
+                         └──────────────┬───────────────┘
+                                        │ reverse_proxy（flush_interval -1）
+                         ┌──────────────▼───────────────┐
+                         │  HomehubExtension :8080      │
+                         │                              │
+                         │  gin 路由                    │
+                         │   ├ /api/v1/*  REST          │
+                         │   ├ /media/*   本地化资源     │
+                         │   ├ /p/{slug}  公开粘贴页     │
+                         │   └ /*         embed 前端 SPA │
+                         │                              │
+                         │  auth   挑战响应 + 入站签名   │
+                         │  paste  pastebin 模块        │
+                         │  rss    抓取→清洗→本地化→入库  │
+                         │  cron   清理任务调度          │
+                         │  hub    接收 Homehub 推送     │
+                         └───────┬──────────────┬───────┘
+                                 │              │
+                    ┌────────────▼───┐   ┌──────▼─────────────┐
+                    │ SQLite (WAL)   │   │ blobs/ 内容寻址文件  │
+                    │ 元数据 + 索引   │   │ sha256 分片目录      │
+                    └────────────────┘   └────────────────────┘
+                                 │
+                    ┌────────────▼───────────────────────┐
+                    │ Homehub 宿主 HTTP API（外部）        │
+                    │ 限流 · 超时 · 缓存 · singleflight    │
+                    └────────────────────────────────────┘
+```
+
+设计要点：
+
+- **单二进制**：前端 `pnpm build` 产物通过 `//go:embed all:web/dist` 打进程序，`web/dist` 里保留占位 `index.html` 以保证全新 clone 直接 `go build` 成功。
+- **SQLite 用 `modernc.org/sqlite`**（纯 Go、无 CGO），`WAL` + 单写连接，`_pragma` 在 DSN 里固定，避免 `SQLITE_BUSY`。
+- **内容寻址存储**：媒体文件按 `sha256` 存 `blobs/<前2位>/<hash>.<ext>`，同一图片被多篇文章引用只占一份空间；DB 里用引用计数决定何时回收。
+- **双向公私钥，两个方向各管一件事**：
+  - 浏览器 → 服务端：Ed25519（或 P-256）挑战-响应。私钥以不可导出方式生成并存在 IndexedDB，服务端只存公钥。
+  - Homehub → 服务端：每个入站请求自带签名，覆盖 method/path/query/body 摘要/时间戳/nonce。Extension 只存宿主公钥，一条合法请求无法被挪到别的端点重放。
+  详见 [docs/api.md](docs/api.md)。
+- **清理策略只有一处定义**：所有保留期、GC 都在 `config.json` 的 `cleanup.jobs` 里，用 cron 表达式描述，运行时可在「系统 → 任务」页面看到每次执行结果。详见 [docs/config.md](docs/config.md)。
+
+## 技术栈
+
+Go module 路径：`github.com/ignvex/HomehubExtension`（与仓库地址一致，保留大小写）。
+
+- 后端：Go 1.27、gin（`gin.New()`，非 `Default()`）、`log/slog`、`modernc.org/sqlite`、`robfig/cron/v3`、`mmcdole/gofeed`、`golang.org/x/net/html`
+- 前端：TypeScript（`strict`）、Vite、原生 DOM + 轻量路由、手写 CSS3（无 UI 框架）、pnpm
+- 部署：Caddy（反代 + 证书）、systemd、GitHub Actions 交叉编译 `linux/amd64`
+
+## 目录结构
+
+```text
+HomehubExtension/
+├── main.go                  # 入口：子命令、日志、信号处理
+├── enroll.go                # enroll 子命令的最小装配
+├── assets.go                # go:embed all:web/dist
+├── Makefile
+├── Dockerfile               # 多阶段：前端 → Go → alpine 运行镜像
+├── go.mod
+├── config.example.json      # 配置模板（字段与 docs/config.md 一致）
+├── internal/
+│   ├── app/                 # 依赖装配、生命周期、清理任务实现
+│   ├── config/              # 加载、${VAR} 展开、聚合校验
+│   ├── httpapi/             # gin 路由、中间件、handler、SPA fallback、SSE
+│   ├── auth/                # 挑战响应、会话、入站请求签名
+│   ├── store/               # 仓储接口与值对象
+│   │   └── sqlite/          # SQLite 实现 + embed 迁移
+│   ├── blob/                # 内容寻址文件存储（流式写入）
+│   ├── paste/               # pastebin 领域逻辑
+│   ├── rss/                 # 清洗、抓取、媒体本地化、失败重试
+│   ├── scheduler/           # cron 调度与任务执行记录
+│   └── events/              # 进程内事件总线（SSE 广播）
+├── web/                     # 前端工程（pnpm + Vite + TS）
+│   └── dist/.gitkeep        # 让 go:embed 在全新 clone 上也能编译
+├── docs/                    # 设计文档
+├── deploy/                  # systemd unit、Caddyfile、env 示例、备份脚本
+└── .github/workflows/ci.yml
+```
+
+## 快速开始（开发）
+
+前置：Go ≥ 1.27、Node ≥ 22、pnpm ≥ 10。
+
+```bash
+git clone https://github.com/ignvex/HomehubExtension.git
+cd HomehubExtension
+
+cp config.example.json config.json
+# 至少改 server.public_url、database.path、storage.blob_dir
+# 密钥用 ${VAR} 引用，写在环境变量或 .env 里，不要进 config.json
+
+go run . serve -config config.json    # 后端 :8080
+pnpm --dir web install
+pnpm --dir web dev                    # 前端 :5173，/api 与 /media 代理到 :8080
+```
+
+首次使用需要在服务端生成配对码，再在浏览器 `/pair` 页面注册设备公钥：
+
+```bash
+go run . enroll -config config.json -name "macbook-chrome"
+```
+
+构建发布产物：
+
+```bash
+pnpm --dir web build
+GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "-s -w" -o bin/homehub-extension .
+```
+
+## 测试
+
+```bash
+make lint    # 规范检查：gofmt、vet、deadcode、行宽、函数长度、import 分组
+make test    # go test ./...
+make race    # 并发路径（一次性读取、SSRF 开关、调度器互斥、轮询器）
+make build   # 前端构建 + 交叉编译 linux/amd64
+```
+
+`make lint` 落实的是项目采用的 Go 编码规范（阿里规范 + Uber Style Guide 常见实践）。几项阈值写成了脚本，CI 里同样跑：
+
+- 单行 ≤ 120 字符，单文件 ≤ 500 行
+- 单函数 ≤ 80 行，参数 ≤ 5 个（超出用 struct 收口）
+- import 分三组：标准库 → 内部包 → 第三方库
+- `deadcode` 零输出——不能有写了却没人调用的代码
+
+CI 与本地一致：`.github/workflows/ci.yml` 分四个 job（Go、前端、交叉编译、镜像）。
+
+编译 job 必须等前端产物就位——`go:embed` 在编译期读取 `web/dist`，顺序错了会产出一个只有占位页的二进制：体积正常、能启动、就是没有界面。CI 里用 `grep -qa "_app/"` 断言前端确实嵌进去了。
+
+测试覆盖的重点不是行数，而是几条容易出错的语义：
+
+- 一次性片段在 8 个并发读取下只有 1 个成功
+- 签名不能被搬到另一个路径或另一个 body 上使用
+- 同一 nonce 重放必须被拒
+- 外键级联删除后 `blob.ref_count` 必须归零
+- 清洗后的 HTML 里除 `<a href>` 外没有任何绝对外链
+- API 的 404 必须是 JSON，不能被 SPA fallback 吞掉
+
+## 与 Homehub 宿主对接
+
+宿主推送订阅，Extension 负责抓取与本地化。请求必须签名：
+
+```bash
+# 签名消息（逐字节，\n 是真实换行）
+homehubext/req/v1
+<METHOD>
+<PATH>
+<QUERY>
+<hex(sha256(body))>
+<timestamp>
+<nonce>
+```
+
+请求头带 `X-HH-Timestamp`、`X-HH-Nonce`、`X-HH-Signature`（base64）。
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| `POST` | `/api/v1/hub/subscriptions` | 推送订阅：`{url, title, interval, enabled, fetch_now}`。同 URL 幂等更新 |
+| `GET` | `/api/v1/hub/subscriptions` | 对账列表 |
+| `DELETE` | `/api/v1/hub/subscriptions/{id}` | 移除订阅 |
+| `POST` | `/api/v1/hub/subscriptions/{id}/refresh` | 立即抓取 |
+
+`interval` 会被夹到 `rss.min_interval` 与 `rss.max_interval` 之间。首推默认立即抓一次。
+
+## 配置
+
+`config.json` 通过 `-config` 指定（systemd 用绝对路径），也可以用 `HOMEHUB_CONFIG` 环境变量。所有字段、默认值与清理任务语法见 [docs/config.md](docs/config.md)，模板见 [`config.example.json`](config.example.json)。
+
+几条硬规则：
+
+- 找不到配置文件时**直接退出**，不回落到内置默认值。
+- 支持 `${VAR}` 与 `${VAR:-default}` 展开，密钥只出现在环境变量里。
+- 校验错误一次性全部列出，而不是撞到第一个就退。
+
+## 部署
+
+```text
+/usr/local/bin/homehub-extension          二进制
+/usr/local/bin/homehub-backup.sh          备份脚本（deploy/backup.sh）
+/etc/homehub-extension/config.json        配置（0640 root:homehub）
+/etc/homehub-extension/env                密钥（0600 root:homehub）
+/etc/homehub-extension/homehub.pub        Homehub 宿主公钥（0644）
+/var/lib/homehub-extension/homehub.db     SQLite
+/var/lib/homehub-extension/blobs/         媒体文件
+/var/backups/homehub/                     每日备份，保留 7 份
+```
+
+Caddy 关键片段（完整版见 [`deploy/Caddyfile`](deploy/Caddyfile)）：
+
+```caddy
+homehub.example.com {
+    encode zstd gzip
+
+    # 关掉反代响应缓冲。SSE 必须，否则事件会被攒成一批发。
+    reverse_proxy 127.0.0.1:8080 {
+        flush_interval -1
+    }
+
+    request_body {
+        max_size 2MB
+    }
+}
+```
+
+`flush_interval -1` 全局开启而不是只对事件流生效：代价只是普通响应少一层攒批，换来的是不会因为路径写错而只在 SSE 上出问题。
+
+systemd 单元里 `ProtectSystem=strict` 会让根文件系统只读，`ReadWritePaths` 必须显式包含数据目录。完整单元见 [`deploy/homehub-extension.service`](deploy/homehub-extension.service)。
+
+备份（数据库走二进制的 `backup` 子命令，媒体用 rsync 硬链接增量，不依赖 sqlite3 CLI）：
+
+```bash
+sudo install -m 0755 deploy/backup.sh /usr/local/bin/homehub-backup.sh
+# crontab: 0 3 * * * /usr/local/bin/homehub-backup.sh >> /var/log/homehub-backup.log 2>&1
+```
+
+容器部署见 [`Dockerfile`](Dockerfile)。容器内需要监听 `0.0.0.0`，所以配置里要设 `server.allow_remote_listen: true`。
+
+## 文档
+
+| 文档 | 内容 |
+| --- | --- |
+| [docs/architecture.md](docs/architecture.md) | 运行拓扑、组件职责、数据流、存储布局、资源预算、技术选型理由 |
+| [docs/config.md](docs/config.md) | 配置加载、全字段说明、cleanup cron 设计、systemd 集成 |
+| [docs/api.md](docs/api.md) | REST 约定、Ed25519 双向鉴权协议、端点清单、错误与分页 |
+| [docs/rss.md](docs/rss.md) | 抓取与条件请求、HTML 白名单清洗、媒体下载与重写、SSRF 防护、CSP |
+| [docs/frontend.md](docs/frontend.md) | pnpm 工程、路由与视图、CSS 分层、阅读器排版、构建与 embed |
+
+## 路线图
+
+- [x] **M0** 设计定稿：README + `docs/`
+- [x] **M1** 后端骨架：config、slog、gin 中间件、SQLite 迁移、`/healthz`、`/readyz`、优雅关闭
+- [x] **M2** 前端骨架：Vite + TS + CSS token 体系 + 应用外壳 + 开发代理 + 工具台首页
+- [x] **M3** 交付链：embed、SPA fallback、CSP、systemd + Caddyfile
+- [x] **M4** 鉴权闭环：密钥生成、设备配对、挑战登录、会话、CSRF、入站签名
+- [x] **M5** Pastebin 端到端（含无 JS 公开页）
+- [x] **M6** RSS：抓取 → 清洗 → 媒体本地化 → 重试 → 阅读视图
+- [x] **M7** 清理调度 + 运维接口 + 测试
+- [x] **M8** 首发硬化：GitHub Actions CI、Dockerfile、备份子命令
+- [ ] **M9** OPML 导入导出、更多工具台应用（按需追加，实现接口并注册即可）
+
+## 许可
+
+尚未选择许可证。在 LICENSE 落地前，默认保留所有权利。
