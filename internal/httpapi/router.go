@@ -140,14 +140,18 @@ func (s *server) registerHub(r *gin.Engine) {
 	g.POST("/subscriptions/:id/refresh", s.handleHubRefresh)
 }
 
+// registerPaste 挂载 pastebin。
+//
+// 整组不要求登录：匿名也能创建、查看与管理自己的片段。
+// 归属靠 X-Owner-Token（匿名）或 Bearer（已登录）推导，
+// 见 middleware.OwnerHash。写操作仍然过 CSRF——那是防止跨站
+// 借用浏览器 cookie 的，与"是否登录"无关。
 func (s *server) registerPaste(r *gin.Engine) {
 	if !s.Cfg.Pastebin.Enabled {
 		return
 	}
-	authn := RequireAuth(s.Auth, false)
-	csrf := RequireCSRF()
 
-	g := r.Group("/api/v1/pastes", authn, csrf)
+	g := r.Group("/api/v1/pastes", OptionalAuth(s.Auth), RequireCSRF())
 	g.POST("", s.handlePasteCreate)
 	g.GET("", s.handlePasteList)
 	g.GET("/:slug", s.handlePasteGet)
@@ -155,7 +159,7 @@ func (s *server) registerPaste(r *gin.Engine) {
 	g.DELETE("/:slug", s.handlePasteDelete)
 
 	// 公开分享页不鉴权：分享链接必须能被 curl 与爬虫读取。
-	r.GET("/p/:slug", s.handlePublicPaste)
+	r.GET("/p/:slug", OptionalAuth(s.Auth), s.handlePublicPaste)
 }
 
 func (s *server) registerRSS(r *gin.Engine) {
@@ -167,9 +171,13 @@ func (s *server) registerRSS(r *gin.Engine) {
 
 	r.GET("/media/:name", s.handleMedia)
 
+	// 订阅源管理需要登录：抓取会主动访问外部地址，
+	// 匿名开放等于把服务变成开放的 SSRF 跳板。
 	g := r.Group("/api/v1", authn, csrf)
+	g.POST("/feeds", s.handleFeedCreate)
 	g.GET("/feeds", s.handleFeedList)
 	g.GET("/feeds/:id", s.handleFeedGet)
+	g.PATCH("/feeds/:id", s.handleFeedUpdate)
 	g.POST("/feeds/:id/refresh", s.handleFeedRefresh)
 	g.DELETE("/feeds/:id", s.handleFeedDelete)
 
@@ -184,12 +192,21 @@ func (s *server) registerSystem(r *gin.Engine) {
 	authn := RequireAuth(s.Auth, false)
 	csrf := RequireCSRF()
 
+	// 公开端点：工具台首页要在未登录时就能渲染，
+	// 否则用户看到的第一个页面是登录墙，不知道这服务能干什么。
+	//
+	// /apps 只返回应用元信息与计数，不含任何用户内容。
+	// /system/info 是版本与运行时长，/system/stats 是聚合计数——
+	// 这两者曾要求鉴权，但首页的卡片角标依赖它们，放开更合理。
+	pub := r.Group("/api/v1")
+	pub.GET("/apps", s.handleApps)
+	pub.GET("/system/info", s.handleInfo)
+	pub.GET("/system/stats", s.handleStats)
+
+	// 其余保持鉴权：配置视图、任务历史、手动触发清理。
 	g := r.Group("/api/v1", authn)
-	g.GET("/system/info", s.handleInfo)
-	g.GET("/system/stats", s.handleStats)
 	g.GET("/system/jobs", s.handleJobs)
 	g.GET("/system/config", s.handleConfig)
-	g.GET("/apps", s.handleApps)
 
 	w := r.Group("/api/v1", authn, csrf)
 	w.POST("/system/jobs/:name/run", s.handleRunJob)

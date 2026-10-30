@@ -1,4 +1,5 @@
 import { createPaste } from "../api/pastes";
+import { saveOwnerToken } from "../auth/owner-token";
 import type { PasteVisibility } from "../api/types";
 import { pageHeader } from "../components/page";
 import { icon } from "../components/icons";
@@ -226,7 +227,7 @@ export const pasteNewView: ViewFactory = (ctx) => {
 
     void (async () => {
       try {
-        await createPaste(
+        const created = await createPaste(
           {
             title: titleInput.value.trim().slice(0, 200),
             body,
@@ -239,6 +240,14 @@ export const pasteNewView: ViewFactory = (ctx) => {
           ctx.signal,
         );
         if (ctx.signal.aborted) return;
+
+        // 匿名创建时服务端会返回 owner token。必须存下来：
+        // 之后管理（改、删、看私有）全靠它，而且丢了找不回。
+        // 已登录创建时该字段为空，saveOwnerToken 会直接返回。
+        if (created.owner_token) {
+          saveOwnerToken(created.owner_token);
+        }
+
         ctx.toast.show("片段已创建", "success");
         ctx.router.navigate("/pastes");
       } catch (reason) {

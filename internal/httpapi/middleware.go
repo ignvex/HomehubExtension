@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/ignvex/HomehubExtension/internal/auth"
+	"github.com/ignvex/HomehubExtension/internal/paste"
 
 	"github.com/gin-gonic/gin"
 )
@@ -22,10 +23,11 @@ const (
 	ctxLogger    = "logger"
 	ctxHubBody   = "hub_body"
 
-	cookieSession   = "hh_session"
-	cookieCSRF      = "hh_csrf"
-	headerCSRF      = "X-CSRF-Token"
-	headerRequestID = "X-Request-ID"
+	cookieSession    = "hh_session"
+	cookieCSRF       = "hh_csrf"
+	headerCSRF       = "X-CSRF-Token"
+	headerRequestID  = "X-Request-ID"
+	headerOwnerToken = "X-Owner-Token"
 )
 
 func requestID(c *gin.Context) string {
@@ -187,8 +189,18 @@ func RequireAuth(svc *auth.Service, allowCookie bool) gin.HandlerFunc {
 	}
 }
 
-// RequireCSRF 对 cookie 认证的写请求做双提交校验。
-// Bearer 请求直接放行，因为攻击者无法让浏览器自动带上 Authorization 头。
+// RequireCSRF 对「浏览器会自动携带凭证」的写请求做双提交校验。
+//
+// 豁免三种情况，判据都是「有没有可被借用的凭证」而不是「是不是写请求」：
+//
+//  1. 安全方法（GET/HEAD/OPTIONS）本身无副作用。
+//  2. Bearer 认证：攻击者无法让浏览器自动附加 Authorization 头。
+//  3. 完全匿名的请求：既没有 Bearer 也没有 session cookie。
+//     此时不存在被冒用身份的凭证，CSRF 攻击也就无从谈起——
+//     这正是「不登录也能创建片段」能成立的前提。
+//
+// 第 3 条容易漏。漏了的症状是匿名创建被 403 挡住，
+// 而错误信息是「缺少 CSRF 令牌」——看起来像前端忘了带 header。
 func RequireCSRF() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		switch c.Request.Method {
@@ -201,6 +213,11 @@ func RequireCSRF() gin.HandlerFunc {
 				c.Next()
 				return
 			}
+		}
+		// 没有任何会话凭证：匿名请求，没有可借用的身份。
+		if _, err := c.Cookie(cookieSession); err != nil {
+			c.Next()
+			return
 		}
 		cookie, err := c.Cookie(cookieCSRF)
 		if err != nil || cookie == "" {
@@ -298,4 +315,41 @@ func RequireAttemptLimit(limiter *auth.AttemptLimiter, log *slog.Logger) gin.Han
 
 func strconvItoa(v int) string {
 	return strconv.Itoa(v)
+}
+
+// OptionalAuth 尝试识别调用方，但从不拒绝请求。
+//
+// 用于「匿名也能用，登录后行为更完整」的端点：
+//   - paste 创建：匿名可建，登录则归属到设备
+//   - paste 列表：匿名凭 owner token 看自己的，登录看设备的
+//
+// 与 RequireAuth 的关键区别：凭证无效时不是 401，而是当作匿名继续。
+// 这样 token 过期的用户不会突然失去所有能力，只是退回匿名。
+func OptionalAuth(svc *auth.Service) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if token := auth.ParseBearer(c.GetHeader("Authorization")); token != "" {
+			if client, err := svc.Authenticate(c.Request.Context(), token); err == nil {
+				c.Set(ctxClient, &authClient{ID: client.ID, Name: client.Name})
+				c.Set("auth_via_bearer", true)
+			}
+		}
+		c.Next()
+	}
+}
+
+// OwnerHash 从请求上下文推导归属哈希。
+//
+// 优先级：已登录设备 > 客户端提交的 owner token。两者都没有则返回空，
+// 调用方据此决定是「拒绝」还是「按匿名处理」。
+//
+// owner token 走 header 而不是 query：query 会进访问日志，
+// 而这些日志通常会被收集到别处。
+func OwnerHash(c *gin.Context) string {
+	if cl := clientFrom(c); cl != nil {
+		return paste.OwnerHashForClient(cl.ID)
+	}
+	if token := c.GetHeader(headerOwnerToken); token != "" {
+		return paste.OwnerHashForToken(token)
+	}
+	return ""
 }

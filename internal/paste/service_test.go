@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ignvex/HomehubExtension/internal/store"
 	"github.com/ignvex/HomehubExtension/internal/store/sqlite"
 )
 
@@ -33,7 +34,7 @@ func TestCreateAndRead(t *testing.T) {
 	s := newService(t)
 	ctx := context.Background()
 
-	p, err := s.Create(ctx, CreateRequest{Body: "hello", Language: "go"})
+	p, _, err := s.Create(ctx, CreateRequest{Body: "hello", Language: "go"})
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -44,7 +45,7 @@ func TestCreateAndRead(t *testing.T) {
 		t.Error("default expiry should be applied")
 	}
 
-	got, err := s.Read(ctx, p.Slug, "")
+	got, err := s.Read(ctx, p.Slug, "", "")
 	if err != nil {
 		t.Fatalf("Read: %v", err)
 	}
@@ -55,7 +56,7 @@ func TestCreateAndRead(t *testing.T) {
 
 func TestUnknownLanguageFallsBack(t *testing.T) {
 	s := newService(t)
-	p, err := s.Create(context.Background(), CreateRequest{
+	p, _, err := s.Create(context.Background(), CreateRequest{
 		Body: "x", Language: "brainfuck",
 	})
 	if err != nil {
@@ -68,7 +69,7 @@ func TestUnknownLanguageFallsBack(t *testing.T) {
 
 func TestBodyTooLarge(t *testing.T) {
 	s := newService(t)
-	_, err := s.Create(context.Background(), CreateRequest{
+	_, _, err := s.Create(context.Background(), CreateRequest{
 		Body: strings.Repeat("a", 2048),
 	})
 	if !errors.Is(err, ErrTooLarge) {
@@ -79,7 +80,7 @@ func TestBodyTooLarge(t *testing.T) {
 func TestExpiryBeyondMax(t *testing.T) {
 	s := newService(t)
 	d := 400 * 24 * time.Hour
-	_, err := s.Create(context.Background(), CreateRequest{Body: "x", ExpiresIn: &d})
+	_, _, err := s.Create(context.Background(), CreateRequest{Body: "x", ExpiresIn: &d})
 	if !errors.Is(err, ErrBadExpiry) {
 		t.Fatalf("err = %v, want ErrBadExpiry", err)
 	}
@@ -88,7 +89,7 @@ func TestExpiryBeyondMax(t *testing.T) {
 func TestZeroExpiryMeansPermanent(t *testing.T) {
 	s := newService(t)
 	zero := time.Duration(0)
-	p, err := s.Create(context.Background(), CreateRequest{Body: "x", ExpiresIn: &zero})
+	p, _, err := s.Create(context.Background(), CreateRequest{Body: "x", ExpiresIn: &zero})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -101,7 +102,7 @@ func TestPasswordProtection(t *testing.T) {
 	s := newService(t)
 	ctx := context.Background()
 
-	p, err := s.Create(ctx, CreateRequest{Body: "secret", Password: "hunter2"})
+	p, _, err := s.Create(ctx, CreateRequest{Body: "secret", Password: "hunter2"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -113,10 +114,10 @@ func TestPasswordProtection(t *testing.T) {
 		t.Fatal("plaintext password leaked into hash field")
 	}
 
-	if _, err := s.Read(ctx, p.Slug, "wrong"); !errors.Is(err, ErrBadPassword) {
+	if _, err := s.Read(ctx, p.Slug, "wrong", ""); !errors.Is(err, ErrBadPassword) {
 		t.Errorf("wrong password = %v, want ErrBadPassword", err)
 	}
-	if _, err := s.Read(ctx, p.Slug, "hunter2"); err != nil {
+	if _, err := s.Read(ctx, p.Slug, "hunter2", ""); err != nil {
 		t.Errorf("correct password rejected: %v", err)
 	}
 }
@@ -125,15 +126,15 @@ func TestBurnAfterReadIsSingleUse(t *testing.T) {
 	s := newService(t)
 	ctx := context.Background()
 
-	p, err := s.Create(ctx, CreateRequest{Body: "once", BurnAfterRead: true})
+	p, _, err := s.Create(ctx, CreateRequest{Body: "once", BurnAfterRead: true})
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	if _, err := s.Read(ctx, p.Slug, ""); err != nil {
+	if _, err := s.Read(ctx, p.Slug, "", ""); err != nil {
 		t.Fatalf("first read: %v", err)
 	}
-	if _, err := s.Read(ctx, p.Slug, ""); !errors.Is(err, ErrExpired) {
+	if _, err := s.Read(ctx, p.Slug, "", ""); !errors.Is(err, ErrExpired) {
 		t.Errorf("second read = %v, want ErrExpired", err)
 	}
 }
@@ -142,7 +143,7 @@ func TestBurnAfterReadConcurrent(t *testing.T) {
 	s := newService(t)
 	ctx := context.Background()
 
-	p, err := s.Create(ctx, CreateRequest{Body: "only once", BurnAfterRead: true})
+	p, _, err := s.Create(ctx, CreateRequest{Body: "only once", BurnAfterRead: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -153,7 +154,7 @@ func TestBurnAfterReadConcurrent(t *testing.T) {
 	for i := 0; i < n; i++ {
 		go func() {
 			<-start
-			_, err := s.Read(ctx, p.Slug, "")
+			_, err := s.Read(ctx, p.Slug, "", "")
 			results <- err
 		}()
 	}
@@ -175,12 +176,12 @@ func TestMetaDoesNotBurn(t *testing.T) {
 	s := newService(t)
 	ctx := context.Background()
 
-	p, _ := s.Create(ctx, CreateRequest{Body: "content", BurnAfterRead: true})
-	if _, err := s.Meta(ctx, p.Slug); err != nil {
+	p, _, _ := s.Create(ctx, CreateRequest{Body: "content", BurnAfterRead: true})
+	if _, err := s.Meta(ctx, p.Slug, ""); err != nil {
 		t.Fatal(err)
 	}
 	// 页面预取不应烧掉一次性片段。
-	if _, err := s.Read(ctx, p.Slug, ""); err != nil {
+	if _, err := s.Read(ctx, p.Slug, "", ""); err != nil {
 		t.Errorf("read after meta should succeed: %v", err)
 	}
 }
@@ -189,12 +190,97 @@ func TestDeleteThenRead(t *testing.T) {
 	s := newService(t)
 	ctx := context.Background()
 
-	p, _ := s.Create(ctx, CreateRequest{Body: "x"})
-	if err := s.Delete(ctx, p.Slug); err != nil {
+	// 匿名创建：必须凭 owner token 才能删。
+	p, token, err := s.Create(ctx, CreateRequest{Body: "x"})
+	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.Read(ctx, p.Slug, ""); !errors.Is(err, ErrExpired) {
+	owner := OwnerHashForToken(token)
+
+	if err := s.Delete(ctx, p.Slug, owner); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Read(ctx, p.Slug, "", owner); !errors.Is(err, ErrExpired) {
 		t.Errorf("read after delete = %v, want ErrExpired", err)
+	}
+}
+
+// 匿名创建的片段不能被别人删改。这是「持有 token 即拥有」的另一面：
+// 没有 token 的人也拿不到删除权。
+func TestAnonymousPasteNotManageableByOthers(t *testing.T) {
+	s := newService(t)
+	ctx := context.Background()
+
+	p, token, err := s.Create(ctx, CreateRequest{Body: "mine"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if token == "" {
+		t.Fatal("匿名创建应返回 owner token")
+	}
+
+	// 换个 token 就当别人。
+	other := OwnerHashForToken("someone-elses-token")
+	if err := s.Delete(ctx, p.Slug, other); !errors.Is(err, store.ErrNotFound) {
+		t.Errorf("别人删除 = %v, want ErrNotFound", err)
+	}
+	if err := s.Delete(ctx, p.Slug, ""); !errors.Is(err, store.ErrNotFound) {
+		t.Errorf("无凭证删除 = %v, want ErrNotFound", err)
+	}
+	if _, err := s.Update(ctx, p.Slug, UpdateRequest{}, other); !errors.Is(err, store.ErrNotFound) {
+		t.Errorf("别人修改 = %v, want ErrNotFound", err)
+	}
+
+	// 真正的拥有者可以删。
+	if err := s.Delete(ctx, p.Slug, OwnerHashForToken(token)); err != nil {
+		t.Errorf("拥有者删除失败: %v", err)
+	}
+}
+
+// private 片段只有创建者能读。其他人拿到链接也不行。
+func TestPrivatePasteRequiresOwner(t *testing.T) {
+	s := newService(t)
+	ctx := context.Background()
+
+	p, token, err := s.Create(ctx, CreateRequest{Body: "secret", Visibility: VisPrivate})
+	if err != nil {
+		t.Fatal(err)
+	}
+	owner := OwnerHashForToken(token)
+
+	if _, err := s.Read(ctx, p.Slug, "", owner); err != nil {
+		t.Errorf("拥有者应能读: %v", err)
+	}
+	// 返回 NotFound 而不是 Forbidden：告诉对方"存在但你没权限"本身就是泄露。
+	if _, err := s.Read(ctx, p.Slug, "", ""); !errors.Is(err, store.ErrNotFound) {
+		t.Errorf("无凭证读 private = %v, want ErrNotFound", err)
+	}
+	if _, err := s.Meta(ctx, p.Slug, ""); !errors.Is(err, store.ErrNotFound) {
+		t.Errorf("无凭证读 private 元信息 = %v, want ErrNotFound", err)
+	}
+}
+
+// 登录用户创建的片段按设备归属，列表只看得到自己的。
+func TestListFiltersByOwner(t *testing.T) {
+	s := newService(t)
+	ctx := context.Background()
+
+	if _, _, err := s.Create(ctx, CreateRequest{Body: "a", OwnerClientID: "device-1"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.Create(ctx, CreateRequest{Body: "b", OwnerClientID: "device-2"}); err != nil {
+		t.Fatal(err)
+	}
+
+	mine, _, err := s.List(ctx, OwnerHashForClient("device-1"), 10, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(mine) != 1 {
+		t.Fatalf("device-1 看到 %d 条，want 1", len(mine))
+	}
+	if mine[0].Body != "" {
+		t.Error("列表不应包含正文")
 	}
 }
 
@@ -202,12 +288,16 @@ func TestListOmitsBody(t *testing.T) {
 	s := newService(t)
 	ctx := context.Background()
 
+	// 同一个匿名客户端复用同一个 owner token，三条都归它。
+	var token string
 	for i := 0; i < 3; i++ {
-		if _, err := s.Create(ctx, CreateRequest{Body: "body-content"}); err != nil {
+		_, tok, err := s.Create(ctx, CreateRequest{Body: "body-content", OwnerToken: token})
+		if err != nil {
 			t.Fatal(err)
 		}
+		token = tok
 	}
-	items, _, err := s.List(ctx, 10, "")
+	items, _, err := s.List(ctx, OwnerHashForToken(token), 10, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -250,7 +340,7 @@ func TestPublicDisabled(t *testing.T) {
 	defer db.Close()
 
 	s := NewService(db, Config{MaxBodyBytes: 1024, AllowPublic: false})
-	_, err = s.Create(context.Background(), CreateRequest{Body: "x", Visibility: VisPublic})
+	_, _, err = s.Create(context.Background(), CreateRequest{Body: "x", Visibility: VisPublic})
 	if !errors.Is(err, ErrForbidden) {
 		t.Errorf("err = %v, want ErrForbidden", err)
 	}

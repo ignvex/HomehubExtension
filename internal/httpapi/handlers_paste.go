@@ -25,6 +25,8 @@ type pasteResponse struct {
 	CreatedAt     *int64 `json:"created_at"`
 	UpdatedAt     *int64 `json:"updated_at,omitempty"`
 	URL           string `json:"url,omitempty"`
+	// OwnerToken 只在创建响应里出现一次，且仅匿名创建时有值。
+	OwnerToken string `json:"owner_token,omitempty"`
 }
 
 func toPasteResponse(p *pasteModel, withBody bool) pasteResponse {
@@ -69,7 +71,14 @@ func (s *server) handlePasteCreate(c *gin.Context) {
 		return
 	}
 
-	p, err := s.Paste.Create(c.Request.Context(), paste.CreateRequest{
+	// 归属：已登录用设备 id，匿名则 service 生成一次性 token。
+	cl := clientFrom(c)
+	var clientID string
+	if cl != nil {
+		clientID = cl.ID
+	}
+
+	p, ownerToken, err := s.Paste.Create(c.Request.Context(), paste.CreateRequest{
 		Title:         req.Title,
 		Body:          req.Body,
 		Language:      req.Language,
@@ -77,6 +86,8 @@ func (s *server) handlePasteCreate(c *gin.Context) {
 		Password:      req.Password,
 		ExpiresIn:     expiry,
 		BurnAfterRead: req.BurnAfterRead,
+		OwnerClientID: clientID,
+		OwnerToken:    c.GetHeader(headerOwnerToken),
 	})
 	if err != nil {
 		fail(c, err)
@@ -85,13 +96,17 @@ func (s *server) handlePasteCreate(c *gin.Context) {
 
 	resp := toPasteResponse(p, true)
 	resp.URL = s.publicURL("/p/" + p.Slug)
+	// 始终回显当前有效的 owner_token：首次创建时是服务端新生成的，
+	// 之后是客户端提交的原值。前端每次都用最新返回值覆盖本地存储，
+	// 这样即使 token 轮换也不会丢失归属。服务端只留哈希，丢了找不回。
+	resp.OwnerToken = ownerToken
 	c.Header("Location", "/p/"+p.Slug)
 	c.JSON(http.StatusCreated, resp)
 }
 
 func (s *server) handlePasteList(c *gin.Context) {
 	limit, _ := strconv.Atoi(c.Query("limit"))
-	items, next, err := s.Paste.List(c.Request.Context(), limit, c.Query("cursor"))
+	items, next, err := s.Paste.List(c.Request.Context(), OwnerHash(c), limit, c.Query("cursor"))
 	if err != nil {
 		fail(c, err)
 		return
@@ -104,7 +119,7 @@ func (s *server) handlePasteList(c *gin.Context) {
 }
 
 func (s *server) handlePasteGet(c *gin.Context) {
-	p, err := s.Paste.Read(c.Request.Context(), c.Param("slug"), pastePassword(c))
+	p, err := s.Paste.Read(c.Request.Context(), c.Param("slug"), pastePassword(c), OwnerHash(c))
 	if err != nil {
 		fail(c, err)
 		return
@@ -142,7 +157,7 @@ func (s *server) handlePasteUpdate(c *gin.Context) {
 		Visibility: req.Visibility,
 		Password:   req.Password,
 		ExpiresIn:  expiry,
-	})
+	}, OwnerHash(c))
 	if err != nil {
 		fail(c, err)
 		return
@@ -151,7 +166,7 @@ func (s *server) handlePasteUpdate(c *gin.Context) {
 }
 
 func (s *server) handlePasteDelete(c *gin.Context) {
-	if err := s.Paste.Delete(c.Request.Context(), c.Param("slug")); err != nil {
+	if err := s.Paste.Delete(c.Request.Context(), c.Param("slug"), OwnerHash(c)); err != nil {
 		fail(c, err)
 		return
 	}
@@ -166,14 +181,14 @@ func (s *server) handlePublicPaste(c *gin.Context) {
 	slug := c.Param("slug")
 
 	// 先取元信息判断形态，避免一次页面预取就把 burn_after_read 烧掉。
-	meta, err := s.Paste.Meta(c.Request.Context(), slug)
+	meta, err := s.Paste.Meta(c.Request.Context(), slug, OwnerHash(c))
 	if err != nil {
 		s.renderPasteError(c, err)
 		return
 	}
 
 	if c.Query("raw") == "1" && meta.PasswordHash == "" {
-		p, err := s.Paste.Read(c.Request.Context(), slug, "")
+		p, err := s.Paste.Read(c.Request.Context(), slug, "", OwnerHash(c))
 		if err != nil {
 			s.renderPasteError(c, err)
 			return
@@ -189,7 +204,7 @@ func (s *server) handlePublicPaste(c *gin.Context) {
 	}
 	if c.Request.Method == http.MethodPost {
 		// 表单提交（口令页）走这里。
-		p, err := s.Paste.Read(c.Request.Context(), slug, c.PostForm("password"))
+		p, err := s.Paste.Read(c.Request.Context(), slug, c.PostForm("password"), OwnerHash(c))
 		if err != nil {
 			s.renderPasswordPrompt(c, meta.Slug, "口令不正确")
 			return
@@ -198,7 +213,7 @@ func (s *server) handlePublicPaste(c *gin.Context) {
 		return
 	}
 
-	p, err := s.Paste.Read(c.Request.Context(), slug, "")
+	p, err := s.Paste.Read(c.Request.Context(), slug, "", OwnerHash(c))
 	if err != nil {
 		s.renderPasteError(c, err)
 		return

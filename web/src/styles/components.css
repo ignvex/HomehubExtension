@@ -1785,3 +1785,43 @@
     }
   }
 }
+
+/* ---- 订阅源新建表单 ---- */
+
+.feed-create {
+  padding: var(--space-4);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background: var(--surface);
+}
+
+.feed-create-row {
+  display: grid;
+  gap: var(--space-3);
+  /* 地址占大头，名称次之，间隔最窄；窄屏自动堆叠。 */
+  grid-template-columns: minmax(0, 2fr) minmax(0, 1fr) minmax(7rem, auto) auto;
+  align-items: end;
+}
+
+.feed-create-row .field--narrow {
+  min-width: 7rem;
+}
+
+.feed-create .btn {
+  height: 2.375rem; /* 与 .input 的行高对齐 */
+  white-space: nowrap;
+}
+
+@media (max-width: 780px) {
+  .feed-create-row {
+    grid-template-columns: 1fr;
+  }
+  .feed-create .btn {
+    width: 100%;
+  }
+}
+
+/* 订阅源卡片上的操作条：允许换行，否则窄屏会挤成一条。 */
+.feed-actions {
+  flex-wrap: wrap;
+}

@@ -14,14 +14,16 @@ type pasteStore struct{ d *DB }
 func (d *DB) Paste() store.PasteStore { return pasteStore{d} }
 
 const pasteCols = `id, slug, title, body, language, visibility, password_hash,
-                   expires_at, burn_after_read, size_bytes, created_at, updated_at, deleted_at`
+                   expires_at, burn_after_read, size_bytes, created_at, updated_at,
+                   deleted_at, owner_hash`
 
 func scanPaste(row interface{ Scan(...any) error }) (*store.Paste, error) {
 	var p store.Paste
 	var expires, deleted sql.NullInt64
 	var burn int
 	err := row.Scan(&p.ID, &p.Slug, &p.Title, &p.Body, &p.Language, &p.Visibility,
-		&p.PasswordHash, &expires, &burn, &p.SizeBytes, &p.CreatedAt, &p.UpdatedAt, &deleted)
+		&p.PasswordHash, &expires, &burn, &p.SizeBytes, &p.CreatedAt, &p.UpdatedAt,
+		&deleted, &p.OwnerHash)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, store.ErrNotFound
 	}
@@ -45,10 +47,11 @@ func (s pasteStore) Create(ctx context.Context, p *store.Paste) error {
 	}
 	_, err := s.d.rw.ExecContext(ctx, `
 		INSERT INTO paste (id, slug, title, body, language, visibility, password_hash,
-		                   expires_at, burn_after_read, size_bytes, created_at, updated_at)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
+		                   expires_at, burn_after_read, size_bytes, created_at, updated_at,
+		                   owner_hash)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		p.ID, p.Slug, p.Title, p.Body, p.Language, p.Visibility, p.PasswordHash,
-		nullInt(p.ExpiresAt), burn, p.SizeBytes, p.CreatedAt, p.UpdatedAt)
+		nullInt(p.ExpiresAt), burn, p.SizeBytes, p.CreatedAt, p.UpdatedAt, p.OwnerHash)
 	if err != nil {
 		if isUniqueViolation(err) {
 			return store.ErrConflict
@@ -85,7 +88,7 @@ func (s pasteStore) SoftDelete(ctx context.Context, slug string) error {
 	return requireAffected(res)
 }
 
-func (s pasteStore) List(ctx context.Context, limit int, cursor string) ([]store.Paste, string, error) {
+func (s pasteStore) List(ctx context.Context, ownerHash string, limit int, cursor string) ([]store.Paste, string, error) {
 	if limit <= 0 || limit > 200 {
 		limit = 50
 	}
@@ -93,6 +96,14 @@ func (s pasteStore) List(ctx context.Context, limit int, cursor string) ([]store
 	// 空游标表示从头开始：不加 id 条件，而不是与空字符串比较（那会返回空集）。
 	query := `SELECT ` + pasteCols + ` FROM paste WHERE deleted_at IS NULL`
 	args := []any{}
+	// 始终按归属过滤，空字符串也一样。
+	//
+	// 早先的写法是「ownerHash 为空则不过滤」，本意是留给管理员看全部。
+	// 但匿名调用方拿到的正是空字符串，结果匿名列表会返回所有人的片段。
+	// 归属过滤必须 fail-closed：空字符串匹配 owner_hash='' 的历史数据，
+	// 而不是匹配一切。
+	query += ` AND owner_hash = ?`
+	args = append(args, ownerHash)
 	if cursor != "" {
 		query += ` AND id < ?`
 		args = append(args, cursor)

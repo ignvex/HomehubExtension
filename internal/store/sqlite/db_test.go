@@ -28,8 +28,10 @@ func TestMigrateSetsVersion(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if v != 1 {
-		t.Errorf("schema version = %d, want 1", v)
+	// 迁移版本只前进不回退；新增迁移时同步更新这里。
+	const wantVersion = 2
+	if v != wantVersion {
+		t.Errorf("schema version = %d, want %d", v, wantVersion)
 	}
 	// 重复打开不应重复执行迁移。
 	if err := migrate(context.Background(), db.rw); err != nil {
@@ -103,7 +105,7 @@ func TestPasteListCursor(t *testing.T) {
 		}
 	}
 
-	page1, next, err := db.Paste().List(ctx, 2, "")
+	page1, next, err := db.Paste().List(ctx, "", 2, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -115,7 +117,7 @@ func TestPasteListCursor(t *testing.T) {
 		t.Errorf("first item = %s, want %s", page1[0].ID, ids[2])
 	}
 
-	page2, next2, err := db.Paste().List(ctx, 2, next)
+	page2, next2, err := db.Paste().List(ctx, "", 2, next)
 	if err != nil {
 		t.Fatal(err)
 	}

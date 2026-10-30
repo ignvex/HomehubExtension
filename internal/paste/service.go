@@ -4,8 +4,10 @@ package paste
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"strings"
@@ -43,6 +45,25 @@ type Config struct {
 	Languages     map[string]bool
 }
 
+// OwnerHash 把归属凭证换算成库里存的哈希。
+//
+// 两种来源用前缀区分，避免同一字符串在两种语义下撞到一起：
+//
+//	c:<clientID>  已登录设备
+//	t:<token>     匿名创建者持有的一次性凭证
+//
+// 只存哈希：数据库泄露不等于凭证泄露。
+func OwnerHash(prefix, value string) string {
+	sum := sha256.Sum256([]byte(prefix + ":" + value))
+	return hex.EncodeToString(sum[:])
+}
+
+// OwnerHashForClient 是已登录设备的归属哈希。
+func OwnerHashForClient(clientID string) string { return OwnerHash("c", clientID) }
+
+// OwnerHashForToken 是匿名创建者凭证的归属哈希。
+func OwnerHashForToken(token string) string { return OwnerHash("t", token) }
+
 // Service 实现片段的生命周期、一次性读取与口令校验。
 type Service struct {
 	st  store.Store
@@ -68,31 +89,37 @@ type CreateRequest struct {
 	Password      string
 	ExpiresIn     *time.Duration
 	BurnAfterRead bool
+	// OwnerClientID 由 handler 注入：已登录时是设备 id，匿名时为空。
+	OwnerClientID string
+	// OwnerToken 是匿名调用方提交的已有凭证。
+	// 首次创建时为空，service 会生成一个；之后同一客户端应复用它，
+	// 否则每次创建都产生新归属，列表里永远只有最近一条。
+	OwnerToken string
 }
 
 // Create 生成 slug 并落库。slug 冲突时重试，5 次仍失败则报错。
-func (s *Service) Create(ctx context.Context, req CreateRequest) (*store.Paste, error) {
-	p, err := s.buildPaste(req)
+func (s *Service) Create(ctx context.Context, req CreateRequest) (*store.Paste, string, error) {
+	p, ownerToken, err := s.buildPaste(req)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 
 	// slug 冲突几乎不可能（62^6 ≈ 5.7e10），但一旦发生就重试。
 	for attempt := 0; attempt < 5; attempt++ {
 		slug, err := randomSlug(s.cfg.SlugLength)
 		if err != nil {
-			return nil, err
+			return nil, "", err
 		}
 		p.Slug = slug
 		err = s.st.Paste().Create(ctx, p)
 		if err == nil {
-			return p, nil
+			return p, ownerToken, nil
 		}
 		if !errors.Is(err, store.ErrConflict) {
-			return nil, err
+			return nil, "", err
 		}
 	}
-	return nil, errors.New("could not allocate a unique slug")
+	return nil, "", errors.New("could not allocate a unique slug")
 }
 
 // buildPaste 校验输入并构造值对象，不涉及任何 IO。
@@ -100,12 +127,12 @@ func (s *Service) Create(ctx context.Context, req CreateRequest) (*store.Paste, 
 // 独立出来是为了让 Create 只承担"生成 slug 并处理冲突"这一件事：
 // 参数校验、默认值填充、过期时间解析与口令哈希都属于纯计算，
 // 混在一起会让主流程读不出骨架。
-func (s *Service) buildPaste(req CreateRequest) (*store.Paste, error) {
+func (s *Service) buildPaste(req CreateRequest) (*store.Paste, string, error) {
 	if int64(len(req.Body)) > s.cfg.MaxBodyBytes {
-		return nil, fmt.Errorf("%w: limit is %d bytes", ErrTooLarge, s.cfg.MaxBodyBytes)
+		return nil, "", fmt.Errorf("%w: limit is %d bytes", ErrTooLarge, s.cfg.MaxBodyBytes)
 	}
 	if strings.TrimSpace(req.Body) == "" {
-		return nil, errors.New("body must not be empty")
+		return nil, "", errors.New("body must not be empty")
 	}
 
 	vis := req.Visibility
@@ -113,7 +140,7 @@ func (s *Service) buildPaste(req CreateRequest) (*store.Paste, error) {
 		vis = VisUnlisted
 	}
 	if vis == VisPublic && !s.cfg.AllowPublic {
-		return nil, ErrForbidden
+		return nil, "", ErrForbidden
 	}
 
 	// 未知语言回落到 text 而不是报错：语言标记只影响展示，
@@ -129,16 +156,35 @@ func (s *Service) buildPaste(req CreateRequest) (*store.Paste, error) {
 	now := s.now()
 	expiresAt, err := s.resolveExpiry(req.ExpiresIn, now)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 
 	hash := ""
 	if req.Password != "" {
 		h, err := HashPassword(req.Password)
 		if err != nil {
-			return nil, err
+			return nil, "", err
 		}
 		hash = h
+	}
+
+	// 归属：已登录用设备 id，匿名凭 owner token。
+	//
+	// 匿名客户端首次创建时带着空 token 来，这里生成一个；之后它应该
+	// 在每次创建时复用同一个 token，否则每条片段都是独立归属，
+	// 列表里只会出现最近创建的那一条。
+	var ownerHash, ownerToken string
+	if req.OwnerClientID != "" {
+		ownerHash = OwnerHashForClient(req.OwnerClientID)
+	} else {
+		ownerToken = req.OwnerToken
+		if ownerToken == "" {
+			ownerToken, err = randomToken(32)
+			if err != nil {
+				return nil, "", err
+			}
+		}
+		ownerHash = OwnerHashForToken(ownerToken)
 	}
 
 	return &store.Paste{
@@ -153,7 +199,8 @@ func (s *Service) buildPaste(req CreateRequest) (*store.Paste, error) {
 		SizeBytes:     int64(len(req.Body)),
 		CreatedAt:     now.Unix(),
 		UpdatedAt:     now.Unix(),
-	}, nil
+		OwnerHash:     ownerHash,
+	}, ownerToken, nil
 }
 
 // resolveExpiry 把请求里的相对时长换算成绝对时刻。
@@ -185,7 +232,7 @@ func (s *Service) resolveExpiry(in *time.Duration, now time.Time) (*int64, error
 }
 
 // Read 返回片段。带密码的片段必须提供正确口令。
-func (s *Service) Read(ctx context.Context, slug, password string) (*store.Paste, error) {
+func (s *Service) Read(ctx context.Context, slug, password, ownerHash string) (*store.Paste, error) {
 	p, err := s.st.Paste().GetBySlug(ctx, slug)
 	if err != nil {
 		return nil, err
@@ -193,6 +240,11 @@ func (s *Service) Read(ctx context.Context, slug, password string) (*store.Paste
 	now := s.now()
 	if !p.Live(now.Unix()) {
 		return nil, ErrExpired
+	}
+	// private 的语义是"只有创建者能读"。归属不匹配时返回 ErrNotFound
+	// 而不是 ErrForbidden：告诉对方"存在但你没权限"本身就是信息泄露。
+	if p.Visibility == VisPrivate && p.OwnerHash != ownerHash {
+		return nil, store.ErrNotFound
 	}
 	if p.PasswordHash != "" {
 		if !VerifyPassword(p.PasswordHash, password) {
@@ -215,13 +267,17 @@ func (s *Service) Read(ctx context.Context, slug, password string) (*store.Paste
 // Meta 只返回元信息，不消耗一次性读取机会。
 // 公开页需要先知道标题与语言才能渲染，而 burn_after_read 的片段
 // 不应因为页面预取就被烧掉。
-func (s *Service) Meta(ctx context.Context, slug string) (*store.Paste, error) {
+func (s *Service) Meta(ctx context.Context, slug, ownerHash string) (*store.Paste, error) {
 	p, err := s.st.Paste().GetBySlug(ctx, slug)
 	if err != nil {
 		return nil, err
 	}
 	if !p.Live(s.now().Unix()) {
 		return nil, ErrExpired
+	}
+	// 元信息也会泄露标题，private 片段同样要挡住。
+	if p.Visibility == VisPrivate && p.OwnerHash != ownerHash {
+		return nil, store.ErrNotFound
 	}
 	p.Body = ""
 	return p, nil
@@ -238,7 +294,7 @@ type UpdateRequest struct {
 }
 
 // Update 覆盖可变字段。已过期或已删除的片段返回 ErrExpired。
-func (s *Service) Update(ctx context.Context, slug string, req UpdateRequest) (*store.Paste, error) {
+func (s *Service) Update(ctx context.Context, slug string, req UpdateRequest, ownerHash string) (*store.Paste, error) {
 	p, err := s.st.Paste().GetBySlug(ctx, slug)
 	if err != nil {
 		return nil, err
@@ -246,6 +302,11 @@ func (s *Service) Update(ctx context.Context, slug string, req UpdateRequest) (*
 	now := s.now()
 	if !p.Live(now.Unix()) {
 		return nil, ErrExpired
+	}
+	// 只有创建者能改。匿名创建者也一样——凭 owner token 证明身份。
+	// 返回 ErrNotFound 而非 ErrForbidden，理由同 Read。
+	if p.OwnerHash != "" && p.OwnerHash != ownerHash {
+		return nil, store.ErrNotFound
 	}
 
 	if req.Title != nil {
@@ -302,13 +363,23 @@ func (s *Service) Update(ctx context.Context, slug string, req UpdateRequest) (*
 }
 
 // Delete 软删除片段。物理删除由 paste-expired 任务负责。
-func (s *Service) Delete(ctx context.Context, slug string) error {
+func (s *Service) Delete(ctx context.Context, slug, ownerHash string) error {
+	p, err := s.st.Paste().GetBySlug(ctx, slug)
+	if err != nil {
+		return err
+	}
+	if !p.Live(s.now().Unix()) {
+		return ErrExpired
+	}
+	if p.OwnerHash != "" && p.OwnerHash != ownerHash {
+		return store.ErrNotFound
+	}
 	return s.st.Paste().SoftDelete(ctx, slug)
 }
 
 // List 分页返回未删除且未过期的片段，不含正文。
-func (s *Service) List(ctx context.Context, limit int, cursor string) ([]store.Paste, string, error) {
-	items, next, err := s.st.Paste().List(ctx, limit, cursor)
+func (s *Service) List(ctx context.Context, ownerHash string, limit int, cursor string) ([]store.Paste, string, error) {
+	items, next, err := s.st.Paste().List(ctx, ownerHash, limit, cursor)
 	if err != nil {
 		return nil, "", err
 	}
@@ -326,6 +397,18 @@ func (s *Service) List(ctx context.Context, limit int, cursor string) ([]store.P
 // ---- slug ----
 
 const base62 = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+
+// randomToken 生成 URL 安全的随机凭证。
+//
+// 用 base64url 而不是 base62：它编码 32 字节只需 43 个字符，
+// 且可以被客户端原样放进 header 或 localStorage，不需要转义。
+func randomToken(n int) (string, error) {
+	buf := make([]byte, n)
+	if _, err := rand.Read(buf); err != nil {
+		return "", err
+	}
+	return base64.RawURLEncoding.EncodeToString(buf), nil
+}
 
 func randomSlug(n int) (string, error) {
 	buf := make([]byte, n)

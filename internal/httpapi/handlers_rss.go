@@ -326,3 +326,161 @@ func (s *server) handleEntryOriginal(c *gin.Context) {
 }
 
 var _ = blob.ErrNotFound
+
+// feedCreateRequest 是网页端新建订阅源的载荷。
+//
+// 与 Homehub 推送（hubUpsertRequest）的区别：那边是宿主主动推，
+// 这边是用户自己填。共用同一个 Upsert，所以同一 URL 不会重复建。
+type feedCreateRequest struct {
+	URL      string `json:"url" binding:"required"`
+	Title    string `json:"title"`
+	Interval string `json:"interval"`
+	Enabled  *bool  `json:"enabled"`
+}
+
+func (s *server) handleFeedCreate(c *gin.Context) {
+	if s.RSS == nil {
+		failWith(c, http.StatusNotFound, "not_found", "RSS 模块未启用")
+		return
+	}
+	var req feedCreateRequest
+	if !bindJSON(c, &req) {
+		return
+	}
+
+	// 入库前挡住内网地址。匿名用户若能新建订阅，就等于把服务
+	// 变成 SSRF 跳板：让它去访问 169.254.169.254 并把内容读回来。
+	if err := s.RSS.ValidateURL(req.URL); err != nil {
+		failWith(c, http.StatusBadRequest, "invalid_request", "订阅地址不可用",
+			FieldError{Field: "url", Reason: err.Error()})
+		return
+	}
+
+	interval := s.Cfg.RSS.DefaultInterval.Duration
+	if req.Interval != "" {
+		d, err := time.ParseDuration(req.Interval)
+		if err != nil {
+			failWith(c, http.StatusBadRequest, "invalid_request", "interval 格式不正确",
+				FieldError{Field: "interval", Reason: `需要形如 "30m" 的时长`})
+			return
+		}
+		interval = d
+	}
+	// 与 hub 推送走同一套夹紧规则，避免两个入口行为不一致。
+	if interval < s.Cfg.RSS.MinInterval.Duration {
+		interval = s.Cfg.RSS.MinInterval.Duration
+	}
+	if interval > s.Cfg.RSS.MaxInterval.Duration {
+		interval = s.Cfg.RSS.MaxInterval.Duration
+	}
+
+	enabled := true
+	if req.Enabled != nil {
+		enabled = *req.Enabled
+	}
+
+	now := time.Now()
+	next := now.Unix()
+	saved, created, err := s.Store.Feed().Upsert(c.Request.Context(), &store.Feed{
+		URL:           req.URL,
+		Title:         req.Title,
+		Source:        "manual",
+		Enabled:       enabled,
+		FetchInterval: int64(interval / time.Second),
+		NextFetchAt:   &next,
+		CreatedAt:     now.Unix(),
+	})
+	if err != nil {
+		fail(c, err)
+		return
+	}
+
+	status := http.StatusOK
+	if created {
+		status = http.StatusCreated
+	}
+
+	c.JSON(status, feedResponse{
+		ID: saved.ID, URL: saved.URL, Title: saved.Title, SiteURL: saved.SiteURL,
+		Enabled:       saved.Enabled,
+		FetchInterval: (time.Duration(saved.FetchInterval) * time.Second).String(),
+		NextFetchAt:   optTS(saved.NextFetchAt),
+		LastFetchAt:   optTS(saved.LastFetchAt),
+		LastStatus:    saved.LastStatus,
+		LastError:     saved.LastError,
+		ErrorCount:    saved.ErrorCount,
+	})
+}
+
+// feedUpdateRequest 只允许改调度与显示字段。
+//
+// URL 不可改：它是去重键，改了等于换一个订阅。要换就删了重建。
+type feedUpdateRequest struct {
+	Title    *string `json:"title"`
+	Interval *string `json:"interval"`
+	Enabled  *bool   `json:"enabled"`
+}
+
+func (s *server) handleFeedUpdate(c *gin.Context) {
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		failWith(c, http.StatusBadRequest, "invalid_request", "id 必须是整数")
+		return
+	}
+	var req feedUpdateRequest
+	if !bindJSON(c, &req) {
+		return
+	}
+
+	feed, err := s.Store.Feed().Get(c.Request.Context(), id)
+	if err != nil {
+		fail(c, err)
+		return
+	}
+
+	if req.Title != nil {
+		feed.Title = *req.Title
+	}
+	if req.Enabled != nil {
+		feed.Enabled = *req.Enabled
+		// 重新启用时清掉失败计数，否则一次历史故障会让它立刻又停下。
+		if *req.Enabled && feed.ErrorCount > 0 {
+			feed.ErrorCount = 0
+			feed.LastError = ""
+			next := time.Now().Unix()
+			feed.NextFetchAt = &next
+		}
+	}
+	if req.Interval != nil {
+		d, perr := time.ParseDuration(*req.Interval)
+		if perr != nil {
+			failWith(c, http.StatusBadRequest, "invalid_request", "interval 格式不正确")
+			return
+		}
+		if d < s.Cfg.RSS.MinInterval.Duration {
+			d = s.Cfg.RSS.MinInterval.Duration
+		}
+		if d > s.Cfg.RSS.MaxInterval.Duration {
+			d = s.Cfg.RSS.MaxInterval.Duration
+		}
+		feed.FetchInterval = int64(d / time.Second)
+	}
+
+	if err := s.Store.Feed().Update(c.Request.Context(), feed); err != nil {
+		fail(c, err)
+		return
+	}
+
+	unread, _ := s.Store.Entry().UnreadCount(c.Request.Context(), id)
+	c.JSON(http.StatusOK, feedResponse{
+		ID: feed.ID, URL: feed.URL, Title: feed.Title, SiteURL: feed.SiteURL,
+		Enabled:       feed.Enabled,
+		FetchInterval: (time.Duration(feed.FetchInterval) * time.Second).String(),
+		NextFetchAt:   optTS(feed.NextFetchAt),
+		LastFetchAt:   optTS(feed.LastFetchAt),
+		LastStatus:    feed.LastStatus,
+		LastError:     feed.LastError,
+		ErrorCount:    feed.ErrorCount,
+		UnreadCount:   unread,
+	})
+}

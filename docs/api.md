@@ -10,7 +10,7 @@
 | 时长 | 字符串，如 `"30m"`、`"168h"`（人可读，需要解析） |
 | 标识 | 字符串；Paste 用 `slug`，其他资源用 ULID |
 | 分页 | 游标式，`?limit=&cursor=`，响应带 `next_cursor`；没有下一页时是 `null` |
-| 认证 | `Authorization: Bearer <token>` 或会话 cookie |
+| 认证 | `Authorization: Bearer <token>`；SSE 用会话 cookie；paste 可完全匿名 |
 | 追踪 | 每个响应带 `X-Request-ID`，与服务端日志一致 |
 | 压缩 | Caddy 负责；API 不自行压缩 |
 
@@ -32,6 +32,22 @@
 **时长不是时刻。** `fetch_interval`、`expires_in`（配置口径）用字符串 `"30m"`；`expires_in`（API 响应里的剩余秒数）是整数秒，因为它是计数值。前端换算只有一处：`lib/format.ts` 的 `parseTime` 里 `sec * 1000`。
 
 唯一的时刻例外是 `SystemInfo.build_time`：它是 `-ldflags` 注入的构建元数据，不是运行时事实，保留人可读字符串。
+
+### 1.1 鉴权边界
+
+不是所有端点都要求登录。边界由「这个操作会不会替用户访问外部世界」与「页面是不是入口」决定：
+
+| 端点 | 鉴权 | 理由 |
+| --- | --- | --- |
+| `GET /apps` | 无 | 工具台是入口页，未登录也该看到能做什么 |
+| `GET /system/info`、`GET /system/stats` | 无 | 首页卡片角标依赖它们；只返回版本与聚合计数 |
+| `/pastes/*` | **可选** | 匿名可创建与管理自己的片段，见 3.1 |
+| `GET /p/*` | 无 | 分享链接要能被 curl 与爬虫读取 |
+| `/feeds/*`、`/entries/*` | **必须** | 抓取会主动访问外部地址，匿名开放等于开放 SSRF |
+| `/system/jobs`、`/system/config` | **必须** | 运维信息 |
+| `/auth/*` | 无 | 它们本身就是获取凭证的入口，有独立限流 |
+
+`/pastes/*` 用「可选鉴权」：有 Bearer 就按设备归属，有 `X-Owner-Token` 就按凭证归属，都没有则视为匿名——但**匿名请求的归属过滤不因此放宽**，见 3.1。
 
 统一错误结构：
 
@@ -231,6 +247,27 @@ Cookie 认证的写请求必须带 `X-CSRF-Token`，值与 `hh_csrf` cookie 一�
 | `DELETE` | `/api/v1/pastes/{slug}` | 软删除 |
 | `GET` | `/p/{slug}` | 公开 HTML 页（服务端渲染，无 JS） |
 | `GET` | `/p/{slug}?raw=1` | 纯文本，`text/plain` |
+
+### 3.1 归属与 owner token
+
+创建不要求登录，但「私有片段只有创建者能看」与「管理自己创建的片段」都需要一个身份。方案是一枚 **owner token**：
+
+- 首次匿名创建时服务端生成，只在创建响应里出现一次，字段名 `owner_token`
+- 客户端必须存下来（`localStorage`），之后的请求带 `X-Owner-Token` 头
+- 服务端只存它的 `sha256`，库里没有明文；丢了找不回
+- 已登录创建不返回该字段，归属由 Bearer 承载
+
+**为什么用 header 而不是 query**：query 会进访问日志，而这些日志通常会被收集到别处。
+
+**过滤必须 fail-closed**：`GET /pastes` 始终按归属过滤，哪怕归属是空字符串。早先的实现把空字符串当"不过滤"，结果匿名调用方能看到所有人的片段——空字符串恰恰就是匿名调用方会带来的值。
+
+`visibility` 的语义：
+
+| 值 | 含义 |
+| --- | --- |
+| `public` | 出现在公开列表 |
+| `unlisted` | 知道链接即可访问（默认） |
+| `private` | 只有创建者能读；其他人拿到链接返回 **404**（不是 403——确认存在性本身就是泄露） |
 
 创建请求：
 

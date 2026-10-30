@@ -1,3 +1,4 @@
+import { loadOwnerToken } from "../auth/owner-token";
 import { ApiError } from "./errors";
 
 const API_BASE = "/api/v1";
@@ -47,6 +48,11 @@ export async function send<T>(path: string, init: HttpInit = {}): Promise<T> {
   const headers = new Headers(init.headers);
   headers.set("Accept", "application/json");
   headers.set("X-Request-ID", requestId());
+
+  // 匿名所有权凭证。没有登录态时也带上，服务端据此识别"自己的"片段。
+  // 未设置时为空字符串，服务端按匿名处理。
+  const ownerToken = loadOwnerToken();
+  if (ownerToken) headers.set("X-Owner-Token", ownerToken);
 
   let body: string | undefined;
   if (init.body !== undefined) {

@@ -56,8 +56,10 @@ type PasteStore interface {
 	// ClaimBurn 原子地把 burn_after_read 的片段标记为已读。
 	// 返回 true 表示本次调用抢到了唯一一次读取权；false 表示已被别人读走。
 	ClaimBurn(ctx context.Context, slug string, now int64) (bool, error)
-	// List 按主键倒序分页。返回空游标表示没有下一页。
-	List(ctx context.Context, limit int, cursor string) ([]Paste, string, error)
+	// List 按归属过滤并倒序分页。
+	// ownerHash 始终参与过滤：空字符串匹配 owner_hash=''（迁移前的历史数据），
+	// 而不是"返回全部"。归属过滤必须 fail-closed。
+	List(ctx context.Context, ownerHash string, limit int, cursor string) ([]Paste, string, error)
 	// PurgeExpired 物理删除过期或已软删超过保留期的记录，返回删除行数。
 	PurgeExpired(ctx context.Context, now int64, softDeletedBefore int64) (int64, error)
 }
@@ -224,6 +226,10 @@ type Paste struct {
 	CreatedAt     int64
 	UpdatedAt     int64
 	DeletedAt     *int64
+	// OwnerHash 是"持有即拥有"凭证的 sha256。
+	// 登录用户用 client id，匿名用户用服务端生成的一次性 token。
+	// 空字符串表示迁移前的历史数据。
+	OwnerHash string
 }
 
 // Live 表示未删除且未过期。

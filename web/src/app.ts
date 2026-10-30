@@ -19,11 +19,20 @@ import { pastesView } from "./views/pastes";
 import { readerView } from "./views/reader";
 import { settingsView } from "./views/settings";
 
+// 路由与鉴权边界。
+//
+// auth: false 的页面在未登录时也能打开：
+//   工具台  —— 用户看到的第一个页面，不该是登录墙
+//   paste   —— 匿名可创建与管理自己的片段（凭 owner token）
+//
+// auth: true 的页面必须配对：
+//   RSS 阅读、订阅源管理 —— 抓取会主动访问外部地址
+//   设置 —— 含运维信息
 const ROUTES: readonly RouteDefinition[] = [
-  { path: "/", view: homeView, auth: true, title: "工具台" },
+  { path: "/", view: homeView, auth: false, title: "工具台" },
   { path: "/pair", view: pairView, auth: false, title: "设备配对" },
-  { path: "/pastes", view: pastesView, auth: true, title: "片段" },
-  { path: "/pastes/new", view: pasteNewView, auth: true, title: "新建片段" },
+  { path: "/pastes", view: pastesView, auth: false, title: "片段" },
+  { path: "/pastes/new", view: pasteNewView, auth: false, title: "新建片段" },
   { path: "/entries", view: entriesView, auth: true, title: "条目" },
   { path: "/entries/:id", view: readerView, auth: true, title: "阅读" },
   { path: "/feeds", view: feedsView, auth: true, title: "订阅源" },

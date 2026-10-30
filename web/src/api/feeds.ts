@@ -15,3 +15,43 @@ export function refreshFeed(id: number, signal?: AbortSignal): Promise<unknown> 
     ...(signal ? { signal } : {}),
   });
 }
+
+export interface CreateFeedInput {
+  url: string;
+  title?: string;
+  interval?: string;
+  enabled?: boolean;
+}
+
+export function createFeed(input: CreateFeedInput, signal?: AbortSignal): Promise<Feed> {
+  return api<Feed>("/feeds", {
+    method: "POST",
+    body: input,
+    ...(signal ? { signal } : {}),
+  });
+}
+
+export interface UpdateFeedInput {
+  title?: string;
+  interval?: string;
+  enabled?: boolean;
+}
+
+export function updateFeed(
+  id: number,
+  input: UpdateFeedInput,
+  signal?: AbortSignal,
+): Promise<Feed> {
+  return api<Feed>(`/feeds/${id}`, {
+    method: "PATCH",
+    body: input,
+    ...(signal ? { signal } : {}),
+  });
+}
+
+export function deleteFeed(id: number, signal?: AbortSignal): Promise<void> {
+  return api<void>(`/feeds/${id}`, {
+    method: "DELETE",
+    ...(signal ? { signal } : {}),
+  });
+}

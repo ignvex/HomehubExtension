@@ -492,3 +492,18 @@ func (d *Downloader) DownloadAll(
 	wg.Wait()
 	return out
 }
+
+// ValidateURL 校验一个订阅地址是否可抓。
+//
+// 导出给 HTTP 层用：网页端新建订阅源时必须在入库前挡住内网地址，
+// 否则服务就成了一个开放的 SSRF 跳板——匿名用户能让它去访问
+// 家庭内网的任意地址并把响应内容读回来。
+//
+// 策略与媒体下载共用同一套判断（checkHost），避免两处规则漂移。
+func (s *Service) ValidateURL(raw string) error {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("%w: 无法解析", ErrBlockedHost)
+	}
+	return checkHost(u, s.cfg.AllowPrivateHosts)
+}

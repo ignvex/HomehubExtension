@@ -20,6 +20,7 @@ import (
 	"github.com/ignvex/HomehubExtension/internal/config"
 	"github.com/ignvex/HomehubExtension/internal/events"
 	"github.com/ignvex/HomehubExtension/internal/paste"
+	"github.com/ignvex/HomehubExtension/internal/rss"
 	"github.com/ignvex/HomehubExtension/internal/store/sqlite"
 
 	"github.com/gin-gonic/gin"
@@ -35,6 +36,7 @@ type harness struct {
 	bus      *events.Bus
 	blobs    *blob.Store
 	pasteSvc *paste.Service
+	rssSvc   *rss.Service
 }
 
 func newHarness(t *testing.T) *harness {
@@ -86,16 +88,27 @@ func newHarness(t *testing.T) *harness {
 	})
 
 	bus := events.New()
+	rssSvc := rss.NewService(db, blobs, rss.Config{
+		UserAgent:       "test/1",
+		RequestTimeout:  2 * time.Second,
+		FetchTimeout:    5 * time.Second,
+		MaxFeedBytes:    1 << 20,
+		MaxEntryBytes:   1 << 20,
+		DefaultInterval: 30 * time.Minute,
+		MinInterval:     10 * time.Minute,
+		MaxInterval:     6 * time.Hour,
+	}, nil)
+
 	router := NewRouter(Deps{
 		Cfg: cfg, Store: db, Blobs: blobs, Auth: svc, HubVerifier: verifier,
-		Paste: pasteSvc, Log: nil, Bus: bus,
+		Paste: pasteSvc, RSS: rssSvc, Log: nil, Bus: bus,
 		Build:   BuildInfo{Version: "test"},
 		Started: time.Now(),
 	})
 
 	return &harness{router: router, db: db, cfg: cfg, svc: svc,
 		hubPriv: hubPriv, hubPub: hubPub, bus: bus,
-		blobs: blobs, pasteSvc: pasteSvc}
+		blobs: blobs, pasteSvc: pasteSvc, rssSvc: rssSvc}
 }
 
 // setLimiter 重建路由以挂上限流器。
@@ -104,7 +117,7 @@ func (h *harness) setLimiter(l *auth.AttemptLimiter) {
 	h.router = NewRouter(Deps{
 		Cfg: h.cfg, Store: h.db, Blobs: h.blobs, Auth: h.svc,
 		HubVerifier: auth.NewHubVerifier(h.hubPub, time.Minute, time.Minute),
-		Paste:       h.pasteSvc, Log: nil, Bus: h.bus, Limiter: l,
+		Paste:       h.pasteSvc, RSS: h.rssSvc, Log: nil, Bus: h.bus, Limiter: l,
 		Build:   BuildInfo{Version: "test"},
 		Started: time.Now(),
 	})
@@ -213,10 +226,48 @@ func TestHealthAndReady(t *testing.T) {
 	}
 }
 
+// 鉴权边界：哪些端点匿名可用，哪些必须登录。
+//
+// 这条测试是需求的可执行表达——改了路由鉴权而忘了改这里，
+// 说明边界被无意中移动了。
+func TestAuthBoundaries(t *testing.T) {
+	h := newHarness(t)
+
+	// 匿名可用：工具台首页要靠它们渲染。
+	for _, path := range []string{
+		"/api/v1/apps",
+		"/api/v1/system/info",
+		"/api/v1/system/stats",
+		"/api/v1/pastes", // 匿名可以有自己的片段
+	} {
+		w := h.do(t, httptest.NewRequest(http.MethodGet, path, nil))
+		if w.Code != http.StatusOK {
+			t.Errorf("%s 应匿名可访问, got %d: %s", path, w.Code, w.Body.String())
+		}
+	}
+
+	// 必须登录：抓取会访问外部地址，匿名开放等于开放 SSRF。
+	// 任务历史与配置视图含运维信息，也不该公开。
+	for _, path := range []string{
+		"/api/v1/feeds",
+		"/api/v1/entries",
+		"/api/v1/system/jobs",
+		"/api/v1/system/config",
+	} {
+		w := h.do(t, httptest.NewRequest(http.MethodGet, path, nil))
+		if w.Code != http.StatusUnauthorized {
+			t.Errorf("%s 应要求登录, got %d", path, w.Code)
+		}
+		if ct := w.Header().Get("Content-Type"); !strings.Contains(ct, "application/json") {
+			t.Errorf("%s content-type = %q, want JSON", path, ct)
+		}
+	}
+}
+
 func TestUnauthenticatedRejected(t *testing.T) {
 	h := newHarness(t)
 
-	for _, path := range []string{"/api/v1/pastes", "/api/v1/feeds", "/api/v1/entries"} {
+	for _, path := range []string{"/api/v1/feeds", "/api/v1/entries"} {
 		w := h.do(t, httptest.NewRequest(http.MethodGet, path, nil))
 		if w.Code != http.StatusUnauthorized {
 			t.Errorf("%s = %d, want 401", path, w.Code)
@@ -554,5 +605,133 @@ func TestEnrollRateLimited(t *testing.T) {
 	}
 	if w.Header().Get("Retry-After") == "" {
 		t.Error("429 应带 Retry-After，客户端才知道何时能再试")
+	}
+}
+
+// 匿名创建片段必须返回 owner_token，且凭它能管理自己的片段。
+// 这是「不登录也能用」与「私有片段有意义」之间的桥。
+func TestAnonymousPasteOwnership(t *testing.T) {
+	h := newHarness(t)
+
+	// 不带任何凭证创建。
+	w := h.doJSON(t, http.MethodPost, "/api/v1/pastes", map[string]any{
+		"body": "anonymous", "visibility": "private",
+	}, nil)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("匿名创建 = %d: %s", w.Code, w.Body.String())
+	}
+
+	var created struct {
+		Slug       string `json:"slug"`
+		OwnerToken string `json:"owner_token"`
+	}
+	json.Unmarshal(w.Body.Bytes(), &created)
+	if created.OwnerToken == "" {
+		t.Fatal("匿名创建必须返回 owner_token")
+	}
+
+	// 没有 token 读 private 片段：应 404（不是 403——不确认存在性）。
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/pastes/"+created.Slug, nil)
+	if w := h.do(t, req); w.Code != http.StatusNotFound {
+		t.Errorf("无 token 读 private = %d, want 404", w.Code)
+	}
+
+	// 带 token 就能读。
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/pastes/"+created.Slug, nil)
+	req.Header.Set(headerOwnerToken, created.OwnerToken)
+	if w := h.do(t, req); w.Code != http.StatusOK {
+		t.Fatalf("带 token 读 private = %d: %s", w.Code, w.Body.String())
+	}
+
+	// 列表只返回自己的：另一个匿名调用方看不到别人创建的。
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/pastes", nil)
+	w = h.do(t, req)
+	var listed struct {
+		Items []struct {
+			Slug string `json:"slug"`
+		} `json:"items"`
+	}
+	json.Unmarshal(w.Body.Bytes(), &listed)
+	for _, it := range listed.Items {
+		if it.Slug == created.Slug {
+			t.Error("无 token 的列表里出现了别人的片段")
+		}
+	}
+
+	// 带 token 的列表能看到。
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/pastes", nil)
+	req.Header.Set(headerOwnerToken, created.OwnerToken)
+	w = h.do(t, req)
+	json.Unmarshal(w.Body.Bytes(), &listed)
+	found := false
+	for _, it := range listed.Items {
+		if it.Slug == created.Slug {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("带 token 的列表里应能看到自己的片段")
+	}
+
+	// 别人删不掉。
+	req = httptest.NewRequest(http.MethodDelete, "/api/v1/pastes/"+created.Slug, nil)
+	req.Header.Set(headerOwnerToken, "someone-else")
+	if w := h.do(t, req); w.Code != http.StatusNotFound {
+		t.Errorf("别人删除 = %d, want 404", w.Code)
+	}
+
+	// 自己能删。
+	req = httptest.NewRequest(http.MethodDelete, "/api/v1/pastes/"+created.Slug, nil)
+	req.Header.Set(headerOwnerToken, created.OwnerToken)
+	if w := h.do(t, req); w.Code != http.StatusNoContent {
+		t.Errorf("拥有者删除 = %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// 登录用户创建的片段归属到设备，靠 Bearer 管理，不需要 owner_token。
+func TestLoggedInPasteOwnership(t *testing.T) {
+	h := newHarness(t)
+	token, _ := h.login(t)
+
+	w := h.doJSON(t, http.MethodPost, "/api/v1/pastes", map[string]any{
+		"body": "mine", "visibility": "private",
+	}, bearer(token))
+	if w.Code != http.StatusCreated {
+		t.Fatalf("创建 = %d", w.Code)
+	}
+	var created struct {
+		Slug       string `json:"slug"`
+		OwnerToken string `json:"owner_token"`
+	}
+	json.Unmarshal(w.Body.Bytes(), &created)
+
+	// 已登录创建不应返回 owner_token——身份由 Bearer 承载。
+	if created.OwnerToken != "" {
+		t.Error("已登录创建不该返回 owner_token")
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/pastes/"+created.Slug, nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	if w := h.do(t, req); w.Code != http.StatusOK {
+		t.Errorf("设备读自己的 private = %d", w.Code)
+	}
+}
+
+// 订阅源管理需要登录，且入库前必须挡住内网地址。
+func TestFeedCreateRequiresAuthAndBlocksSSRF(t *testing.T) {
+	h := newHarness(t)
+
+	body := []byte(`{"url":"http://169.254.169.254/latest/meta-data/"}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/feeds", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	if w := h.do(t, req); w.Code != http.StatusUnauthorized {
+		t.Errorf("匿名新建订阅 = %d, want 401", w.Code)
+	}
+
+	token, _ := h.login(t)
+	w := h.doJSON(t, http.MethodPost, "/api/v1/feeds",
+		map[string]any{"url": "http://169.254.169.254/latest/meta-data/"}, bearer(token))
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("内网地址 = %d, want 400: %s", w.Code, w.Body.String())
 	}
 }

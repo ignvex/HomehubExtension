@@ -109,6 +109,11 @@ export interface PasteSummary {
   created_at: number;
   updated_at?: number | null;
   url?: string;
+  /**
+   * 匿名创建时返回的所有权凭证，只在创建响应里出现一次。
+   * 已登录创建时为空。前端必须存进 localStorage 后才能管理该片段。
+   */
+  owner_token?: string;
 }
 
 export interface PasteDetail extends PasteSummary {
