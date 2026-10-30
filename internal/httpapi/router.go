@@ -195,10 +195,9 @@ func (s *server) registerSystem(r *gin.Engine) {
 	// 公开端点：工具台首页要在未登录时就能渲染，
 	// 否则用户看到的第一个页面是登录墙，不知道这服务能干什么。
 	//
-	// /apps 只返回应用元信息与计数，不含任何用户内容。
-	// /system/info 是版本与运行时长，/system/stats 是聚合计数——
-	// 这两者曾要求鉴权，但首页的卡片角标依赖它们，放开更合理。
-	pub := r.Group("/api/v1")
+	// 用 OptionalAuth 而不是完全跳过鉴权：有凭证时要能算出「你的」
+	// 片段数，否则角标会显示全局计数而列表是空的。
+	pub := r.Group("/api/v1", OptionalAuth(s.Auth))
 	pub.GET("/apps", s.handleApps)
 	pub.GET("/system/info", s.handleInfo)
 	pub.GET("/system/stats", s.handleStats)

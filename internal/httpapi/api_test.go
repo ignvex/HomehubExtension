@@ -735,3 +735,138 @@ func TestFeedCreateRequiresAuthAndBlocksSSRF(t *testing.T) {
 		t.Errorf("内网地址 = %d, want 400: %s", w.Code, w.Body.String())
 	}
 }
+
+// 工具台角标必须与列表口径一致。
+//
+// 这个 bug 出现过：角标读的是全局计数，列表按归属过滤，于是
+// 匿名用户看到「首页说 2 条」点进去却是空的。两个数字来自不同
+// 查询口径这件事，只有把两者放在同一条测试里比较才会暴露。
+func TestAppsBadgeMatchesPasteList(t *testing.T) {
+	h := newHarness(t)
+
+	// 匿名创建两条，同一个 owner token。
+	var token string
+	for i := 0; i < 2; i++ {
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/pastes",
+			bytes.NewReader([]byte(`{"body":"x"}`)))
+		req.Header.Set("Content-Type", "application/json")
+		if token != "" {
+			req.Header.Set(headerOwnerToken, token)
+		}
+		w := h.do(t, req)
+		if w.Code != http.StatusCreated {
+			t.Fatalf("创建 = %d: %s", w.Code, w.Body.String())
+		}
+		var created struct {
+			OwnerToken string `json:"owner_token"`
+		}
+		json.Unmarshal(w.Body.Bytes(), &created)
+		token = created.OwnerToken
+	}
+
+	badgeFor := func(token string) int64 {
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/apps", nil)
+		if token != "" {
+			req.Header.Set(headerOwnerToken, token)
+		}
+		w := h.do(t, req)
+		if w.Code != http.StatusOK {
+			t.Fatalf("apps = %d", w.Code)
+		}
+		var resp struct {
+			Apps []struct {
+				ID    string `json:"id"`
+				Badge *struct {
+					Count int64 `json:"count"`
+				} `json:"badge"`
+			} `json:"apps"`
+		}
+		json.Unmarshal(w.Body.Bytes(), &resp)
+		for _, a := range resp.Apps {
+			if a.ID == "pastebin" && a.Badge != nil {
+				return a.Badge.Count
+			}
+		}
+		return -1
+	}
+
+	listLen := func(token string) int {
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/pastes", nil)
+		if token != "" {
+			req.Header.Set(headerOwnerToken, token)
+		}
+		w := h.do(t, req)
+		var resp struct {
+			Items []json.RawMessage `json:"items"`
+		}
+		json.Unmarshal(w.Body.Bytes(), &resp)
+		return len(resp.Items)
+	}
+
+	// 带 token：角标 == 列表条数。
+	badge, listed := badgeFor(token), listLen(token)
+	if badge != int64(listed) {
+		t.Errorf("角标 %d 与列表 %d 不一致", badge, listed)
+	}
+	if badge != 2 {
+		t.Errorf("角标 = %d, want 2", badge)
+	}
+
+	// 匿名：两者都必须是 0——不是「角标显示全局数、列表是空的」。
+	if got := badgeFor(""); got != 0 {
+		t.Errorf("匿名角标 = %d, want 0（不该暴露全局计数）", got)
+	}
+	if got := listLen(""); got != 0 {
+		t.Errorf("匿名列表 = %d, want 0", got)
+	}
+}
+
+// 详情页依赖的路由与数据必须对得上：
+// 列表里出现的每个 slug，都要能通过 GET /pastes/{slug} 读到。
+//
+// 曾经前端没有 /pastes/:slug 路由，列表也无法点击——
+// 断言「列表里的条目都能打开」能同时锁住这两件事。
+func TestEveryListedPasteIsReadable(t *testing.T) {
+	h := newHarness(t)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/pastes",
+		bytes.NewReader([]byte(`{"body":"detail me","visibility":"unlisted"}`)))
+	req.Header.Set("Content-Type", "application/json")
+	w := h.do(t, req)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("创建 = %d", w.Code)
+	}
+	var created struct {
+		Slug       string `json:"slug"`
+		OwnerToken string `json:"owner_token"`
+	}
+	json.Unmarshal(w.Body.Bytes(), &created)
+
+	// 列表里有它。
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/pastes", nil)
+	req.Header.Set(headerOwnerToken, created.OwnerToken)
+	w = h.do(t, req)
+	var listed struct {
+		Items []struct {
+			Slug string `json:"slug"`
+		} `json:"items"`
+	}
+	json.Unmarshal(w.Body.Bytes(), &listed)
+	if len(listed.Items) != 1 || listed.Items[0].Slug != created.Slug {
+		t.Fatalf("列表 = %+v", listed.Items)
+	}
+
+	// 列表里的 slug 能打开详情。
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/pastes/"+listed.Items[0].Slug, nil)
+	w = h.do(t, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("详情 = %d: %s", w.Code, w.Body.String())
+	}
+	var detail struct {
+		Body string `json:"body"`
+	}
+	json.Unmarshal(w.Body.Bytes(), &detail)
+	if detail.Body != "detail me" {
+		t.Errorf("正文 = %q", detail.Body)
+	}
+}

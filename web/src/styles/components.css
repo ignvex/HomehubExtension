@@ -1825,3 +1825,76 @@
 .feed-actions {
   flex-wrap: wrap;
 }
+
+  /* ---- 片段详情 ---- */
+
+  /* 列表标题是进入详情的入口：整块可点，且不能丢掉可访问性。
+     用链接包住文本而不是给 h2 绑 onclick——键盘与读屏都能用。 */
+  .paste-title-link {
+    color: inherit;
+    text-decoration: none;
+  }
+
+  .paste-title-link:hover {
+    color: var(--accent);
+    text-decoration: underline;
+    text-underline-offset: 0.2em;
+  }
+
+  .paste-detail {
+    display: grid;
+    gap: var(--space-4);
+  }
+
+  .paste-detail-head {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-3);
+    align-items: start;
+    justify-content: space-between;
+  }
+
+  .paste-detail-title {
+    margin: 0;
+    font-size: var(--text-lg);
+    font-weight: 600;
+    overflow-wrap: anywhere;
+  }
+
+  .paste-detail-meta {
+    display: grid;
+    gap: var(--space-1) var(--space-4);
+    grid-template-columns: max-content minmax(0, 1fr);
+    margin: 0;
+    font-size: var(--text-sm);
+  }
+
+  .paste-detail-meta dt {
+    color: var(--text-muted);
+  }
+
+  .paste-detail-meta dd {
+    margin: 0;
+    overflow-wrap: anywhere;
+  }
+
+  /* 正文：等宽、保留空白、横向可滚。
+     长行不折行是刻意的——代码片段折行后缩进会错位。 */
+  .paste-content {
+    margin: 0;
+    padding: var(--space-4);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    background: var(--surface-alt);
+    overflow-x: auto;
+    max-height: 70vh;
+    overflow-y: auto;
+  }
+
+  .paste-content code {
+    font-family: var(--font-mono);
+    font-size: var(--text-sm);
+    line-height: 1.6;
+    white-space: pre;
+    tab-size: 2;
+  }

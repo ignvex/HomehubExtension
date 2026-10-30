@@ -88,7 +88,12 @@ func (s pasteStore) SoftDelete(ctx context.Context, slug string) error {
 	return requireAffected(res)
 }
 
-func (s pasteStore) List(ctx context.Context, ownerHash string, limit int, cursor string) ([]store.Paste, string, error) {
+func (s pasteStore) List(
+	ctx context.Context,
+	ownerHash string,
+	limit int,
+	cursor string,
+) ([]store.Paste, string, error) {
 	if limit <= 0 || limit > 200 {
 		limit = 50
 	}
@@ -167,4 +172,16 @@ func (s pasteStore) ClaimBurn(ctx context.Context, slug string, nowSec int64) (b
 		return false, err
 	}
 	return n == 1, nil
+}
+
+// CountByOwner 统计某归属下未删除的片段数。
+//
+// 与 List 用同一套过滤条件：工具台的角标必须和列表里的条数一致，
+// 否则会出现「首页说 2 条、列表是空的」这种自相矛盾的界面。
+func (s pasteStore) CountByOwner(ctx context.Context, ownerHash string) (int64, error) {
+	var n int64
+	err := s.d.ro.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM paste WHERE deleted_at IS NULL AND owner_hash = ?`,
+		ownerHash).Scan(&n)
+	return n, err
 }

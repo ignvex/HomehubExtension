@@ -34,13 +34,30 @@ func (s *server) handleApps(c *gin.Context) {
 		return
 	}
 
+	// 角标必须与列表口径一致：列表按归属过滤，角标就不能是全局计数。
+	// 否则用户会看到「首页说 2 条、列表是空的」这种自相矛盾的界面。
+	owner := OwnerHash(c)
+	myPastes, err := s.Store.Paste().CountByOwner(c.Request.Context(), owner)
+	if err != nil {
+		fail(c, err)
+		return
+	}
+
+	// RSS 数据只有登录用户才看得到，匿名时不要把全局未读数当角标——
+	// 那会让匿名用户以为有内容却进不去。
+	loggedIn := clientFrom(c) != nil
+	unread := stats.Unread
+	if !loggedIn {
+		unread = 0
+	}
+
 	apps := make([]appCard, 0, 4)
 	if s.Cfg.Pastebin.Enabled {
 		apps = append(apps, appCard{
 			ID: "pastebin", Name: "Pastebin", Icon: "paste",
 			Description: "自托管文本片段，支持过期、口令与一次性读取",
 			Path:        "/pastes", Enabled: true,
-			Badge: &appBadge{Count: stats.Pastes, Label: "条"},
+			Badge: &appBadge{Count: myPastes, Label: "条"},
 		})
 	}
 	if s.Cfg.RSS.Enabled {
@@ -48,7 +65,7 @@ func (s *server) handleApps(c *gin.Context) {
 			ID: "rss", Name: "RSS 阅读", Icon: "rss",
 			Description: "订阅由 Homehub 推送，媒体全部本地化，零第三方请求",
 			Path:        "/entries", Enabled: true,
-			Badge: &appBadge{Count: stats.Unread, Label: "未读"},
+			Badge: &appBadge{Count: unread, Label: "未读"},
 		})
 	}
 	apps = append(apps, appCard{
@@ -129,11 +146,26 @@ func (s *server) handleStats(c *gin.Context) {
 		fail(c, err)
 		return
 	}
+
+	// pastes 按归属统计，与列表一致。
+	// feeds/entries 只有登录用户看得到，匿名时返回 0 而不是全局数字。
+	owner := OwnerHash(c)
+	myPastes, err := s.Store.Paste().CountByOwner(c.Request.Context(), owner)
+	if err != nil {
+		fail(c, err)
+		return
+	}
+	loggedIn := clientFrom(c) != nil
+	feeds, entries, unread := stats.Feeds, stats.Entries, stats.Unread
+	if !loggedIn {
+		feeds, entries, unread = 0, 0, 0
+	}
+
 	out := gin.H{
-		"pastes":        stats.Pastes,
-		"feeds":         stats.Feeds,
-		"entries":       stats.Entries,
-		"unread":        stats.Unread,
+		"pastes":        myPastes,
+		"feeds":         feeds,
+		"entries":       entries,
+		"unread":        unread,
 		"blobs":         stats.Blobs,
 		"blob_bytes":    stats.BlobBytes,
 		"pending_media": stats.PendingMedia,

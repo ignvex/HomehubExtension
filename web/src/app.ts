@@ -14,6 +14,7 @@ import { feedsView } from "./views/feeds";
 import { homeView } from "./views/home";
 import { notFoundView } from "./views/not-found";
 import { pairView } from "./views/pair";
+import { pasteDetailView } from "./views/paste-detail";
 import { pasteNewView } from "./views/paste-new";
 import { pastesView } from "./views/pastes";
 import { readerView } from "./views/reader";
@@ -33,6 +34,7 @@ const ROUTES: readonly RouteDefinition[] = [
   { path: "/pair", view: pairView, auth: false, title: "设备配对" },
   { path: "/pastes", view: pastesView, auth: false, title: "片段" },
   { path: "/pastes/new", view: pasteNewView, auth: false, title: "新建片段" },
+  { path: "/pastes/:slug", view: pasteDetailView, auth: false, title: "片段详情" },
   { path: "/entries", view: entriesView, auth: true, title: "条目" },
   { path: "/entries/:id", view: readerView, auth: true, title: "阅读" },
   { path: "/feeds", view: feedsView, auth: true, title: "订阅源" },

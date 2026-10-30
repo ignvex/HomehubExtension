@@ -60,6 +60,9 @@ type PasteStore interface {
 	// ownerHash 始终参与过滤：空字符串匹配 owner_hash=''（迁移前的历史数据），
 	// 而不是"返回全部"。归属过滤必须 fail-closed。
 	List(ctx context.Context, ownerHash string, limit int, cursor string) ([]Paste, string, error)
+	// CountByOwner 统计某归属下未删除的片段数。
+	// 与 List 一样按 ownerHash 过滤，空字符串匹配历史数据。
+	CountByOwner(ctx context.Context, ownerHash string) (int64, error)
 	// PurgeExpired 物理删除过期或已软删超过保留期的记录，返回删除行数。
 	PurgeExpired(ctx context.Context, now int64, softDeletedBefore int64) (int64, error)
 }

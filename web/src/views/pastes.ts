@@ -96,7 +96,16 @@ function pasteRow(
     h(
       "div",
       { class: "paste-main" },
-      h("h2", { class: "paste-title" }, title),
+      // 标题可点：详情页是查看正文与管理的主入口。
+      h(
+        "h2",
+        { class: "paste-title" },
+        h(
+          "a",
+          { class: "paste-title-link", attrs: { href: `/pastes/${encodeURIComponent(paste.slug)}` } },
+          title,
+        ),
+      ),
       h(
         "p",
         { class: "paste-meta" },
