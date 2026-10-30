@@ -92,15 +92,35 @@ if (sizes.some((file) => file.name.endsWith(".map"))) {
   fail("dist 中不应有 sourcemap");
 }
 
-// 6. 体积闸门。数值来自 docs/frontend.md 的预算。
+// 6. 体积闸门。
+//
+// 分两档统计，因为懒加载让「总量大」和「首屏慢」脱钩了：
+//   首屏 = index.html 直接引用的入口 chunk + shared 公共 chunk
+//   按需 = 其余 tools-* 等动态 import 的 chunk
+//
+// 只卡总量会逼着人删功能；只卡首屏则总量可能失控。
+// 两档都设上限，各自对应真实的用户体验与部署成本。
 const totalRaw = sizes.reduce((sum, file) => sum + file.raw, 0);
 const js = sizes.filter((file) => file.name.endsWith(".js"));
 const css = sizes.filter((file) => file.name.endsWith(".css"));
-const jsGzip = js.reduce((sum, file) => sum + file.gzip, 0);
 const cssGzip = css.reduce((sum, file) => sum + file.gzip, 0);
-if (totalRaw > 300 * 1024) fail(`dist 未压缩总量 ${totalRaw} 字节，超过 300 KB`);
-if (jsGzip > 60 * 1024) fail(`JS gzip ${jsGzip} 字节，超过 60 KB`);
-if (cssGzip > 15 * 1024) fail(`CSS gzip ${cssGzip} 字节，超过 15 KB`);
+
+// 从 index.html 里找出首屏直接加载的 chunk 文件名。
+const entryRefs = [...html.matchAll(/(?:src|href)=["']([^"']+\.js)["']/gi)]
+  .map((m) => (m[1] ?? "").split("/").pop() ?? "")
+  .filter(Boolean);
+const isEntry = (file) => entryRefs.some((ref) => file.name.endsWith(ref)) || /\/shared-/.test(file.name);
+
+const entryJs = js.filter(isEntry);
+const lazyJs = js.filter((file) => !isEntry(file));
+const entryGzip = entryJs.reduce((sum, file) => sum + file.gzip, 0);
+const lazyGzip = lazyJs.reduce((sum, file) => sum + file.gzip, 0);
+
+if (totalRaw > 400 * 1024) fail(`dist 未压缩总量 ${totalRaw} 字节，超过 400 KB`);
+if (entryGzip > 40 * 1024) fail(`首屏 JS gzip ${entryGzip} 字节，超过 40 KB`);
+if (lazyGzip > 80 * 1024) fail(`按需 JS gzip ${lazyGzip} 字节，超过 80 KB`);
+if (cssGzip > 20 * 1024) fail(`CSS gzip ${cssGzip} 字节，超过 20 KB`);
+if (lazyJs.length > 40) fail(`按需 chunk 数量 ${lazyJs.length}，超过 40 个`);
 
 sizes.sort((a, b) => b.raw - a.raw);
 for (const file of sizes) {
@@ -110,6 +130,10 @@ for (const file of sizes) {
 }
 console.log(
   `\n合计：${sizes.length} 个文件，${totalRaw} B 未压缩 / ${sizes.reduce((s, f) => s + f.gzip, 0)} B gzip`,
+);
+console.log(
+  `首屏 JS：${entryJs.length} 个 chunk / ${entryGzip} B gzip；` +
+    `按需 JS：${lazyJs.length} 个 chunk / ${lazyGzip} B gzip；CSS：${cssGzip} B gzip`,
 );
 
 if (failures.length > 0) {

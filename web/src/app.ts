@@ -19,6 +19,8 @@ import { pasteNewView } from "./views/paste-new";
 import { pastesView } from "./views/pastes";
 import { readerView } from "./views/reader";
 import { settingsView } from "./views/settings";
+import { toolView } from "./views/tool-runner";
+import { toolsView } from "./views/tools";
 
 // 路由与鉴权边界。
 //
@@ -38,6 +40,10 @@ const ROUTES: readonly RouteDefinition[] = [
   { path: "/entries", view: entriesView, auth: true, title: "条目" },
   { path: "/entries/:id", view: readerView, auth: true, title: "阅读" },
   { path: "/feeds", view: feedsView, auth: true, title: "订阅源" },
+  // 开发工具全部是纯前端计算，不需要登录。
+  // 它们不访问任何服务器数据，也不发起外部请求。
+  { path: "/tools", view: toolsView, auth: false, title: "开发工具" },
+  { path: "/tools/:id", view: toolView, auth: false, title: "工具" },
   { path: "/settings", view: settingsView, auth: true, title: "设置" },
 ];
 

@@ -29,7 +29,24 @@ export type IconName =
   | "lock"
   | "database"
   | "chevron-right"
-  | "filter";
+  | "filter"
+  // 开发工具用
+  | "tools"
+  | "braces"
+  | "regex"
+  | "calculator"
+  | "binary"
+  | "link"
+  | "hash"
+  | "file-code"
+  | "image"
+  | "minimize"
+  | "image-plus"
+  | "fingerprint"
+  | "qr"
+  | "palette"
+  | "type"
+  | "search";
 
 interface IconDefinition {
   paths: readonly string[];
@@ -97,6 +114,30 @@ const ICONS: Record<IconName, IconDefinition> = {
   database: { paths: ["M4 6c0-1.66 3.58-3 8-3s8 1.34 8 3-3.58 3-8 3-8-1.34-8-3z", "M4 6v12c0 1.66 3.58 3 8 3s8-1.34 8-3V6", "M4 12c0 1.66 3.58 3 8 3s8-1.34 8-3"] },
   "chevron-right": { paths: ["m9 6 6 6-6 6"] },
   filter: { paths: ["M3 5h18", "M6 12h12", "M10 19h4"] },
+  tools: {
+    paths: [
+      "M14.7 6.3a4 4 0 0 1 5 5l-2.4-2.4-2.6 2.6-2.4-2.4 2.4-2.8z",
+      "M12.3 9 4 17.3V20h2.7L15 11.7",
+      "M17 14l3 3",
+    ],
+  },
+  braces: { paths: ["M9 4H7a2 2 0 0 0-2 2v4l-2 2 2 2v4a2 2 0 0 0 2 2h2", "M15 4h2a2 2 0 0 1 2 2v4l2 2-2 2v4a2 2 0 0 1-2 2h-2"] },
+  regex: { paths: ["M4 18h4", "M6 18v-4", "M14 8v.01", "M18 12v.01", "M10 15v.01", "M16 6v.01"] },
+  calculator: {
+    paths: ["M5 3h14v18H5z", "M8 7h8v3H8z", "M8 14h.01", "M12 14h.01", "M16 14h.01", "M8 17.5h.01", "M12 17.5h.01", "M16 17.5h.01"],
+  },
+  binary: { paths: ["M7 5h3v6H7z", "M14 13h3v6h-3z", "M7 17h1", "M16 5h1"] },
+  link: { paths: ["M10 13a5 5 0 0 0 7 0l2-2a5 5 0 0 0-7-7l-1 1", "M14 11a5 5 0 0 0-7 0l-2 2a5 5 0 0 0 7 7l1-1"] },
+  hash: { paths: ["M5 9h14", "M5 15h14", "M10 3 8 21", "M16 3l-2 18"] },
+  "file-code": { paths: ["M6 3h8l4 4v14H6z", "M14 3v4h4", "M9 12l2 2-2 2", "M13 16h2"] },
+  image: { paths: ["M4 5h16v14H4z", "M8.5 10a1.5 1.5 0 1 0 0-3 1.5 1.5 0 0 0 0 3z", "M5 17l4.5-4.5 3 3L16 12l3 3"] },
+  minimize: { paths: ["M4 9V4h5", "M20 9V4h-5", "M4 15v5h5", "M20 15v5h-5"] },
+  "image-plus": { paths: ["M4 5h11v14H4z", "M7.5 10a1.5 1.5 0 1 0 0-3 1.5 1.5 0 0 0 0 3z", "M5 17l3.5-3.5 2.5 2.5L14 13", "M19 8v6", "M16 11h6"] },
+  fingerprint: { paths: ["M12 4a8 8 0 0 0-8 8v3", "M12 8a4 4 0 0 0-4 4v5", "M12 12v8", "M16 12a4 4 0 0 1 4-4v7"] },
+  qr: { paths: ["M4 4h6v6H4z", "M14 4h6v6h-6z", "M4 14h6v6H4z", "M14 14h2v2h-2z", "M18 14h2v2h-2z", "M14 18h2v2h-2z", "M18 18h2v2h-2z"] },
+  palette: { paths: ["M12 3a9 9 0 1 0 0 18h2a2 2 0 0 0 0-4 2 2 0 0 1 2-2h1a4 4 0 0 0 4-4 9 9 0 0 0-9-8z", "M8 9v.01", "M12 7v.01", "M16 9v.01"] },
+  type: { paths: ["M4 6V4h16v2", "M12 4v16", "M9 20h6"] },
+  search: { paths: ["M11 4a7 7 0 1 0 0 14 7 7 0 0 0 0-14z", "M16 16l4 4"] },
 };
 
 export function icon(name: IconName, className = "icon"): SVGSVGElement {
@@ -134,6 +175,8 @@ const APP_ICONS: Record<string, IconName> = {
   reader: "inbox",
   settings: "settings",
   system: "settings",
+  tools: "tools",
+  workbench: "tools",
 };
 
 export function appIcon(name: string): SVGSVGElement | null {

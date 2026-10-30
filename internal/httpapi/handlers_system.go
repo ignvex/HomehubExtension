@@ -68,6 +68,14 @@ func (s *server) handleApps(c *gin.Context) {
 			Badge: &appBadge{Count: unread, Label: "未读"},
 		})
 	}
+	// 开发工具：纯前端计算，不碰服务器数据。
+	// 放在 Pastebin 与 RSS 之后——它们是本项目的两个主功能，
+	// 工具集是附带的便利。
+	apps = append(apps, appCard{
+		ID: "tools", Name: "开发工具", Icon: "tools",
+		Description: "JSON、正则、Base64、哈希、二维码等，全部在浏览器本地运行",
+		Path:        "/tools", Enabled: true,
+	})
 	apps = append(apps, appCard{
 		ID: "system", Name: "系统", Icon: "settings",
 		Description: "运行状态、存储占用与清理任务记录",

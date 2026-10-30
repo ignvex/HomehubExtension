@@ -19,7 +19,9 @@ dev-web: ## 前端开发服务器（Vite，代理到 8080）
 	pnpm --dir web dev
 
 build: web ## 交叉编译 linux/amd64 单二进制
-	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "$(LDFLAGS)" -o $(BINARY) .
+	# -a 强制重建：go:embed 的目录变化在 9p / 网络文件系统上
+	# 可能检测不到 mtime 变化，导致二进制里嵌的是旧前端。
+	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -a -trimpath -ldflags "$(LDFLAGS)" -o $(BINARY) .
 	@ls -lh $(BINARY)
 
 web: ## 构建前端
