@@ -111,7 +111,7 @@ func NewDownloader(blobs *blob.Store, cfg DownloadConfig) *Downloader {
 		cfg.MaxBytes = 50 << 20
 	}
 	if cfg.UserAgent == "" {
-		cfg.UserAgent = "HomehubExtension/0.1"
+		cfg.UserAgent = "HomehubExtension/1.0"
 	}
 	return &Downloader{
 		client: &http.Client{

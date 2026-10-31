@@ -80,7 +80,7 @@
     "media_concurrency": 3,
     "fetch_timeout": "90s",
     "request_timeout": "20s",
-    "user_agent": "HomehubExtension/0.1 (+https://homehub.example.com)",
+    "user_agent": "HomehubExtension/1.0 (+https://homehub.example.com)",
     "max_feed_bytes": 5242880,
     "max_entry_bytes": 2097152,
     "allow_private_hosts": false,

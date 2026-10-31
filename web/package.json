@@ -1,6 +1,6 @@
 {
   "name": "homehub-extension-web",
-  "version": "0.1.0",
+  "version": "1.0.0-alpha",
   "private": true,
   "type": "module",
   "packageManager": "pnpm@12.6.0",

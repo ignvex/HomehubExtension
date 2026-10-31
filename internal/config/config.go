@@ -176,7 +176,7 @@ func Default() Config {
 			MediaConcurrency: 3,
 			FetchTimeout:     Duration{90 * time.Second},
 			RequestTimeout:   Duration{20 * time.Second},
-			UserAgent:        "HomehubExtension/0.1",
+			UserAgent:        "HomehubExtension/1.0",
 			MaxFeedBytes:     5 << 20,
 			MaxEntryBytes:    2 << 20,
 			Referer:          "auto",

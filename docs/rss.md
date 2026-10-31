@@ -41,7 +41,7 @@ ETag/304  统一模型  剥离脚本     解析 srcset   校验+哈希    失败
 
 ```http
 GET <feed url> HTTP/1.1
-User-Agent: HomehubExtension/0.1 (+https://homehub.example.com)
+User-Agent: HomehubExtension/1.0 (+https://homehub.example.com)
 Accept: application/rss+xml, application/atom+xml, application/feed+json, application/xml;q=0.9, */*;q=0.5
 Accept-Encoding: gzip, br, zstd
 If-None-Match: <etag>

@@ -9,7 +9,7 @@ Homehub 的扩展服务：一个 Go 单二进制后端 + TypeScript 前端，为
 - **RSS 阅读器（资源本地化）** —— 订阅可由 **Homehub 宿主主动推送**，也可在网页端手动添加（需登录）。抓取后把正文涉及的所有媒体下载到本地，无法本地化、但会让浏览器对外发起请求的元素一律抹除。验收标准是可执行的：**读完一篇文章，浏览器没有向第三方发出任何请求**。
 - **开发工具台（15 个）** —— 全部在浏览器里算，不上传、不联网、不追踪。按路由懒加载，首屏只下载元数据，单个工具的实现不进主 bundle。分五类：文本与校验（JSON、正则、程序员计算器）、编码与哈希（Base64、URL、哈希）、配置格式（YAML / JSON / INI 互转）、图片处理（格式转换、压缩、Base64）、时间与随机（时间戳、UUID、二维码、颜色、字体）。
 
-> 状态：M0–M9 已落地，仅剩 OPML 导入导出（M10）。`make test`、`make lint`、`make units`、`pnpm --dir web check` 全绿，`go build` 与 `pnpm --dir web build` 都能产出可部署产物。
+> 状态：M0–M9 已落地，仅剩 OPML 导入导出（M10）。当前版本 `1.0.0-alpha`，变更见 [CHANGELOG.md](CHANGELOG.md)。`make test`、`make lint`、`make units`、`pnpm --dir web check` 全绿，`go build` 与 `pnpm --dir web build` 都能产出可部署产物。
 
 ## 设计约束
 
@@ -324,6 +324,7 @@ systemctl list-timers homehub-backup.timer
 | [docs/config.md](docs/config.md) | 配置加载、全字段说明、cleanup cron 设计、systemd 集成 |
 | [docs/api.md](docs/api.md) | REST 约定、Ed25519 双向鉴权协议、端点清单、错误与分页 |
 | [docs/hub-integration.md](docs/hub-integration.md) | **面向 Homehub 宿主的对接指南**：部署准备、请求签名（含 Go/TS 参考实现与测试向量）、端点、重试与对账 |
+| [CHANGELOG.md](CHANGELOG.md) | 版本变更记录；本版发布说明见 [docs/release-notes/v1.0.0-alpha.md](docs/release-notes/v1.0.0-alpha.md) |
 | [docs/rss.md](docs/rss.md) | 抓取与条件请求、HTML 白名单清洗、媒体下载与重写、SSRF 防护、CSP |
 | [docs/frontend.md](docs/frontend.md) | pnpm 工程、路由与视图、CSS 分层、阅读器排版、构建与 embed |
 
