@@ -249,50 +249,35 @@ Homehub 宿主推送订阅时使用的入站签名通道。
 
 ### 5.1 unit
 
-```ini
-[Unit]
-Description=HomehubExtension
-Documentation=https://github.com/ignvex/HomehubExtension
-After=network-online.target
-Wants=network-online.target
+完整单元见 [`deploy/homehub-extension.service`](../deploy/homehub-extension.service)。
+这里不再贴副本：文档里曾经贴过一份，结果和实际文件静默漂移了（文档写着
+`Type=simple` 和一条 `ExecReload`，而进程根本不处理 SIGHUP）。唯一来源是 deploy 下的文件。
 
-[Service]
-Type=simple
-User=homehub
-Group=homehub
-EnvironmentFile=-/etc/homehub-extension/env
-ExecStart=/usr/local/bin/homehub-extension serve -config /etc/homehub-extension/config.json
-ExecReload=/bin/kill -HUP $MAINPID
-Restart=on-failure
-RestartSec=5s
+几个不显然的取值，以及它们各自防的是什么：
 
-# 加固
-NoNewPrivileges=true
-ProtectSystem=strict
-ProtectHome=true
-PrivateTmp=true
-PrivateDevices=true
-ProtectKernelTunables=true
-ProtectKernelModules=true
-RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
-ReadWritePaths=/var/lib/homehub-extension
+- **`Type=notify` + `WatchdogSec=60s`**：进程在端口真正 bind 成功之后才发 `READY=1`，
+  `systemctl start` 返回时服务已经可用，部署脚本和 `After=` 依赖它的 unit 都不必再轮询 `/healthz`。
+  心跳每 30 秒一次，超过 60 秒没有心跳 systemd 判定假死并重启——这是 `Restart=on-failure`
+  完全看不到的一类故障：进程还在、端口还占着，但已经不干活。
+- **`StateDirectory=homehub-extension`**：目录由 systemd 创建并 chown，同时自动放行给
+  `ProtectSystem=strict`。安装时不需要手工 `mkdir` + `chown`。
+- **`GOMEMLIMIT=256MiB` 与 `MemoryMax=512M` 必须成对**：前者让 Go 的 GC 提前压低堆，
+  后者是 cgroup 硬墙。只配 `MemoryMax` 的话，触墙就是 OOM kill，没有减震。
+- **`ExecStartPre=... migrate`**：迁移失败停在启动前，日志直接指向配置或权限问题，
+  而不是让 serve 反复崩在 `Type=notify` 的启动超时上。
+- **没有 `ExecReload`**：进程只处理 `SIGINT`/`SIGTERM`，SIGHUP 走默认处置直接终止进程。
+  写一条 `ExecReload=/bin/kill -HUP $MAINPID` 得到的不是热重载，而是 `systemctl reload`
+  把服务杀掉——随后被 `Restart=on-failure` 拉起，看起来像是「reload 生效了」。
+- **`TimeoutStopSec=30s`** 要大于应用内部的 20 秒关闭预算，否则 systemd 会强杀，
+  WAL 来不及 checkpoint。
+- **`Restart=on-failure` 而不是 `always`**，配 `StartLimitBurst=5` / `StartLimitIntervalSec=60`：
+  配置错误这类启动失败重试几次就停在 failed，不会无限刷日志。
+- **`SystemCallFilter=@system-service` + `SystemCallErrorNumber=EPERM`**：被过滤的调用返回
+  错误而不是发 `SIGSYS` 杀进程，真出问题时是一个可读的错误而不是无声崩溃。
 
-# 资源
-MemoryMax=512M
-LimitNOFILE=4096
-TimeoutStopSec=25s
-
-[Install]
-WantedBy=multi-user.target
-```
-
-要点：
-
-- `ProtectSystem=strict` 把根文件系统挂成只读，`ReadWritePaths` 是唯一出口。漏掉它表现为启动即失败、日志只有 `permission denied`。
-- `EnvironmentFile` 里的变量用于 `${VAR}` 展开，文件权限 `0600 root:homehub`。
-- `TimeoutStopSec` 要大于应用内部的 20 秒关闭预算，否则 systemd 会强杀，WAL 来不及 checkpoint。
-- `Restart=on-failure` 而不是 `always`：配置错误这类启动失败不应该无限重启刷日志。
-- `MemoryMax=512M` 让内核在内存紧张时优先杀本进程，保护宿主。
+加固程度可以量化：`systemd-analyze security --offline=yes deploy/homehub-extension.service`
+当前是 **1.5 OK**（首版是 6.3 MEDIUM）。这个分数越低越好；改完文件后跑一次，
+超过 2.0 就值得看看是哪一项退化了。
 
 ### 5.2 环境文件
 
@@ -305,13 +290,24 @@ HOMEHUB_TOKEN=redacted
 
 ```bash
 sudo install -m 0755 bin/homehub-extension /usr/local/bin/
-sudo install -d -o homehub -g homehub -m 0750 /var/lib/homehub-extension
+sudo install -m 0755 deploy/backup.sh /usr/local/bin/homehub-backup.sh
+# 数据目录由 unit 里的 StateDirectory 创建并 chown，不需要手工 mkdir
 sudo install -d -m 0750 /etc/homehub-extension
 sudo install -m 0640 -o root -g homehub config.json /etc/homehub-extension/config.json
 sudo install -m 0600 -o root -g homehub deploy/env.example /etc/homehub-extension/env
+sudo install -m 0644 deploy/homehub-extension.service \
+                    deploy/homehub-backup.service deploy/homehub-backup.timer /etc/systemd/system/
+sudo install -d -o homehub -g homehub -m 0750 /var/backups/homehub
 sudo systemctl daemon-reload
-sudo systemctl enable --now homehub-extension
+sudo systemctl enable --now homehub-extension homehub-backup.timer
 journalctl -u homehub-extension -f
+```
+
+`homehub` 系统用户需要先存在：
+
+```bash
+sudo useradd --system --home /var/lib/homehub-extension \
+  --shell /usr/sbin/nologin homehub
 ```
 
 首次配对：
@@ -324,22 +320,37 @@ sudo -u homehub /usr/local/bin/homehub-extension enroll \
 
 命令输出一次性配对码，15 分钟内有效。浏览器打开 `https://<public_url>/pair` 输入即可。
 
-### 5.4 重载
+### 5.4 改配置
 
-`SIGHUP` 只重载以下三项，其余变更需要重启并会写一条 warn 日志：
+**一律 `systemctl restart homehub-extension`。** 目前没有热重载，进程不处理 SIGHUP。
 
-- `log.level`
-- `cleanup.jobs` 的调度（重新解析并重建 cron）
-- `auth.failed_attempt_*`
+不做热重载是有意的取舍。真正可热改的只有 `log.level`、`cleanup.jobs` 的调度、
+`auth.failed_attempt_*` 三项，而这三项的实现代价并不低——尤其是 `cleanup.jobs`：
+`scheduler.Apply` 目前不支持重复调用（每条计划都会再注册一个 cron 条目，
+`planned` 也只追加不替换），要支持热改就得先把计划表做成可替换的，
+再处理「新配置只有一半合法」时的一致性。
 
-`addr`、`database.path`、`storage.blob_dir` 必须在重启时变更。热改监听地址会带来连接中断与 Caddy 502，收益小于风险。
+收益那一侧很薄：重启是原子的，`RestartSec=5s` 加上 `Type=notify` 保证 `start` 返回时
+已经可用；而部分热改一旦留下半应用状态，排查成本远高于一次重启。
+
+`addr`、`database.path`、`storage.blob_dir` 本来就只能重启生效——热改监听地址会带来
+连接中断与 Caddy 502，收益小于风险。
 
 ## 6. 备份与恢复
 
 ```bash
-# deploy/backup.sh 每日 03:00 跑一次，保留 7 份
-0 3 * * *  /usr/local/bin/homehub-backup.sh >> /var/log/homehub-backup.log 2>&1
+# deploy/backup.sh 每日 03:00 跑一次，保留 7 份；调度交给 systemd timer
+sudo install -m 0755 deploy/backup.sh /usr/local/bin/homehub-backup.sh
+sudo install -m 0644 deploy/homehub-backup.service deploy/homehub-backup.timer /etc/systemd/system/
+sudo install -d -o homehub -g homehub -m 0750 /var/backups/homehub
+sudo systemctl daemon-reload
+sudo systemctl enable --now homehub-backup.timer
+systemctl list-timers homehub-backup.timer
 ```
+
+用 timer 而不是 cron：日志直接进 journal（`journalctl -u homehub-backup`），
+`Persistent=true` 会补跑关机期间错过的触发点，`RandomizedDelaySec` 负责错峰——
+这三件事 cron 都要另写脚本解决。
 
 数据库备份走二进制自带的子命令，**不依赖系统装 sqlite3**：
 

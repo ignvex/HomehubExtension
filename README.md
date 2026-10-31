@@ -4,11 +4,12 @@ Homehub 的扩展服务：一个 Go 单二进制后端 + TypeScript 前端，为
 
 功能模块：
 
-- **工具台首页** —— 应用卡片网格，由 `GET /api/v1/apps` 驱动。**未登录也能看**：它是入口页，不该是登录墙。新增模块只需在代码里注册，首页自动多出一张卡。
+- **工具台首页** —— 应用卡片网格，由 `GET /api/v1/apps` 驱动。**未登录也能看**：它是入口页，不该是登录墙。卡片列表由后端 `handleApps` 组装，前端不硬编码：新增一个模块要动两处——后端追加一张卡片，前端注册对应路由。
 - **Pastebin** —— **不登录也能创建**。支持过期时间、语言标记、口令保护、一次性读取、私有访问与无需 JS 的公开分享页。匿名创建时服务端返回一枚 owner token，凭它管理自己的片段。
 - **RSS 阅读器（资源本地化）** —— 订阅可由 **Homehub 宿主主动推送**，也可在网页端手动添加（需登录）。抓取后把正文涉及的所有媒体下载到本地，无法本地化、但会让浏览器对外发起请求的元素一律抹除。验收标准是可执行的：**读完一篇文章，浏览器没有向第三方发出任何请求**。
+- **开发工具台（15 个）** —— 全部在浏览器里算，不上传、不联网、不追踪。按路由懒加载，首屏只下载元数据，单个工具的实现不进主 bundle。分五类：文本与校验（JSON、正则、程序员计算器）、编码与哈希（Base64、URL、哈希）、配置格式（YAML / JSON / INI 互转）、图片处理（格式转换、压缩、Base64）、时间与随机（时间戳、UUID、二维码、颜色、字体）。
 
-> 状态：后端可用，测试全绿。前端工程在 `web/` 下进行中。
+> 状态：M0–M9 已落地，仅剩 OPML 导入导出（M10）。`make test`、`make lint`、`make units`、`pnpm --dir web check` 全绿，`go build` 与 `pnpm --dir web build` 都能产出可部署产物。
 
 ## 设计约束
 
@@ -61,7 +62,7 @@ Homehub 的扩展服务：一个 Go 单二进制后端 + TypeScript 前端，为
 
 设计要点：
 
-- **单二进制**：前端 `pnpm build` 产物通过 `//go:embed all:web/dist` 打进程序，`web/dist` 里保留占位 `index.html` 以保证全新 clone 直接 `go build` 成功。
+- **单二进制**：前端 `pnpm build` 产物通过 `//go:embed all:web/dist` 打进程序。仓库里只提交 `web/dist/.gitkeep`，让目录存在且非空，保证全新 clone 直接 `go build` 成功。
 - **SQLite 用 `modernc.org/sqlite`**（纯 Go、无 CGO），`WAL` + 单写连接，`_pragma` 在 DSN 里固定，避免 `SQLITE_BUSY`。
 - **内容寻址存储**：媒体文件按 `sha256` 存 `blobs/<前2位>/<hash>.<ext>`，同一图片被多篇文章引用只占一份空间；DB 里用引用计数决定何时回收。
 - **双向公私钥，两个方向各管一件事**：
@@ -100,11 +101,13 @@ HomehubExtension/
 │   ├── paste/               # pastebin 领域逻辑
 │   ├── rss/                 # 清洗、抓取、媒体本地化、失败重试
 │   ├── scheduler/           # cron 调度与任务执行记录
+│   ├── systemd/             # sd_notify：READY / WATCHDOG / STOPPING
 │   └── events/              # 进程内事件总线（SSE 广播）
 ├── web/                     # 前端工程（pnpm + Vite + TS）
-│   └── dist/.gitkeep        # 让 go:embed 在全新 clone 上也能编译
+│   ├── src/tools/           # 15 个开发工具，每个一个模块，registry 懒加载
+│   └── dist/.gitkeep        # 让 go:embed 在全新 clone 上也能编译（目录不得为空）
 ├── docs/                    # 设计文档
-├── deploy/                  # systemd unit、Caddyfile、env 示例、备份脚本
+├── deploy/                  # systemd unit/timer、Caddyfile、env 示例、备份脚本
 └── .github/workflows/ci.yml
 ```
 
@@ -123,6 +126,12 @@ cp config.example.json config.json
 go run . serve -config config.json    # 后端 :8080
 pnpm --dir web install
 pnpm --dir web dev                    # 前端 :5173，/api 与 /media 代理到 :8080
+```
+
+`serve` 启动时会自动执行迁移。要把「改库结构」从「重启服务」里拆出来，就单独跑一次——失败时停在启动前，不必等 `Type=notify` 超时：
+
+```bash
+go run . migrate -config config.json   # 只应用待执行的迁移，打印 schema_version 后退出
 ```
 
 首次使用需要在服务端生成配对码，再在浏览器 `/pair` 页面注册设备公钥：
@@ -144,6 +153,7 @@ GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "-s -w" -o bin/homehub-exten
 make lint    # 规范检查：gofmt、vet、deadcode、行宽、函数长度、import 分组
 make test    # go test ./...
 make race    # 并发路径（一次性读取、SSRF 开关、调度器互斥、轮询器）
+make units   # systemd 单元语法 + 加固评分
 make build   # 前端构建 + 交叉编译 linux/amd64
 ```
 
@@ -156,7 +166,7 @@ make build   # 前端构建 + 交叉编译 linux/amd64
 
 CI 与本地一致：`.github/workflows/ci.yml` 分四个 job（Go、前端、交叉编译、镜像）。
 
-编译 job 必须等前端产物就位——`go:embed` 在编译期读取 `web/dist`，顺序错了会产出一个只有占位页的二进制：体积正常、能启动、就是没有界面。CI 里用 `grep -qa "_app/"` 断言前端确实嵌进去了。
+编译 job 必须等前端产物就位——`go:embed` 在编译期读取 `web/dist`，顺序错了会产出一个只有 `.gitkeep` 的二进制：体积正常、能启动，但访问任何页面只看到一张「前端未构建」提示页。CI 里用 `grep -qa "_app/"` 断言前端确实嵌进去了。
 
 测试覆盖的重点不是行数，而是几条容易出错的语义：
 
@@ -173,7 +183,7 @@ CI 与本地一致：`.github/workflows/ci.yml` 分四个 job（Go、前端、�
 
 | 页面 / 端点 | 鉴权 | 理由 |
 | --- | --- | --- |
-| 工具台 `/`、`/apps`、`/system/info`、`/system/stats` | 无 | 入口页；只返回聚合计数，不含用户内容 |
+| 工具台 `/`、`/tools/*`、`/apps`、`/system/info`、`/system/stats` | 无 | 入口页；只返回聚合计数，不含用户内容；工具全在浏览器本地算 |
 | 片段 `/pastes/*`、`/p/*` | 可选 | 匿名可创建与管理自己的片段 |
 | RSS 阅读 `/entries/*` | 必须 | 含抓取的全文内容 |
 | 订阅源 `/feeds/*` | 必须 | 抓取会访问外部地址，匿名开放等于开放 SSRF |
@@ -204,8 +214,41 @@ homehubext/req/v1
 | `GET` | `/api/v1/hub/subscriptions` | 对账列表 |
 | `DELETE` | `/api/v1/hub/subscriptions/{id}` | 移除订阅 |
 | `POST` | `/api/v1/hub/subscriptions/{id}/refresh` | 立即抓取 |
+| `POST` | `/api/v1/hub/keys` | 签发访问密钥：`{name, expires_in}`。明文只返回一次 |
+| `GET` | `/api/v1/hub/keys` | 密钥对账，不含明文 |
+| `DELETE` | `/api/v1/hub/keys/{id}` | 撤销密钥，连带踢掉它换出的会话 |
 
 `interval` 会被夹到 `rss.min_interval` 与 `rss.max_interval` 之间。首推默认立即抓一次。
+
+推送是幂等的，且**省略就是保留**：不带 `interval` / `enabled` 时沿用已存的全局值，不是回落默认。否则一次「只改标题」的推送会把用户显式暂停的订阅重新启用。显式把 `enabled` 从 `false` 改回 `true` 会同时清零 `error_count`——否则一个被自动停用的源恢复后，下一次失败就重新越线。
+
+### 访问密钥：宿主发凭证，用户自己登录
+
+订阅通道之外，宿主还能给用户签发一把**长期登录凭证**，省掉「SSH 上服务器跑 enroll」这一步：
+
+```bash
+curl -X POST https://homehub.example.com/api/v1/hub/keys \
+  -H 'X-HH-Timestamp: …' -H 'X-HH-Nonce: …' -H 'X-HH-Signature: …' \
+  -d '{"name":"alice","expires_in":"720h"}'
+# → {"id":"01JC…","key":"HHE-7QK4-2M9X-P3TB-8HVN-5RCW","expires_at":1795843200,…}
+```
+
+用户拿这串 `HHE-…` 到 `/pair` 页面输入即可进入，不需要本机私钥。它和配对码的区别：
+
+| | 配对码 `HH-…` | 访问密钥 `HHE-…` |
+| --- | --- | --- |
+| 谁生成 | 服务端 `enroll` 命令 | 宿主签名调用 `/api/v1/hub/keys` |
+| 有效期 | 15 分钟 | 由 `expires_in` 决定，可永久 |
+| 可重复使用 | 否，一次即废 | 是，换浏览器换设备都用它 |
+| 登录后本机存什么 | 不可导出的设备私钥 | 什么都不存，每次输入同一串 |
+
+密钥是长期共享凭证，泄露等于账号泄露，所以要当密码对待。签发时 Extension 会为该密钥建一台「无主客户端」（公钥入库、私钥当场丢弃），所以它只能靠密钥兑换，无法走挑战-响应；`DELETE /api/v1/hub/keys/{id}` 会连带撤销这台客户端和它的全部会话。
+
+**授权在宿主侧，Extension 不判断谁能拿密钥。** 签名通过就无条件下发——Extension 里没有用户表，也无从知道某人在宿主里是否还在职。代价是宿主私钥泄露即可批量签发永久密钥，所以它的保护等级等同于本实例。
+
+**轮换是安全的**：签发新密钥 → 确认能登录 → 撤销旧的。所有能登录的凭证（配对设备 + 访问密钥）共享同一个实例级 `owner_id`，所以新密钥读得到旧密钥名下的全部私有片段，配对设备也看得到密钥建的内容；撤销旧密钥只让它自己的会话失效。匿名片段不受影响，仍然按 owner token 隔离。
+
+细节见 [docs/api.md](docs/api.md#210-访问密钥宿主签发用户直接登录)。
 
 ## 配置
 
@@ -225,7 +268,7 @@ homehubext/req/v1
 /etc/homehub-extension/config.json        配置（0640 root:homehub）
 /etc/homehub-extension/env                密钥（0600 root:homehub）
 /etc/homehub-extension/homehub.pub        Homehub 宿主公钥（0644）
-/var/lib/homehub-extension/homehub.db     SQLite
+/var/lib/homehub-extension/homehub.db     SQLite（由 StateDirectory 创建）
 /var/lib/homehub-extension/blobs/         媒体文件
 /var/backups/homehub/                     每日备份，保留 7 份
 ```
@@ -249,14 +292,27 @@ homehub.example.com {
 
 `flush_interval -1` 全局开启而不是只对事件流生效：代价只是普通响应少一层攒批，换来的是不会因为路径写错而只在 SSE 上出问题。
 
-systemd 单元里 `ProtectSystem=strict` 会让根文件系统只读，`ReadWritePaths` 必须显式包含数据目录。完整单元见 [`deploy/homehub-extension.service`](deploy/homehub-extension.service)。
+systemd 部署的三个要点（完整单元见 [`deploy/homehub-extension.service`](deploy/homehub-extension.service)，细节见 [docs/config.md](docs/config.md#5-systemd-集成)）：
+
+- **`Type=notify`**：进程在端口真正 bind 之后才发 `READY=1`，`systemctl start` 返回时服务已经可用，依赖它的 unit 和部署脚本都不必再轮询 `/healthz`。`WatchdogSec=60s` 配合每 30 秒一次的心跳，能发现「进程还在、端口还占着，但已经不干活」的假死。
+- **`StateDirectory=homehub-extension`**：`/var/lib/homehub-extension` 由 systemd 创建并 chown，同时自动放行给 `ProtectSystem=strict`，安装时不需要手工 `mkdir`。
+- **没有 `ExecReload`**：进程只处理 `SIGINT`/`SIGTERM`，SIGHUP 会直接终止它。改配置一律 `systemctl restart`——写一条 `ExecReload=/bin/kill -HUP $MAINPID` 得到的是「reload 把服务杀掉」，而不是热重载。
+
+`GOMEMLIMIT=256MiB` 与 `MemoryMax=512M` 成对生效：前者让 Go 的 GC 提前压低堆，后者是 cgroup 硬墙。只配后者的话，触墙就是 OOM kill，没有减震。
+
+加固程度可量化：`systemd-analyze security --offline=yes deploy/homehub-extension.service` 当前评分为 **1.5 OK**（首版是 6.3 MEDIUM）。
 
 备份（数据库走二进制的 `backup` 子命令，媒体用 rsync 硬链接增量，不依赖 sqlite3 CLI）：
 
 ```bash
 sudo install -m 0755 deploy/backup.sh /usr/local/bin/homehub-backup.sh
-# crontab: 0 3 * * * /usr/local/bin/homehub-backup.sh >> /var/log/homehub-backup.log 2>&1
+sudo install -m 0644 deploy/homehub-backup.service deploy/homehub-backup.timer /etc/systemd/system/
+sudo install -d -o homehub -g homehub -m 0750 /var/backups/homehub
+sudo systemctl daemon-reload && sudo systemctl enable --now homehub-backup.timer
+systemctl list-timers homehub-backup.timer
 ```
+
+调度交给 systemd timer 而不是 cron：`Persistent=true` 会补跑关机期间错过的触发点，日志直接进 journal（`journalctl -u homehub-backup`），`RandomizedDelaySec` 负责错峰。
 
 容器部署见 [`Dockerfile`](Dockerfile)。容器内需要监听 `0.0.0.0`，所以配置里要设 `server.allow_remote_listen: true`。
 
@@ -267,6 +323,7 @@ sudo install -m 0755 deploy/backup.sh /usr/local/bin/homehub-backup.sh
 | [docs/architecture.md](docs/architecture.md) | 运行拓扑、组件职责、数据流、存储布局、资源预算、技术选型理由 |
 | [docs/config.md](docs/config.md) | 配置加载、全字段说明、cleanup cron 设计、systemd 集成 |
 | [docs/api.md](docs/api.md) | REST 约定、Ed25519 双向鉴权协议、端点清单、错误与分页 |
+| [docs/hub-integration.md](docs/hub-integration.md) | **面向 Homehub 宿主的对接指南**：部署准备、请求签名（含 Go/TS 参考实现与测试向量）、端点、重试与对账 |
 | [docs/rss.md](docs/rss.md) | 抓取与条件请求、HTML 白名单清洗、媒体下载与重写、SSRF 防护、CSP |
 | [docs/frontend.md](docs/frontend.md) | pnpm 工程、路由与视图、CSS 分层、阅读器排版、构建与 embed |
 
@@ -281,7 +338,8 @@ sudo install -m 0755 deploy/backup.sh /usr/local/bin/homehub-backup.sh
 - [x] **M6** RSS：抓取 → 清洗 → 媒体本地化 → 重试 → 阅读视图
 - [x] **M7** 清理调度 + 运维接口 + 测试
 - [x] **M8** 首发硬化：GitHub Actions CI、Dockerfile、备份子命令
-- [ ] **M9** OPML 导入导出、更多工具台应用（按需追加，实现接口并注册即可）
+- [x] **M9** 开发工具台：15 个纯前端工具，按路由懒加载，首屏只下载元数据
+- [ ] **M10** OPML 导入导出（影响 feed 批量创建接口）
 
 ## 许可
 

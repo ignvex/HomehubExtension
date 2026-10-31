@@ -177,7 +177,11 @@ POST /api/v1/auth/token
 
 nonce 一次性：校验通过后立即写 `consumed_at`，重复提交返回 401。nonce 过期、client 已撤销、签名不匹配都返回同一个 401，不区分原因——避免给出枚举线索。
 
-`access_token` 是无状态 JWS，15 分钟有效，服务端校验只需验签。这个时长固定，不提供配置项——它就是「撤销一台设备」的最坏延迟。`refresh_token` 是不透明随机串，数据库只存 `sha256`，7 天有效，可即时撤销。
+`access_token` 是签过名的紧凑 JWS，15 分钟有效。这个时长固定，不提供配置项：它限制单个令牌的暴露窗口，并强制客户端周期性使用 refresh 轮换。
+
+**校验是「验签 + 查 client」。** 每次带 Bearer 的请求都会验签，再按 `client_id` 读一次 `auth_client` 并确认 `revoked_at` 为空。多出这一次查询是刻意的：不查库的话，撤销设备或撤销访问密钥要等令牌自然过期才生效，而「撤销」在运维动作里必须立刻算数。代价是每个认证请求多一次主键查询（SQLite 上可忽略）。
+
+`refresh_token` 是不透明随机串，库里只存 `sha256`，有效期 `auth.session_ttl`（默认 7 天），每次使用即旋转。
 
 `refresh` 的响应形状与 `/auth/token` 一致（含 `client` 对象），因此前端刷新页面时只调 `/auth/refresh` 一次就能同时拿到会话与身份，不需要再跟一个 `/auth/me`。旧 refresh token 在使用成功后立即失效（旋转），旧 token 重用视为泄露，服务端撤销该 client 的全部会话。
 
@@ -192,23 +196,58 @@ nonce 一次性：校验通过后立即写 `consumed_at`，重复提交返回 40
 | `GET /api/v1/clients` | 已登记设备列表（不含公钥明细） |
 | `DELETE /api/v1/clients/{id}` | 撤销设备：`revoked_at` 置位，同时删该 client 的全部 session 与 challenge |
 
-撤销的设备在 access token 过期前（≤ 15 分钟）仍能通过验签。这是无状态令牌的固有取舍，15 分钟窗口可接受。
+**撤销立即生效。** 令牌本身是自包含的，但每次校验都会回查 client，所以 `DELETE /api/v1/clients/{id}` 之后，该设备的 access token 在下一次请求就被拒绝，不必等 15 分钟。`refresh_token` 一并在同一事务里删除。
 
 ### 2.7 机器对机器：请求签名
 
-适合服务端脚本、CI、Homehub 宿主回调。不使用 cookie 与 Bearer，而是每个请求自带签名：
+目前只有一个调用方用到它：**Homehub 宿主**。粘贴创建、订阅管理这些端点都不接受签名，它们走 Bearer 或 owner token。
+
+**身份不是一个字段，而是「能签出这个签名」这件事本身。** Extension 里没有宿主账号，没有为它签发的 API key，也没有访问令牌——只有部署时放进去的一把公钥。确认过程就四步：
+
+1. **部署时**：宿主生成 Ed25519 密钥对，公钥放到 `auth.hub.public_key_path`（默认 `/etc/homehub-extension/homehub.pub`）。私钥始终在宿主侧。
+2. **每次请求**：宿主用私钥签一条固定格式的消息。
+3. **Extension 验签**：用存着的公钥验。
+4. **验签通过 = 请求方持有对应私钥 = 它是宿主**。
+
+没有「先认证换 token」的交换。每条请求都自证，服务端不存会话；只留一张 nonce 去重表防重放，那张表不参与身份判定。
+
+请求头只有三个：
 
 ```http
-POST /api/v1/pastes HTTP/1.1
-X-HH-Client: 01JC8Z3K9V2Q7X4B6N0M
 X-HH-Timestamp: 1793251200
 X-HH-Nonce: 9mK2pQ…
 X-HH-Signature: <base64>
 ```
 
-服务端校验顺序：时间戳偏差 ≤ 60 秒 → nonce 未在窗口内出现过 → 签名匹配 → client 未撤销。nonce 存在内存 LRU（容量 10 万，TTL 120 秒），不落库。
+待签消息七行，`\n` 连接，无尾随换行：
 
-**已实现**，并且是 Homehub 推送订阅的唯一认证方式（见 4.0）。
+```text
+homehubext/req/v1
+<METHOD>
+<PATH>
+<QUERY>
+<hex(sha256(body))>
+<timestamp>
+<nonce>
+```
+
+几个容易签错的地方：
+
+- `PATH` 是 `URL.EscapedPath()`，百分号编码后的形式。
+- `QUERY` 是 `RawQuery` 原串，不排序。
+- 空 body 也要算摘要（空串的 sha256 是 `e3b0c442…`），不是空字符串。
+- 时间戳是十进制 Unix 秒，只接受整数。
+
+校验顺序（`internal/auth/signature.go`）：
+
+1. 三个头缺任一 → 401
+2. `|now - ts| > clock_skew`（默认 60s）→ 401
+3. `ed25519.Verify` 不通过 → 401
+4. nonce 在窗口内出现过 → 401
+
+第 4 步放在验签之后是有意的：先登记的话，任何人都能用攒造的请求把去重表撑满（容量 10 万），把合法请求挤成「已重放」。nonce 表存在内存里，每 `ttl/4`（默认 30 秒）清扫一次，不落库。
+
+公钥没配置时返回 **503 `unavailable`** 而不是 401——那是部署缺失，不是请求方的问题。
 
 ### 2.8 CSRF
 
@@ -235,6 +274,92 @@ Cookie 认证的写请求必须带 `X-CSRF-Token`，值与 `hh_csrf` cookie 一�
 | `/media/*` | 不限流；内容寻址 + 强缓存，热请求基本不落到 Go |
 
 实现用 `golang.org/x/time/rate` 的内存桶，单实例无需共享存储。进程重启后计数清零，可接受。
+
+### 2.10 访问密钥：宿主签发，用户直接登录
+
+原来只有一条拿凭证的路：SSH 到服务器跑 `enroll` 生成配对码。宿主要给某个用户发一把「你自己就能进」的凭证，隔着这层做不到。
+
+访问密钥补上了这条路。宿主用签名通道签发，用户拿着它去 `/pair` 页面输入，或者直接调 `/auth/key`。
+
+#### 签发
+
+```http
+POST /api/v1/hub/keys
+X-HH-Timestamp: 1793251200
+X-HH-Nonce: 9mK2pQ…
+X-HH-Signature: <base64>
+
+{"name": "alice", "expires_in": "720h"}
+```
+
+```json
+{
+  "id": "01JC…",
+  "name": "alice",
+  "key": "HHE-7QK4-2M9X-P3TB-8HVN-5RCW",
+  "client_id": "01JC…",
+  "created_at": 1793251200,
+  "expires_at": 1795843200
+}
+```
+
+`expires_in` 省略表示永不过期。"0" 或负数被拒绝——用「省略」表达永久，不用 `0`，避免 1970 年那种歧义。
+
+**`key` 只在这一个响应里出现。** 库里存的是 `sha256`，之后任何接口都拿不回明文，也拿不回本体。丢了只能重新签发。
+
+#### 兑换
+
+```http
+POST /api/v1/auth/key
+
+{"key": "HHE-7QK4-2M9X-P3TB-8HVN-5RCW"}
+```
+
+响应与 `POST /auth/token` 完全一致（`access_token`、`expires_in`、`csrf_token`、`client`），并且同样用 `Set-Cookie` 下发 `hh_session`。拿到令牌之后，两条登录路径再无区别——同一个 `issue()`、同一个 owner_hash、同一个权限模型。
+
+#### 管理
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| `POST` | `/api/v1/hub/keys` | 签发，201，明文只返回一次 |
+| `GET` | `/api/v1/hub/keys` | 列表，**不含明文也不含哈希**，带 `live` 布尔供对账 |
+| `DELETE` | `/api/v1/hub/keys/{id}` | 撤销密钥，并连带撤销它换出去的会话 |
+
+#### 语义
+
+- **可重复使用**：同一串密钥可以反复兑换，换浏览器、换设备都用它。这是它与配对码的核心区别——配对码 15 分钟、用一次即废。
+- **撤销即生效**：`DELETE` 会同时撤销绑定客户端和它的全部 refresh 会话。access token 虽然是自包含 JWS，但每次校验都会确认 client 未被撤销，所以旧令牌在下一次请求就失效，没有 15 分钟残留窗口。
+- **输入容错**：大小写、空格、分隔符、是否带 `HHE-` 前缀都不影响结果。规范化只按「前缀 + 主体」的总长度判定，不会误裁主体本身（字母表含 H 和 E，主体可能恰好以 `HHE` 开头）。
+- **熵**：20 位 31 进制，约 99 bit，离线穷举不现实。兑换端点仍然过 IP 限流。
+
+#### 安全边界
+
+宿主签发时，Extension 会生成一对 Ed25519 密钥、把公钥登记为一台「无主客户端」、**私钥当场丢弃**。所以：
+
+- 这台客户端永远无法用挑战-响应登录——没人签得出那个消息；
+- 它只能靠密钥兑换；
+- `auth_client` 的表结构一个都不用改，不需要在 SQLite 里重建表。
+
+密钥本身是长期共享凭证，一旦泄露等于账号泄露。它不像设备私钥那样「不可导出」，所以不要写进 URL、不要贴进公开渠道。需要作废时调 `DELETE /api/v1/hub/keys/{id}`。
+
+#### 授权边界
+
+**Extension 不做授权决策。** 谁能拿到密钥、拿几把、什么时候收回，全部由宿主的权限系统判断；Extension 只验证「这条请求确实来自持有宿主私钥的一方」。因此签名通过 = 无条件下发密钥，没有任何白名单、配额或审批环节。
+
+这是有意的取舍：Extension 里没有用户表，也没有身份数据，它无法独立判断「这个人在宿主里还在不在职」。把授权放在宿主是唯一说得通的位置——撤销权限时宿主停止签发并调 `DELETE`，比在 Extension 里复刻一套权限模型可靠得多。
+
+代价要说清楚：**宿主私钥一旦泄露，攻击者可以给自己签发任意数量的永久密钥**，Extension 没有任何手段阻止。所以宿主私钥的保护等级必须等同于 Extension 实例本身。
+
+#### 数据归属
+
+所有能登录的凭证——配对设备、宿主签发的访问密钥——都属于同一个主人，`owner_id` 填同一个实例级标识 `primary`，`owner_hash` 按它推导。于是：
+
+- **跨入口可见**：用密钥建的私有片段，配对的浏览器设备看得到；反过来也一样。同一个人不该因为换了认证方式就看不到自己的东西。
+- **密钥轮换无损**：签发新密钥 → 确认能登录 → 撤销旧的。新密钥读得到旧密钥名下的全部私有片段，撤销只让旧密钥自己的会话失效。
+- **匿名片段仍然隔离**：匿名创建没有身份，`owner_hash` 按 owner token 算。登录身份读不到别人的匿名私有片段，只有持有 owner token 的一方可以。
+- **RSS 订阅全局共享**：`feed` 表按 `url` 唯一、没有 owner 列，所有凭证看到同一批订阅。订阅是实例级资源，同一份 feed 抓一次就够了。
+
+现有部署升级到 0005 时会有一次数据搬迁：`auth_client.owner_id` 补齐，同时全部 `paste.owner_hash` 从 `c:<clientID>` 重算为 `o:primary`。两步在同一个事务里完成，中途失败一起回滚。搬迁之后旧哈希不再匹配任何查询，也不保留兼容分支。
 
 ## 3. Pastebin
 
@@ -325,10 +450,15 @@ X-HH-Signature: <base64>
 
 语义：
 
-- **幂等**：同一个 URL 重复推送只更新调度参数，不重复建订阅，也不清空已经学到的 `title` / `site_url` / `etag`——空值表示"没说"，不是"清空"。
+- **幂等，且省略就是保留**：同一个 URL 重复推送不重复建订阅。省略的字段分三类处理——`title` / `site_url` 为空表示「没说」，保留已学到的值（`etag` / `last_modified` 同理，永远不会被推送清空）；`interval` 省略沿用已存的间隔，新建时用 `rss.default_interval`；`enabled` 省略沿用已存状态，新建时默认 `true`。
+
+  后两条不是细节：如果省略就回落默认，宿主一次「只改标题」的推送会把用户显式暂停的订阅重新启用，并把间隔重置回 30 分钟。
 - **间隔夹紧**：`interval` 落在 `[rss.min_interval, rss.max_interval]` 之间，超出即夹到边界。下限保护目标站点，上限防止一个源被无限期冷落。
-- **首推即抓**：`fetch_now` 缺省为 `true`，异步触发一次抓取，宿主不必等一个完整周期。
+- **重排规则**：`next_fetch_at` 只在间隔真的变了才重算（`now + interval`）。重复推同样的间隔不会把下一次抓取推迟，否则宿主频繁对账推送会把抓取永远推后。
+- **首推即抓**：`fetch_now` 缺省为 `true`，异步触发一次抓取（独立 5 分钟 context，请求立即返回），宿主不必等一个完整周期。
+- **恢复会清零失败计数**：`enabled` 从 `false` 显式改回 `true` 时，`error_count` 与 `last_error` 一并清零。否则一个已因连续失败被停用的源，恢复后下一次失败就重新越线，演成「刚恢复就又停了」。
 - **鉴权**：整个 `/api/v1/hub/*` 分组走 2.7 的请求签名，不接受 Bearer。一条合法请求无法被挪到另一个路径或另一个 body 上重放。
+- **模块关闭时四个端点一致**：`rss.enabled = false` 时，push / list / delete / refresh 都返回 `404 not_found` + `"RSS 模块未启用"`。注意这是签名之后的回答：未签名的请求仍然先得到 401，不会因为模块关闭而泄露它的存在。宿主可以用同一个判断决定要不要展示 RSS 功能。
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
@@ -338,6 +468,8 @@ X-HH-Signature: <base64>
 | `POST` | `/api/v1/hub/subscriptions/{id}/refresh` | 立即抓取，同步返回本轮统计 |
 
 失败退避：连续失败按指数退避至 `max_interval`，连续 10 次把 `enabled` 置 0 并在响应里带出 `last_error`，等宿主侧决定是否重新启用。已抓取的条目不受影响。
+
+宿主想恢复一个被自动停用的源，只要再推一次 `{"url": "...", "enabled": true}`：`error_count` 会被清零，`next_fetch_at` 按当前间隔重排。如果源已经彻底不可用，它会在再失败 10 次之后重新被停用。
 
 ### 4.1 订阅源
 
@@ -396,10 +528,11 @@ X-HH-Signature: <base64>
 - 响应带 `X-Content-Type-Options: nosniff`；`Content-Type` 取自入库时探测并校验过的 MIME，绝不回显客户端提供值。
 - 支持 `Range`（视频拖动需要），单区间，返回 206。
 
-## 5. 系统
+## 5. 工具台与系统
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
+| `GET` | `/api/v1/apps` | 工具台卡片清单（见下） |
 | `GET` | `/healthz` | 进程存活，恒 200，不查依赖 |
 | `GET` | `/readyz` | 依赖就绪：DB 可读、迁移完成、blob 目录可写、磁盘余量；任一失败 503 |
 | `GET` | `/api/v1/system/info` | 版本、构建时间、commit、schema 版本、运行时长、go 版本 |
@@ -409,6 +542,28 @@ X-HH-Signature: <base64>
 | `GET` | `/api/v1/system/config` | 当前生效配置的**脱敏**视图（密钥、token 显示为 `***`） |
 
 `/healthz` 与 `/readyz` 不进鉴权，也不记访问日志（避免探针刷日志）。`/readyz` 的失败原因放在响应体里，便于 curl 排查。
+
+### 5.1 工具台卡片
+
+`GET /api/v1/apps` 返回卡片数组，前端只负责渲染：
+
+```json
+{
+  "apps": [
+    {"id":"pastebin","name":"Pastebin","icon":"paste","description":"…",
+     "path":"/pastes","enabled":true,"badge":{"count":12,"label":"条"}},
+    {"id":"tools","name":"开发工具","icon":"tools","description":"…",
+     "path":"/tools","enabled":true,"badge":null}
+  ]
+}
+```
+
+第二张卡的 `badge` 写成 `null` 而不是省略：实际响应里它一定存在，值可以是对象或 `null`。
+
+- 卡片列表在 `handleApps` 里逐项追加，顺序固定：pastebin → rss → tools → system → feeds。
+- 关闭配置时有两种行为，不要混为一谈：`pastebin.enabled` / `rss.enabled` 为 `false` 时，对应卡片**根本不 append**，数组里看不到它；而 `feeds` 卡片始终下发，它的 `enabled` 跟着 `rss.enabled` 走——RSS 关闭时它仍在数组里，但是 `false`。前端对 `enabled: false` 的卡片不隐藏，而是渲染成不可点击的 `app-card--disabled` 加一枚「未启用」角标。
+- `badge` 是 `null` 而不是被省略（字段没有 `omitempty`）——前端判断 `if (app.badge && app.badge.count > 0)`，`null` 与 `0` 都不渲染。角标口径必须与列表一致：片段数按 `owner` 过滤，未读数在匿名请求下强制为 `0`——否则会出现「首页说 2 条、列表是空的」。
+- 空数组是 `[]`，不是 `null`。
 
 ## 6. 实时事件
 
@@ -487,5 +642,8 @@ curl -s "https://homehub.example.com/api/v1/entries?unread=true&limit=20" \
 ## 9. 待定
 
 - OPML 导入导出：`POST /api/v1/feeds/import`、`GET /api/v1/feeds/export`，取决于是否需要批量迁移。
-- 请求签名（2.7）是否值得实现，取决于是否真有 CI/宿主回调场景。
-- 服务端密钥轮换（多 `kid` 并存）首版不做，单密钥 + 重启即换新会让所有 access token 在 15 分钟内失效，可接受。
+- 服务端密钥轮换（多 `kid` 并存）首版不做。密钥文件持久化在 `auth.server_key_path`，重启复用，不会换新；只有运维主动替换文件才会让已签发的 access token 立即失效（校验时签名对不上）。
+
+## 10. 相关文档
+
+- 面向 Homehub 宿主的对接指南：[hub-integration.md](hub-integration.md)——部署准备、签名实现、端点清单、重试与对账语义。

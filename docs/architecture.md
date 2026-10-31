@@ -457,19 +457,25 @@ CPU：
 ```text
 homehub-extension [serve] -config <path>          启动服务（默认子命令）
 homehub-extension enroll -config <path> -name <n> 生成一次性配对码
-homehub-extension migrate -config <path>          执行迁移后退出（-dry-run 只打印）
+homehub-extension migrate -config <path>          执行迁移后退出，打印 schema_version
+homehub-extension backup -config <path> -out <dir> 导出一份数据库副本
 homehub-extension version                          版本与构建信息，不读配置
+homehub-extension help | -h | --help              打印顶层用法，退出 0
 ```
 
 - 无子命令等价于 `serve`，所以 `homehub-extension -config x.json` 与 `homehub-extension serve -config x.json` 行为一致。
-- 子命令必须写在 flag 之前；`serve`/`enroll` 各自维护独立的 flag set，避免参数串用。
+- 子命令必须写在 flag 之前。`serve`/`enroll`/`migrate`/`backup` 四个需要配置的子命令共用 `runWithConfig` 里同一个 flag set（`-config` / `-name` / `-out` / `-dev`），不按子命令裁剪：给 `serve` 传 `-name` 不会报错，只是被忽略。`version`/`help` 在读配置之前就返回，不注册这些 flag。
 - `enroll` 把配对码写到 stdout（方便 `ssh` 复制），同时写一条审计日志；不写入文件。
-- `migrate` 默认在 `serve` 启动时自动执行，单独子命令只用于部署前预检。
-- 退出码：`0` 成功，`1` 配置或启动失败，`2` 用法错误。`enroll` 的配对码写在 stdout、错误写在 stderr，便于脚本区分。
+- `-h` / `--help` 写在子命令位置时在进入 `serve` 之前被拦下，打印顶层用法并退出 0。注意 `serve -h` 不是同一个东西：它直接把 flag 包的帮助打出来（serve 自己的 flag 列表），退出 1。
+- `migrate` 默认在 `serve` 启动时自动执行；单独的 `migrate` 子命令用于升级前把「改库结构」和「重启」拆开。systemd 单元里的 `ExecStartPre` 就是它。
+- 退出码只有 `0`（成功）和 `1`（配置、迁移或启动失败）。用法错误也返回 `1`，不区分 `2`——脚本里用 `if ! cmd` 而不是比对具体码值。
 
 ## 12. 待定项
 
-1. Homehub 宿主的 API 模型（实体、服务、认证、是否支持推送）。`internal/hub` 目前只留接口，不与任何具体协议绑定。
-2. 是否需要多设备共享同一份阅读状态（当前按设备隔离 `read_at`）。
+1. Homehub 宿主的 API 模型（实体、服务、认证、是否支持推送）。当前只实现了宿主→Extension 这一个方向：入站签名校验、订阅推送/对账/删除/刷新，以及访问密钥的签发/列表/撤销，代码在 `internal/httpapi/handlers_hub.go`，没有单独的 `hub` 包——协议定型后再拆。
+2. ~~是否多设备共享同一份阅读状态~~ **已定案**：`entry.read_at` 是 `entry` 表上的一列，本来就是全局共享——任何设备标为已读，其它设备看到的也是已读。单主人场景下这正是想要的。
 3. 是否提供 OPML 导入导出（影响 feed 批量创建接口）。
 4. 备份是否需要异地（当前只做本机 7 份滚动）。
+5. ~~**访问密钥的身份模型**~~ **已定案（0004 + 0005）**：`auth_client` 增加 `owner_id` 列；访问密钥与配对设备产生的 client 都填 `store.OwnerPrimary`，`owner_hash` 按它推导。结果是同一主人的所有入口共享数据——密钥写的片段设备看得到，轮换密钥也不丢内容。0005 的 Go 侧搬迁把存量的 `c:<clientID>` 哈希重算成 `o:primary`，与 SQL 同一事务。
+
+   仍未定的是**多主人**：`owner_id` 目前只有一个取值，没有配置入口。真要支持时，签发端点加一个签名覆盖的 `owner` 字段即可，数据层不用再迁移。届时还要一起决定：撤销一把密钥时是否连带撤销同身份的其它密钥会话（当前各密钥独立）。

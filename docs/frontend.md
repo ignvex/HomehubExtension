@@ -24,51 +24,61 @@ web/
 │   └── favicon.svg
 └── src/
     ├── main.ts               # 挂载点，注册路由
-    ├── app.ts                # AppContext 构造与全局布局
-    ├── router.ts             # History API 路由
+    ├── app.ts                # 应用外壳与路由表构造
+    ├── router.ts             # History API 路由 + 鉴权守卫
     ├── api/
-    │   ├── client.ts         # fetch 封装、401 刷新、错误映射
+    │   ├── client.ts         # 请求封装、401 刷新、错误映射
+    │   ├── http.ts           # 底层 fetch 与超时
+    │   ├── errors.ts         # 错误解析
     │   ├── types.ts          # 与 Go DTO 对齐的类型
     │   ├── auth.ts
     │   ├── pastes.ts
     │   ├── feeds.ts
-    │   └── entries.ts
+    │   ├── entries.ts
+    │   └── system.ts
     ├── auth/
     │   ├── keys.ts           # WebCrypto 生成/签名
     │   ├── storage.ts        # IndexedDB 存不可导出 CryptoKey
-    │   └── session.ts        # 登录状态、内存中的 access token
+    │   ├── session.ts        # 登录状态、内存中的 access token
+    │   └── owner-token.ts    # 匿名片段的 owner token（localStorage）
     ├── state/
     │   ├── store.ts          # 极简订阅式 store
     │   └── app-state.ts      # 全局切片：me、feeds、unread
     ├── lib/
     │   ├── dom.ts            # h() 创建元素、clamp、debounce
-    │   ├── router-match.ts
     │   ├── sse.ts
+    │   ├── device.ts
+    │   ├── theme.ts
     │   ├── format.ts         # 时间、字节、相对时间
     │   └── strings.ts        # 全部面向用户的文案
     ├── components/
     │   ├── nav.ts
+    │   ├── page.ts           # 页头
     │   ├── toast.ts
-    │   ├── dialog.ts
-    │   ├── empty-state.ts
-    │   ├── skeleton.ts
-    │   └── icon.ts           # 内联 SVG sprite
+    │   ├── states.ts         # 骨架屏、空状态、错误态
+    │   └── icons.ts          # 内联 SVG sprite
+    ├── tools/                # 15 个开发工具，见 3.0.1
     ├── views/
+    │   ├── home.ts
     │   ├── pair.ts
     │   ├── pastes.ts
-    │   ├── paste-editor.ts
+    │   ├── paste-new.ts
+    │   ├── paste-detail.ts
     │   ├── feeds.ts
     │   ├── entries.ts
     │   ├── reader.ts
-    │   ├── settings.ts
-    │   ├── jobs.ts
+    │   ├── settings.ts       # 含清理任务一节
+    │   ├── tools.ts
+    │   ├── tool-runner.ts
     │   └── not-found.ts
     └── styles/
         ├── main.css          # 汇总 @layer
+        ├── reset.css
         ├── tokens.css
         ├── base.css
         ├── layout.css
         ├── components.css
+        ├── utilities.css
         └── reader.css
 ```
 
@@ -91,7 +101,34 @@ web/
 }
 ```
 
-前端**不硬编码应用列表**。新增一个模块只需要在后端注册，首页自动多出一张卡——这正是"后面会有很多本地工具台应用"这条需求的落点。角标数据（未读数、片段数）也由后端算好，前端不做聚合。
+前端**不硬编码应用列表**：卡片全部来自 `GET /api/v1/apps`，`home.ts` 只负责渲染。新增一个模块是两处改动——后端 `handleApps` 追加一项，前端 `app.ts` 的路由表加一条；只改后端的话卡片会指向 404。把列表放在服务端的好处是卡片能跟着配置走，前端不必重新发布。
+
+这里有两种不同行为，别混：
+
+- `pastebin.enabled` / `rss.enabled` 为 `false` 时，`handleApps` **直接不 append** 那张卡——它不会出现在数组里。
+- `feeds` 卡片始终下发，但 `enabled` 跟着 `rss.enabled` 走。前端遇到 `enabled: false` **不隐藏**，而是渲染成不可点击的 `app-card--disabled` 加一枚「未启用」角标——用户能看到功能存在、只是被运维关掉了。
+
+角标数据（未读数、片段数）也由后端算好，前端不做聚合；`badge` 为 `null` 或 `count` 为 `0` 时都不渲染（避免出现「0 条」这种噪音）。
+
+### 3.0.1 开发工具台
+
+`/tools` 是 15 个纯前端工具的入口，`/tools/:id` 是单工具容器。数据结构在 `src/tools/`：
+
+- `types.ts` 定义 `ToolMeta`（静态元数据）与 `ToolFactory`（实现）。
+- `registry.ts` 是唯一的注册点，只 import 元数据、不 import 实现——每个工具的 `load` 是 `() => import("./tools-xxx")`，Vite 据此拆成独立 chunk。首屏 JS（入口 + `shared`，gzip 后 27.5 KB）包含路由、外壳与 registry，工具实现一个也不进主 bundle：15 个 `tools-*` chunk 加一个图片工具共用的 `img-shared`，合计 27.3 KB gzip，只在打开对应工具时下载。
+- 列表页 `views/tools.ts` 只读元数据：按 `CATEGORIES` 分组、带搜索框，打开这一页的代价是零。搜索时平铺不分组。
+- 容器 `views/tool-runner.ts` 负责三个边界：未知 id 给建议列表而不是白屏；chunk 加载失败（部署后旧 chunk 404）提示刷新；卸载时调 `unmount`。
+
+工具拿到的 `ToolContext` 只有两样东西：
+
+```ts
+export interface ToolContext {
+  signal: AbortSignal;   // 路由切换时 abort，长任务应据此放弃
+  toast: ToastApi;
+}
+```
+
+约定是 **`unmount` 必须清掉所有定时器、AbortController、对象 URL 与事件监听**——工具页面的生命周期比普通视图长得多，漏掉一个定时器就是一个永久泄漏。所有计算在本地完成：不上传、不联网、不追踪。
 
 ### 3.1 路由表
 
@@ -99,14 +136,15 @@ web/
 | --- | --- | --- |
 | `/pair` | 设备配对 | 否 |
 | `/` | 工具台首页：应用卡片网格 | **否**（入口页） |
+| `/tools` | 开发工具列表（分类 + 搜索） | **否** |
+| `/tools/:id` | 单工具（按需加载 chunk） | **否** |
 | `/entries` | 全部条目（可按订阅源筛选） | 是 |
 | `/entries/:id` | 阅读视图 | 是 |
 | `/feeds` | 订阅源管理（新建/编辑/删除） | 是 |
 | `/pastes` | 片段列表 | **否**（凭 owner token 看自己的） |
 | `/pastes/new` | 新建片段 | **否** |
-| `/pastes/:slug` | 编辑片段 | 是 |
-| `/settings` | 设置与设备管理 | 是 |
-| `/settings/jobs` | 清理任务记录 | 是 |
+| `/pastes/:slug` | 片段详情（匿名凭 owner token 管理自己的） | **否** |
+| `/settings` | 设置与设备管理；清理任务记录是页内一节，不是独立路由 | 是 |
 | `*` | 404 | — |
 
 `/p/{slug}` **不经过前端路由**，由 Go 服务端渲染。原因：分享链接必须在不加载 JS bundle 的情况下可用，且要能被爬虫与 `curl` 正常读取。
@@ -114,28 +152,30 @@ web/
 ### 3.2 路由实现
 
 ```ts
-type Route = {
-  pattern: string;                 // "/entries/:id"
-  view: ViewFactory;
+interface RouteDefinition {
+  path: string;                 // "/entries/:id"
+  title: string;
   auth: boolean;
-};
-
-interface View {
-  mount(root: HTMLElement, ctx: AppContext, params: Record<string, string>): Promise<void> | void;
-  unmount?(): void;
+  view: ViewFactory;
 }
 
-interface AppContext {
-  api: ApiClient;
-  state: AppStore;
+interface ViewContext {
   router: Router;
+  params: Record<string, string>;
+  query: URLSearchParams;
+  signal: AbortSignal;          // 路由切换时 abort，用于取消进行中的请求
   toast: ToastApi;
-  signal: AbortSignal;             // 路由切换时 abort，用于取消进行中的请求
+  events: (listener: (event: ServerEvent) => void) => () => void;
+}
+
+interface ViewHandle {
+  element: HTMLElement;
+  unmount?: () => void;
 }
 ```
 
 - 用 `history.pushState` + `popstate`，不做 hash 路由。
-- 匹配器是手写的：按 `:` 分段，生成正则，按注册顺序取第一个命中。
+- 匹配器是手写的逐段字符串比较，**不生成正则**：先按 `/` 分段（`splitSegments`），段数不等直接跳过，`:` 开头的段取参数并 `decodeURIComponent`，其余逐字比较，按注册顺序取第一个命中。
 - 切换时先调用上一个视图的 `unmount()`，再 abort `signal`，再清空容器，再 `mount()`。
 - 所有内部链接拦截 `click` 做客户端跳转；带 `target="_blank"`、外域、`download` 属性、修饰键点击一律放行给浏览器。
 - 路由层负责鉴权：`auth: true` 且未登录 → `replaceState` 到 `/pair`，并记住 `returnTo`。
@@ -513,30 +553,33 @@ export default defineConfig({
 var webFS embed.FS
 ```
 
-- `web/dist/index.html` 作为占位文件提交到仓库，保证全新 clone 直接 `go build` 成功。
-- `.gitignore` 忽略 `web/dist/_app/`，但不忽略 `web/dist/index.html`：用 `!web/dist/index.html` 例外。
+- `web/dist/` 目录里只提交一个 `.gitkeep`，保证全新 clone 直接 `go build` 成功（`go:embed all:web/dist` 要求目录存在且非空）。
+- `.gitignore` 用 `web/dist/*` + `!web/dist/.gitkeep`：目录里只提交 `.gitkeep`，构建产出的 `index.html`、`_app/` 一律不入库。
 - 构建顺序必须是「先 `pnpm build`，再 `go build`」。CI 与 Dockerfile 都要显式保证；`make build` 把这个顺序固化。
 - 静态资源服务：`_app/` 用 `http.FileServerFS` + 长缓存；其余路径回退 `index.html` 并 `no-cache`。
 - `/api/`、`/media/`、`/p/`、`/healthz`、`/readyz` 不参与 fallback，否则会把 404 变成 HTML。
 
 ### 9.3 体积预算
 
-| 项 | 目标 |
-| --- | --- |
-| JS（gzip） | < 60 KB |
-| CSS（gzip） | < 15 KB |
-| 首次加载总量 | < 120 KB |
-| 无网络字体、无外链 | 是 |
+闸门写在 `web/scripts/check-dist.mjs` 里，`pnpm check:dist` 超限即失败。分两档统计，因为懒加载让「总量大」和「首屏慢」脱钩了：
 
-CI 里加一条检查：`dist` 总大小超过 300 KB 未压缩则失败。体积是会悄悄膨胀的指标，必须有闸门。
+| 项 | 预算 | 当前 |
+| --- | --- | --- |
+| 首屏 JS（gzip，入口 + shared） | ≤ 40 KB | 27.5 KB（2 个 chunk） |
+| 按需 JS（gzip） | ≤ 80 KB | 27.3 KB（16 个 chunk） |
+| CSS（gzip） | ≤ 20 KB | 8.4 KB |
+| dist 未压缩总量 | ≤ 400 KB | 180.7 KB |
+| 按需 chunk 个数 | ≤ 40 | 16 |
+
+只卡总量会逼着人删功能，只卡首屏则总量可能失控，所以两档都设上限。另有无网络字体（`index.html` 不引任何 `@font-face` 远程资源）、无外链脚本/样式（`check-dist.mjs` 逐条校验 `index.html` 的引用目标真实存在）。
 
 ## 10. 开发约定
 
 - `tsconfig.json`：`strict`、`noUncheckedIndexedAccess`、`exactOptionalPropertyTypes`、`noImplicitOverride`。
 - 只用 `pnpm`，仓库提交 `pnpm-lock.yaml`。`package.json` 里 `packageManager` 字段锁定版本，`corepack` 自动切换。
-- 脚本：`dev`、`build`、`preview`、`check`（`tsc --noEmit`）、`fmt`（Prettier，仅用于 TS/CSS，不格式化 Markdown）。
-- 不引 ESLint：`tsc --strict` 已经覆盖大部分问题，剩余靠 review。若后续需要，再加 `typescript-eslint`。
-- 代码风格：两空格缩进、双引号、语句末尾分号、`const` 优先。由 Prettier 固定，不争论。
+- 脚本：`dev`、`build`、`preview`、`check`（`tsc --noEmit`）、`check:dist`（产物规则）、`test:qr`、`test:crypto`、`verify`（依次跑 check → test:qr → build → check:dist → test:crypto）。
+- 不引 ESLint，也不引 Prettier：`tsc --strict` 已经覆盖大部分问题，格式靠下面几条人工约定。没有格式化脚本，也没有 `.prettierrc`/`.editorconfig`。
+- 代码风格：两空格缩进、双引号、语句末尾分号、`const` 优先。没有工具强制，靠 review 守。
 - 组件不写 `style` 属性：HTML 里的 `style="..."` 会被 CSP 拦截。运行时通过 CSSOM 设置（`el.style.setProperty("--progress", "42%")`）不受 CSP 限制，但仍要求动态值只走自定义属性，不直接写颜色或尺寸——样式规则的归属保持在 CSS 文件里。
 - 中文字符串直接写在代码里，首版不引 i18n。所有面向用户的文案集中在 `lib/strings.ts`，为将来抽取做准备。
 
