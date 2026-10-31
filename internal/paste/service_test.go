@@ -195,7 +195,7 @@ func TestDeleteThenRead(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	owner := OwnerHashForToken(token)
+	owner := store.OwnerHashForToken(token)
 
 	if err := s.Delete(ctx, p.Slug, owner); err != nil {
 		t.Fatal(err)
@@ -220,7 +220,7 @@ func TestAnonymousPasteNotManageableByOthers(t *testing.T) {
 	}
 
 	// 换个 token 就当别人。
-	other := OwnerHashForToken("someone-elses-token")
+	other := store.OwnerHashForToken("someone-elses-token")
 	if err := s.Delete(ctx, p.Slug, other); !errors.Is(err, store.ErrNotFound) {
 		t.Errorf("别人删除 = %v, want ErrNotFound", err)
 	}
@@ -232,7 +232,7 @@ func TestAnonymousPasteNotManageableByOthers(t *testing.T) {
 	}
 
 	// 真正的拥有者可以删。
-	if err := s.Delete(ctx, p.Slug, OwnerHashForToken(token)); err != nil {
+	if err := s.Delete(ctx, p.Slug, store.OwnerHashForToken(token)); err != nil {
 		t.Errorf("拥有者删除失败: %v", err)
 	}
 }
@@ -246,7 +246,7 @@ func TestPrivatePasteRequiresOwner(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	owner := OwnerHashForToken(token)
+	owner := store.OwnerHashForToken(token)
 
 	if _, err := s.Read(ctx, p.Slug, "", owner); err != nil {
 		t.Errorf("拥有者应能读: %v", err)
@@ -272,7 +272,7 @@ func TestListFiltersByOwner(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	mine, _, err := s.List(ctx, OwnerHashForClient("device-1"), 10, "")
+	mine, _, err := s.List(ctx, store.OwnerHashForClient("device-1"), 10, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -297,7 +297,7 @@ func TestListOmitsBody(t *testing.T) {
 		}
 		token = tok
 	}
-	items, _, err := s.List(ctx, OwnerHashForToken(token), 10, "")
+	items, _, err := s.List(ctx, store.OwnerHashForToken(token), 10, "")
 	if err != nil {
 		t.Fatal(err)
 	}

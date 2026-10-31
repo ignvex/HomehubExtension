@@ -19,6 +19,11 @@ const (
 	reqDomain  = "homehubext/req/v1"
 )
 
+// dialAlphabet 是配对码与访问密钥共用的字符表。
+// 去掉 0/O/1/I/L：这两类凭证都靠人抄写或念读传递，形近字会直接变成
+// "码是对的但用户打错了"这种既费时又难解释的故障。
+const dialAlphabet = "23456789ABCDEFGHJKMNPQRSTUVWXYZ"
+
 var (
 	ErrBadCredentials = errors.New("bad credentials")
 	ErrRevoked        = errors.New("client revoked")
@@ -49,6 +54,10 @@ func (s Settings) withDefaults() Settings {
 	}
 	return s
 }
+
+// OwnerPrimary 是实例主人的归属标识，定义在 store 包（它同时是
+// 持久化格式，迁移代码要用）。这里留个别名，免得调用点写成 store. 前缀。
+const OwnerPrimary = store.OwnerPrimary
 
 // Service 实现挑战-响应鉴权与设备管理。
 type Service struct {
@@ -95,7 +104,6 @@ func (s *Service) GenerateEnrollment(ctx context.Context, nameHint string) (stri
 // pairingCode 生成 HH-XXXX-XXXX-XXXX 形式的码。
 // 字符集去掉了 0/O/1/I/L，抄写和念读时不会混淆。
 func pairingCode() (string, error) {
-	const alphabet = "23456789ABCDEFGHJKMNPQRSTUVWXYZ"
 	buf := make([]byte, 12)
 	if err := readRandom(buf); err != nil {
 		return "", err
@@ -106,7 +114,7 @@ func pairingCode() (string, error) {
 		if i > 0 && i%4 == 0 {
 			sb.WriteByte('-')
 		}
-		sb.WriteByte(alphabet[int(b)%len(alphabet)])
+		sb.WriteByte(dialAlphabet[int(b)%len(dialAlphabet)])
 	}
 	return sb.String(), nil
 }
@@ -165,6 +173,9 @@ func (s *Service) Enroll(ctx context.Context, token, name, alg, publicKeyB64 str
 		Name:      truncate(name, 64),
 		PublicKey: raw,
 		Algorithm: alg,
+		// 配对设备与访问密钥属于同一个主人：两者建的私有片段互相
+		// 可见，谁都不需要"换个入口重新登录一遍才能看到自己的东西"。
+		OwnerID:   OwnerPrimary,
 		CreatedAt: now.Unix(),
 	}
 	if err := s.st.CreateClient(ctx, client); err != nil {

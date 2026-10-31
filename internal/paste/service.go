@@ -4,10 +4,8 @@ package paste
 import (
 	"context"
 	"crypto/rand"
-	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base64"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"strings"
@@ -45,24 +43,9 @@ type Config struct {
 	Languages     map[string]bool
 }
 
-// OwnerHash 把归属凭证换算成库里存的哈希。
-//
-// 两种来源用前缀区分，避免同一字符串在两种语义下撞到一起：
-//
-//	c:<clientID>  已登录设备
-//	t:<token>     匿名创建者持有的一次性凭证
-//
-// 只存哈希：数据库泄露不等于凭证泄露。
-func OwnerHash(prefix, value string) string {
-	sum := sha256.Sum256([]byte(prefix + ":" + value))
-	return hex.EncodeToString(sum[:])
-}
-
-// OwnerHashForClient 是已登录设备的归属哈希。
-func OwnerHashForClient(clientID string) string { return OwnerHash("c", clientID) }
-
-// OwnerHashForToken 是匿名创建者凭证的归属哈希。
-func OwnerHashForToken(token string) string { return OwnerHash("t", token) }
+// 归属哈希的算法在 store 包：它是 paste.owner_hash 这一列的
+// 持久化格式，迁移代码也要用同一套计算，放在领域包里会让存储层
+// 反过来依赖领域包。这里保留薄封装只是为了让调用点读起来短一些。
 
 // Service 实现片段的生命周期、一次性读取与口令校验。
 type Service struct {
@@ -91,10 +74,42 @@ type CreateRequest struct {
 	BurnAfterRead bool
 	// OwnerClientID 由 handler 注入：已登录时是设备 id，匿名时为空。
 	OwnerClientID string
+	// OwnerID 优先于 OwnerClientID：非空时表示这次调用属于一个跨
+	// client 稳定的身份（访问密钥），归属按它算而不是按设备算。
+	// 设备配对产生的 client 没有 owner_id，仍然走按设备隔离。
+	OwnerID string
 	// OwnerToken 是匿名调用方提交的已有凭证。
 	// 首次创建时为空，service 会生成一个；之后同一客户端应复用它，
 	// 否则每次创建都产生新归属，列表里永远只有最近一条。
 	OwnerToken string
+}
+
+// resolveOwner 决定这次创建的归属，并返回需要回显给调用方的匿名 token。
+//
+// 优先级：稳定身份 > 设备 id > 匿名 token。
+//
+// 稳定身份排第一是为了让轮换密钥不丢数据：同一主人的两把密钥算出
+// 同一个 owner_hash，旧密钥名下的片段新密钥照样看得到。
+//
+// 匿名客户端首次创建时带着空 token 来，这里生成一个；之后它应该在
+// 每次创建时复用同一个 token，否则每条片段都是独立归属，列表里只会
+// 出现最近创建的那一条。
+func resolveOwner(req CreateRequest) (string, string, error) {
+	switch {
+	case req.OwnerID != "":
+		return store.OwnerHashForOwner(req.OwnerID), "", nil
+	case req.OwnerClientID != "":
+		return store.OwnerHashForClient(req.OwnerClientID), "", nil
+	}
+	token := req.OwnerToken
+	if token == "" {
+		generated, err := randomToken(32)
+		if err != nil {
+			return "", "", err
+		}
+		token = generated
+	}
+	return store.OwnerHashForToken(token), token, nil
 }
 
 // Create 生成 slug 并落库。slug 冲突时重试，5 次仍失败则报错。
@@ -168,23 +183,9 @@ func (s *Service) buildPaste(req CreateRequest) (*store.Paste, string, error) {
 		hash = h
 	}
 
-	// 归属：已登录用设备 id，匿名凭 owner token。
-	//
-	// 匿名客户端首次创建时带着空 token 来，这里生成一个；之后它应该
-	// 在每次创建时复用同一个 token，否则每条片段都是独立归属，
-	// 列表里只会出现最近创建的那一条。
-	var ownerHash, ownerToken string
-	if req.OwnerClientID != "" {
-		ownerHash = OwnerHashForClient(req.OwnerClientID)
-	} else {
-		ownerToken = req.OwnerToken
-		if ownerToken == "" {
-			ownerToken, err = randomToken(32)
-			if err != nil {
-				return nil, "", err
-			}
-		}
-		ownerHash = OwnerHashForToken(ownerToken)
+	ownerHash, ownerToken, err := resolveOwner(req)
+	if err != nil {
+		return nil, "", err
 	}
 
 	return &store.Paste{

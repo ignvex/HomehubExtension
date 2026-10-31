@@ -5,6 +5,8 @@ package store
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 )
 
@@ -14,6 +16,42 @@ var (
 	ErrConflict = errors.New("conflict")
 	ErrGone     = errors.New("gone")
 )
+
+// OwnerPrimary 是实例主人的归属标识。
+//
+// 单主人部署下，所有能登录的凭证——设备配对产生的 client、宿主签发的
+// 访问密钥——都属于同一个主人，因此带同一个 owner_id，算出的
+// owner_hash 也相同：用密钥写的私有片段，配对的浏览器设备看得到，
+// 反之亦然；轮换密钥不会让旧内容失联。
+//
+// 匿名创建（owner token）是唯一的例外，它没有身份，按 token 隔离。
+const OwnerPrimary = "primary"
+
+// OwnerHash 把归属凭证换算成库里存的哈希。
+//
+// 三种来源用前缀区分，避免同一字符串在三种语义下撞到一起：
+//
+//	o:<ownerID>   稳定身份（设备与访问密钥共用）
+//	c:<clientID>  单台设备，只在没有 owner_id 时作为回退
+//	t:<token>     匿名创建者持有的一次性凭证
+//
+// 只存哈希：数据库泄露不等于凭证泄露。
+func OwnerHash(prefix, value string) string {
+	sum := sha256.Sum256([]byte(prefix + ":" + value))
+	return hex.EncodeToString(sum[:])
+}
+
+// OwnerHashForOwner 是跨 client 稳定的归属哈希。
+func OwnerHashForOwner(ownerID string) string { return OwnerHash("o", ownerID) }
+
+// OwnerHashForClient 是单台设备的归属哈希。
+//
+// 只在 client 没有 owner_id 时使用。0005 迁移之后所有 client 都有
+// owner_id，这条路径只服务于迁移前遗留的数据计算。
+func OwnerHashForClient(clientID string) string { return OwnerHash("c", clientID) }
+
+// OwnerHashForToken 是匿名创建者凭证的归属哈希。
+func OwnerHashForToken(token string) string { return OwnerHash("t", token) }
 
 // Store 是全部仓储的入口。实现必须支持并发安全（内部串行化即可）。
 type Store interface {
@@ -198,6 +236,18 @@ type AuthStore interface {
 	ConsumeEnrollment(ctx context.Context, tokenHash []byte, now int64) (*Enrollment, error)
 	// PurgeEnrollments 清理过期或已使用的配对码。
 	PurgeEnrollments(ctx context.Context, now int64) (int64, error)
+
+	// CreateAccessKey 写入一把宿主签发的长期密钥。只存哈希。
+	CreateAccessKey(ctx context.Context, k *AccessKey) error
+	// GetAccessKeyByHash 按明文哈希读取，用于兑换登录。
+	// 不存在返回 ErrNotFound；已撤销或过期也返回 ErrNotFound。
+	GetAccessKeyByHash(ctx context.Context, keyHash []byte, now int64) (*AccessKey, error)
+	// ListAccessKeys 返回全部密钥（含已撤销的），不含明文。
+	ListAccessKeys(ctx context.Context) ([]AccessKey, error)
+	// TouchAccessKey 更新最近使用时间。
+	TouchAccessKey(ctx context.Context, id string, now int64) error
+	// RevokeAccessKey 撤销密钥并连带撤销它绑定的 client 及其全部会话。
+	RevokeAccessKey(ctx context.Context, id string, now int64) error
 }
 
 // JobStore 记录清理任务的每次执行。
@@ -295,10 +345,16 @@ type Blob struct {
 
 // Client 是一台已登记的设备。只存公钥，私钥从未离开客户端。
 type Client struct {
-	ID         string
-	Name       string
-	PublicKey  []byte
-	Algorithm  string
+	ID        string
+	Name      string
+	PublicKey []byte
+	Algorithm string
+	// OwnerID 是跨 client 稳定的归属标识。
+	//
+	// 空表示"这台设备自己就是一个归属"——设备配对产生的 client 就是这种，
+	// 行为与引入该字段前完全一致。访问密钥产生的 client 会填同一个
+	// 实例级标识，使轮换密钥后新旧密钥看到同一批片段。
+	OwnerID    string
 	CreatedAt  int64
 	LastSeenAt *int64
 	RevokedAt  *int64
@@ -338,6 +394,30 @@ type Enrollment struct {
 	NameHint  string
 	CreatedAt int64
 	ExpiresAt int64
+}
+
+// AccessKey 是宿主签发的一把长期登录凭证。
+//
+// KeyHash 是 sha256(规范化后的明文)；明文只在签发响应里出现一次。
+// ClientID 指向一台「无主客户端」：签发时生成了密钥对但私钥已丢弃，
+// 所以这台 client 只能靠 AccessKey 兑换登录，无法走挑战-响应。
+type AccessKey struct {
+	ID         string
+	Name       string
+	KeyHash    []byte
+	ClientID   string
+	CreatedAt  int64
+	ExpiresAt  *int64
+	LastUsedAt *int64
+	RevokedAt  *int64
+}
+
+// Live 表示这把密钥现在还能换到会话。
+func (k *AccessKey) Live(now int64) bool {
+	if k.RevokedAt != nil {
+		return false
+	}
+	return k.ExpiresAt == nil || *k.ExpiresAt > now
 }
 
 // Stats 是系统页的汇总数据。单次查询比多次往返便宜。

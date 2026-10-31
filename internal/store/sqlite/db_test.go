@@ -29,7 +29,7 @@ func TestMigrateSetsVersion(t *testing.T) {
 		t.Fatal(err)
 	}
 	// 迁移版本只前进不回退；新增迁移时同步更新这里。
-	const wantVersion = 2
+	const wantVersion = 5
 	if v != wantVersion {
 		t.Errorf("schema version = %d, want %d", v, wantVersion)
 	}
@@ -487,5 +487,89 @@ func TestBackupToHandlesQuoteInPath(t *testing.T) {
 
 	if err := backup.Ping(ctx); err != nil {
 		t.Errorf("备份不可读: %v", err)
+	}
+}
+
+// 0005 的 Go 侧数据搬迁必须真的改写存量归属。
+//
+// 迁移只补 auth_client.owner_id 是不够的：历史 paste.owner_hash 是按
+// "c:<clientID>" 算的，不重算的话，升级后存量私有片段会立刻变成
+// 没有凭证能匹配的孤儿——数据还在，只是谁都读不到。
+func TestShareOwnerScopeRewritesExistingHashes(t *testing.T) {
+	db := openTest(t)
+	ctx := context.Background()
+	now := time.Now().Unix()
+
+	// 造一台"迁移前"的设备：owner_id 为空，归属按 client id 算。
+	const clientID = "01JCPREVIOUSDEVICE000000"
+	if err := db.Auth().CreateClient(ctx, &store.Client{
+		ID: clientID, Name: "old-device",
+		PublicKey: make([]byte, 32), Algorithm: "ed25519", CreatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	oldHash := store.OwnerHashForClient(clientID)
+	p := &store.Paste{
+		ID: "01JCPAST000000000000000001", Slug: "legacy01", Body: "迁移前写的",
+		Language: "text", Visibility: "private", SizeBytes: 15,
+		OwnerHash: oldHash, CreatedAt: now, UpdatedAt: now,
+	}
+	if err := db.Paste().Create(ctx, p); err != nil {
+		t.Fatal(err)
+	}
+
+	// 退回 0005 之前的状态。
+	if _, err := db.rw.ExecContext(ctx,
+		`UPDATE auth_client SET owner_id = '' WHERE id = ?`, clientID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.rw.ExecContext(ctx, `PRAGMA user_version = 4`); err != nil {
+		t.Fatal(err)
+	}
+
+	// 重新迁移，等价于一次真实升级。
+	if err := migrate(ctx, db.rw); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+
+	// client 的 owner_id 补上了。
+	cl, err := db.Auth().GetClient(ctx, clientID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cl.OwnerID != store.OwnerPrimary {
+		t.Errorf("owner_id = %q, want %q", cl.OwnerID, store.OwnerPrimary)
+	}
+
+	// 片段的归属哈希被重写到实例级。
+	got, err := db.Paste().GetBySlug(ctx, "legacy01")
+	if err != nil {
+		t.Fatalf("迁移后读不到存量片段: %v", err)
+	}
+	want := store.OwnerHashForOwner(store.OwnerPrimary)
+	if got.OwnerHash != want {
+		t.Errorf("owner_hash = %q, want %q（迁移没重写归属）", got.OwnerHash, want)
+	}
+	if got.Body != "迁移前写的" {
+		t.Errorf("body = %q", got.Body)
+	}
+
+	// 按旧哈希过滤的列表应当为空：归属空间已经整体迁移走了。
+	items, _, err := db.Paste().List(ctx, oldHash, 10, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 0 {
+		t.Errorf("旧归属下仍有 %d 条片段，迁移没生效", len(items))
+	}
+
+	// 按新哈希过滤能看到它。
+	items, _, err = db.Paste().List(ctx, want, 10, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 1 {
+		t.Errorf("新归属下 %d 条片段，want 1", len(items))
 	}
 }

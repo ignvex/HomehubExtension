@@ -71,11 +71,14 @@ func (s *server) handlePasteCreate(c *gin.Context) {
 		return
 	}
 
-	// 归属：已登录用设备 id，匿名则 service 生成一次性 token。
+	// 归属：稳定身份 > 设备 id > 匿名 token，与读取侧的 OwnerHash 一致。
+	// 两边必须用同一套优先级，否则会出现"刚创建就读不到"这种
+	// 自相矛盾的状态。
 	cl := clientFrom(c)
-	var clientID string
+	var clientID, ownerID string
 	if cl != nil {
 		clientID = cl.ID
+		ownerID = cl.OwnerID
 	}
 
 	p, ownerToken, err := s.Paste.Create(c.Request.Context(), paste.CreateRequest{
@@ -87,6 +90,7 @@ func (s *server) handlePasteCreate(c *gin.Context) {
 		ExpiresIn:     expiry,
 		BurnAfterRead: req.BurnAfterRead,
 		OwnerClientID: clientID,
+		OwnerID:       ownerID,
 		OwnerToken:    c.GetHeader(headerOwnerToken),
 	})
 	if err != nil {

@@ -12,7 +12,7 @@ import (
 	"time"
 
 	"github.com/ignvex/HomehubExtension/internal/auth"
-	"github.com/ignvex/HomehubExtension/internal/paste"
+	"github.com/ignvex/HomehubExtension/internal/store"
 
 	"github.com/gin-gonic/gin"
 )
@@ -60,6 +60,18 @@ func clientFrom(c *gin.Context) *authClient {
 type authClient struct {
 	ID   string
 	Name string
+	// OwnerID 是跨 client 稳定的归属标识，访问密钥签发的 client 才有。
+	// 空表示按设备隔离（设备配对产生的那种）。
+	OwnerID string
+}
+
+// newAuthClient 把 store 的 client 转成请求上下文里的精简结构。
+//
+// 单独包一层是因为要新增节点有三个：Bearer、cookie 会话、可选鉴权。
+// 逐个手写字面量的话，漏掉 OwnerID 不会编译失败——它只会让归属
+// 悄悄退回按设备算，表现为"轮换后数据不见了"，而错误现场离这里很远。
+func newAuthClient(c *store.Client) *authClient {
+	return &authClient{ID: c.ID, Name: c.Name, OwnerID: c.OwnerID}
 }
 
 // RequestID 为每个请求分配 ID，并在响应头回写，便于和日志对账。
@@ -168,7 +180,7 @@ func RequireAuth(svc *auth.Service, allowCookie bool) gin.HandlerFunc {
 		if token != "" {
 			client, err := svc.Authenticate(c.Request.Context(), token)
 			if err == nil {
-				c.Set(ctxClient, &authClient{ID: client.ID, Name: client.Name})
+				c.Set(ctxClient, newAuthClient(client))
 				// Bearer 请求豁免 CSRF：浏览器不会自动附加这个头。
 				c.Set("auth_via_bearer", true)
 				c.Next()
@@ -179,7 +191,7 @@ func RequireAuth(svc *auth.Service, allowCookie bool) gin.HandlerFunc {
 			if ck, err := c.Cookie(cookieSession); err == nil && ck != "" {
 				client, err := svc.SessionClient(c.Request.Context(), ck)
 				if err == nil {
-					c.Set(ctxClient, &authClient{ID: client.ID, Name: client.Name})
+					c.Set(ctxClient, newAuthClient(client))
 					c.Next()
 					return
 				}
@@ -329,7 +341,7 @@ func OptionalAuth(svc *auth.Service) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		if token := auth.ParseBearer(c.GetHeader("Authorization")); token != "" {
 			if client, err := svc.Authenticate(c.Request.Context(), token); err == nil {
-				c.Set(ctxClient, &authClient{ID: client.ID, Name: client.Name})
+				c.Set(ctxClient, newAuthClient(client))
 				c.Set("auth_via_bearer", true)
 			}
 		}
@@ -346,10 +358,15 @@ func OptionalAuth(svc *auth.Service) gin.HandlerFunc {
 // 而这些日志通常会被收集到别处。
 func OwnerHash(c *gin.Context) string {
 	if cl := clientFrom(c); cl != nil {
-		return paste.OwnerHashForClient(cl.ID)
+		// 有稳定身份就按它算：同一主人的多把密钥共享归属，
+		// 轮换密钥不会让旧片段变成孤儿。
+		if cl.OwnerID != "" {
+			return store.OwnerHashForOwner(cl.OwnerID)
+		}
+		return store.OwnerHashForClient(cl.ID)
 	}
 	if token := c.GetHeader(headerOwnerToken); token != "" {
-		return paste.OwnerHashForToken(token)
+		return store.OwnerHashForToken(token)
 	}
 	return ""
 }
