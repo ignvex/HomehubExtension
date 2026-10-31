@@ -1,5 +1,8 @@
 # 构建产物
 /bin/
+# 发布产物暂存：交叉编译出的二进制按平台分布在这里，不进版本库。
+# 用 /dist/ 而不是 dist/：web/dist 是前端构建产物，规则不同（见下）。
+/dist/
 /homehub-extension
 *.test
 *.out

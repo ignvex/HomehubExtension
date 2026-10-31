@@ -1,6 +1,6 @@
 .PHONY: help dev-api dev-web build test race vet fmt web clean lint units
 
-BINARY := bin/homehub-extension
+BINARY := dist/homehub-extension
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 COMMIT  ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo none)
 DATE    ?= $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
@@ -48,7 +48,7 @@ fmt: ## 格式化
 	gofmt -l -w .
 
 clean: ## 清理产物
-	rm -rf bin/ web/dist/_app web/dist/assets
+	rm -rf bin/ dist/ web/dist/_app web/dist/assets
 
 lint: ## 规范检查（Golang Specification skill）
 	@echo "== gofmt =="
