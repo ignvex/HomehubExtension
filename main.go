@@ -19,6 +19,7 @@ import (
 	"github.com/ignvex/HomehubExtension/internal/app"
 	"github.com/ignvex/HomehubExtension/internal/config"
 	"github.com/ignvex/HomehubExtension/internal/httpapi"
+	"github.com/ignvex/HomehubExtension/internal/store/sqlite"
 )
 
 // 由 -ldflags 注入。
@@ -50,6 +51,14 @@ func main() {
 }
 
 func run(args []string) error {
+	// `-h` / `--help` 写在子命令位置时必须在进入 serve 之前拦下。
+	// 否则它会落到 serve 的 flag set 里：flag 包返回 ErrHelp，
+	// 打印的是 serve 的 flag 列表并以 1 退出，而不是顶层用法。
+	if len(args) > 0 && (args[0] == "-h" || args[0] == "--help") {
+		fmt.Print(usage)
+		return nil
+	}
+
 	cmd := "serve"
 	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
 		cmd = args[0]
@@ -62,7 +71,7 @@ func run(args []string) error {
 		return nil
 	case "serve", "enroll", "migrate", "backup":
 		return runWithConfig(cmd, args)
-	case "help", "-h", "--help":
+	case "help":
 		fmt.Print(usage)
 		return nil
 	default:
@@ -107,7 +116,7 @@ func runWithConfig(cmd string, args []string) error {
 	case "backup":
 		return runBackup(ctx, cfg, logger, *outDir)
 	case "migrate":
-		return fmt.Errorf("migrate 子命令尚未实现（serve 启动时会自动执行迁移）")
+		return runMigrate(ctx, cfg)
 	}
 
 	return app.Run(ctx, app.Options{
@@ -137,6 +146,29 @@ func newLogger(level, format string) *slog.Logger {
 		return slog.New(slog.NewTextHandler(os.Stdout, opts))
 	}
 	return slog.New(slog.NewJSONHandler(os.Stdout, opts))
+}
+
+// runMigrate 执行待应用的迁移后退出。
+//
+// serve 启动时本来就会迁移，这个子命令的价值在于把「改库结构」从
+// 「重启服务」里拆出来：升级前先跑完迁移，重启那一次的停机窗口
+// 就只剩进程启动本身，不必把迁移耗时也算进去。
+func runMigrate(ctx context.Context, cfg config.Config) error {
+	db, err := sqlite.Open(ctx, cfg.Database.Path, sqlite.Options{
+		BusyTimeout: cfg.Database.BusyTimeout.Duration,
+		ReadConns:   cfg.Database.ReadConns,
+	})
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+
+	schema, err := db.SchemaVersion(ctx)
+	if err != nil {
+		return fmt.Errorf("read schema version: %w", err)
+	}
+	fmt.Printf("迁移完成，schema_version = %d\n", schema)
+	return nil
 }
 
 // runEnroll 生成一次性配对码。

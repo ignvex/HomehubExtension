@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io/fs"
 	"log/slog"
+	"net"
 	"net/http"
 	"time"
 
@@ -22,6 +23,7 @@ import (
 	"github.com/ignvex/HomehubExtension/internal/rss"
 	"github.com/ignvex/HomehubExtension/internal/scheduler"
 	"github.com/ignvex/HomehubExtension/internal/store/sqlite"
+	"github.com/ignvex/HomehubExtension/internal/systemd"
 )
 
 // Options 是 app.Run 的装配参数。
@@ -85,6 +87,11 @@ func Run(ctx context.Context, opts Options) error {
 	if err := a.setupScheduler(); err != nil {
 		return err
 	}
+
+	// 心跳覆盖启动与运行全程：systemd 用 WatchdogSec 发现「进程还在但
+	// 已经不干活」的情况，这是 Restart=on-failure 看不到的一类故障。
+	go systemd.KeepWatchdog(ctx, log)
+
 	if err := a.startServers(ctx, opts); err != nil {
 		return err
 	}
@@ -290,18 +297,39 @@ func (a *App) startServers(ctx context.Context, opts Options) error {
 		ReadTimeout:       0,
 	}
 
+	// 先显式 bind 再 Serve。
+	//
+	// ListenAndServe 把 bind 和 serve 揉在一起，bind 的失败只能在后台
+	// goroutine 里经 srvErr 传回来。而下面几行就要发 READY=1——沿用旧写法
+	// 的话，端口被占时进程会先朝 systemd 发一条 READY=1 再退出：
+	// systemd 认为服务就绪，实际上没有任何端口在监听。
+	// 同步 bind 之后，READY 只可能出现在「确实绑定成功」的路径上。
+	ln, err := net.Listen("tcp", a.cfg.Server.Addr)
+	if err != nil {
+		return fmt.Errorf("listen %s: %w", a.cfg.Server.Addr, err)
+	}
+
 	a.srvErr = make(chan error, 1)
 	go func() {
-		a.log.Info("http server listening",
-			"addr", a.cfg.Server.Addr,
-			"public_url", a.cfg.Server.PublicURL,
-			"version", opts.Build.Version)
-		if err := a.server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		if err := a.server.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			a.srvErr <- err
 		}
 	}()
 
 	a.startBackgroundWorkers(ctx)
+
+	a.log.Info("http server listening",
+		"addr", a.cfg.Server.Addr,
+		"public_url", a.cfg.Server.PublicURL,
+		"version", opts.Build.Version)
+
+	// 端口已绑定、迁移与依赖装配全部完成，此刻才算「可以接流量」。
+	if err := systemd.Ready(); err != nil {
+		a.log.Warn("sd_notify ready failed", "err", err)
+	}
+	if err := systemd.Status("serving on %s", a.cfg.Server.Addr); err != nil {
+		a.log.Warn("sd_notify status failed", "err", err)
+	}
 	return nil
 }
 
@@ -359,6 +387,15 @@ func (a *App) closeInfra() {
 // shutdown 按序关闭。先取消 SSE，再停 HTTP，否则 Shutdown 会一直
 // 等着那些长连接直到超时。
 func (a *App) shutdown() {
+	// 先声明进入关闭流程：`systemctl status` 会显示这条状态，
+	// 运维看到的是「正在关闭」而不是一次莫名其妙的连接中断。
+	if err := systemd.Stopping(); err != nil {
+		a.log.Warn("sd_notify stopping failed", "err", err)
+	}
+	if err := systemd.Status("shutting down"); err != nil {
+		a.log.Warn("sd_notify status failed", "err", err)
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), shutdownBudget)
 	defer cancel()
 
