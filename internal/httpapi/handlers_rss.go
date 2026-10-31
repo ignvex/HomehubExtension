@@ -109,7 +109,7 @@ func (s *server) handleFeedList(c *gin.Context) {
 		out = append(out, feedResponse{
 			ID: f.ID, URL: f.URL, Title: f.Title, SiteURL: f.SiteURL,
 			Enabled:       f.Enabled,
-			FetchInterval: (time.Duration(f.FetchInterval) * time.Second).String(),
+			FetchInterval: formatInterval(f.FetchInterval),
 			NextFetchAt:   optTS(f.NextFetchAt),
 			LastFetchAt:   optTS(f.LastFetchAt),
 			LastStatus:    f.LastStatus,
@@ -132,17 +132,16 @@ func (s *server) handleFeedGet(c *gin.Context) {
 		fail(c, err)
 		return
 	}
-	unread, _ := s.Store.Entry().UnreadCount(c.Request.Context(), id)
 	c.JSON(http.StatusOK, feedResponse{
 		ID: f.ID, URL: f.URL, Title: f.Title, SiteURL: f.SiteURL,
 		Enabled:       f.Enabled,
-		FetchInterval: (time.Duration(f.FetchInterval) * time.Second).String(),
+		FetchInterval: formatInterval(f.FetchInterval),
 		NextFetchAt:   optTS(f.NextFetchAt),
 		LastFetchAt:   optTS(f.LastFetchAt),
 		LastStatus:    f.LastStatus,
 		LastError:     f.LastError,
 		ErrorCount:    f.ErrorCount,
-		UnreadCount:   unread,
+		UnreadCount:   f.UnreadCount,
 	})
 }
 
@@ -403,7 +402,7 @@ func (s *server) handleFeedCreate(c *gin.Context) {
 	c.JSON(status, feedResponse{
 		ID: saved.ID, URL: saved.URL, Title: saved.Title, SiteURL: saved.SiteURL,
 		Enabled:       saved.Enabled,
-		FetchInterval: (time.Duration(saved.FetchInterval) * time.Second).String(),
+		FetchInterval: formatInterval(saved.FetchInterval),
 		NextFetchAt:   optTS(saved.NextFetchAt),
 		LastFetchAt:   optTS(saved.LastFetchAt),
 		LastStatus:    saved.LastStatus,
@@ -471,16 +470,15 @@ func (s *server) handleFeedUpdate(c *gin.Context) {
 		return
 	}
 
-	unread, _ := s.Store.Entry().UnreadCount(c.Request.Context(), id)
 	c.JSON(http.StatusOK, feedResponse{
 		ID: feed.ID, URL: feed.URL, Title: feed.Title, SiteURL: feed.SiteURL,
 		Enabled:       feed.Enabled,
-		FetchInterval: (time.Duration(feed.FetchInterval) * time.Second).String(),
+		FetchInterval: formatInterval(feed.FetchInterval),
 		NextFetchAt:   optTS(feed.NextFetchAt),
 		LastFetchAt:   optTS(feed.LastFetchAt),
 		LastStatus:    feed.LastStatus,
 		LastError:     feed.LastError,
 		ErrorCount:    feed.ErrorCount,
-		UnreadCount:   unread,
+		UnreadCount:   feed.UnreadCount,
 	})
 }

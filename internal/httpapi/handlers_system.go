@@ -25,8 +25,11 @@ type appCard struct {
 
 // handleApps 驱动工具台首页。
 //
-// 前端不硬编码应用列表：新增一个模块只需要在代码里注册，
-// 首页自动多出一张卡。这也是"会有很多本地工具台应用"这条需求的落点。
+// 卡片列表就在这个函数里逐项追加，不是一个可插拔的注册表：
+// 新增一个模块要同时改两处——这里加一张卡，前端 app.ts 的路由表
+// 加对应的一条。只改这里的话，卡片会指向 404。
+//
+// 放在服务端的好处是 enabled 能跟着配置走，前端不必重新发布。
 func (s *server) handleApps(c *gin.Context) {
 	stats, err := s.Store.Stats(c.Request.Context())
 	if err != nil {

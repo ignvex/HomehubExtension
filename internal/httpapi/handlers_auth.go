@@ -190,3 +190,28 @@ func (s *server) handleRevokeClient(c *gin.Context) {
 	}
 	c.Status(http.StatusNoContent)
 }
+
+type keyLoginRequest struct {
+	Key string `json:"key" binding:"required"`
+}
+
+// handleKeyLogin 用宿主签发的长期密钥换一组会话令牌。
+//
+// 和 /auth/token 的区别只在于"怎么证明自己"：那边是设备私钥签的
+// 挑战消息，这里是直接出示密钥。拿到令牌之后一切相同——同一个
+// issue()、同一个 access token、同一个 refresh cookie、同一个 owner_hash。
+// 下游没有任何分支需要知道这次登录走的是哪条路。
+func (s *server) handleKeyLogin(c *gin.Context) {
+	var req keyLoginRequest
+	if !bindJSON(c, &req) {
+		return
+	}
+	tokens, err := s.Auth.RedeemAccessKey(c.Request.Context(), req.Key, c.Request.UserAgent())
+	if err != nil {
+		fail(c, err)
+		return
+	}
+	// 不走 machine 分支：密钥登录本质上仍是"人在这台浏览器上进入"，
+	// refresh token 应该留在 HttpOnly cookie 里，而不是进响应体。
+	s.respondTokens(c, tokens, false)
+}

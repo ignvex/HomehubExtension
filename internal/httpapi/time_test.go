@@ -108,8 +108,8 @@ func TestDurationFieldsStayStrings(t *testing.T) {
 	json.Unmarshal(w.Body.Bytes(), &sub)
 
 	// 时长：字符串
-	if v, ok := sub["fetch_interval"].(string); !ok || v != "45m0s" {
-		t.Errorf("fetch_interval = %v (%T)，期望字符串 \"45m0s\"", sub["fetch_interval"], sub["fetch_interval"])
+	if v, ok := sub["fetch_interval"].(string); !ok || v != "45m" {
+		t.Errorf("fetch_interval = %v (%T)，期望字符串 \"45m\"", sub["fetch_interval"], sub["fetch_interval"])
 	}
 	// 时刻：数字（首推会立刻排期，所以 next_fetch_at 一定有值）
 	if _, ok := sub["next_fetch_at"].(float64); !ok {
@@ -193,6 +193,45 @@ func TestEmptyCollectionsAreArrays(t *testing.T) {
 		var arr []json.RawMessage
 		if err := json.Unmarshal(raw, &arr); err != nil {
 			t.Errorf("%s 的 %q 不是数组: %s", c.path, c.key, raw)
+		}
+	}
+}
+
+// formatInterval 的输出去掉零分量，且必须能被 ParseDuration 原样读回。
+//
+// 用 Duration.String() 会得到 "45m0s"、"6h0m0s"。宿主把订阅间隔
+// 回显给用户时看到的就是这种形状，而文档承诺的是 "45m"。
+func TestFormatInterval(t *testing.T) {
+	cases := []struct {
+		seconds int64
+		want    string
+	}{
+		{0, "0s"},
+		{-1, "0s"},
+		{30, "30s"},
+		{600, "10m"},
+		{2700, "45m"},
+		{3600, "1h"},
+		{5400, "1h30m"},
+		{21600, "6h"},
+		{604800, "168h"},
+		// 非整分钟：秒分量必须保留，不能被静默截断。
+		{3661, "1h1m1s"},
+	}
+	for _, c := range cases {
+		got := formatInterval(c.seconds)
+		if got != c.want {
+			t.Errorf("formatInterval(%d) = %q, want %q", c.seconds, got, c.want)
+		}
+		if c.seconds > 0 {
+			back, err := time.ParseDuration(got)
+			if err != nil {
+				t.Errorf("ParseDuration(%q) failed: %v", got, err)
+				continue
+			}
+			if int64(back/time.Second) != c.seconds {
+				t.Errorf("round-trip of %d gave %d", c.seconds, int64(back/time.Second))
+			}
 		}
 	}
 }

@@ -21,6 +21,7 @@ import (
 	"github.com/ignvex/HomehubExtension/internal/events"
 	"github.com/ignvex/HomehubExtension/internal/paste"
 	"github.com/ignvex/HomehubExtension/internal/rss"
+	"github.com/ignvex/HomehubExtension/internal/store"
 	"github.com/ignvex/HomehubExtension/internal/store/sqlite"
 
 	"github.com/gin-gonic/gin"
@@ -409,8 +410,8 @@ func TestHubSubscriptionPush(t *testing.T) {
 		FetchInterval string `json:"fetch_interval"`
 	}
 	json.Unmarshal(w.Body.Bytes(), &sub)
-	if sub.FetchInterval != "45m0s" {
-		t.Errorf("interval = %q, want 45m0s", sub.FetchInterval)
+	if sub.FetchInterval != "45m" {
+		t.Errorf("interval = %q, want 45m", sub.FetchInterval)
 	}
 
 	// 同一 URL 再推一次是更新，不是新建。
@@ -441,7 +442,7 @@ func TestHubSubscriptionPush(t *testing.T) {
 	if len(list.Items) != 1 {
 		t.Fatalf("items = %d, want 1 (upsert must not duplicate)", len(list.Items))
 	}
-	if list.Items[0].FetchInterval != "2h0m0s" {
+	if list.Items[0].FetchInterval != "2h" {
 		t.Errorf("interval after update = %q", list.Items[0].FetchInterval)
 	}
 }
@@ -496,8 +497,219 @@ func TestHubIntervalClamped(t *testing.T) {
 		FetchInterval string `json:"fetch_interval"`
 	}
 	json.Unmarshal(w.Body.Bytes(), &sub)
-	if sub.FetchInterval != "10m0s" {
-		t.Errorf("interval = %q, want clamped to 10m0s", sub.FetchInterval)
+	if sub.FetchInterval != "10m" {
+		t.Errorf("interval = %q, want clamped to 10m", sub.FetchInterval)
+	}
+}
+
+// push 的响应必须带上真实的未读计数。
+//
+// 之前 hubUpsert 返回的是 Upsert 内部 Get 出来的行，而 Get 的查询
+// 没有未读子查询，字段恒为 0；紧跟着的 GET 列表却有值。同一个
+// toHubSubscription 给出两种答案，宿主对账时会以为「刚推的内容没了」。
+func TestHubPushReportsUnreadCount(t *testing.T) {
+	h := newHarness(t)
+	const url = "https://e.com/unread.xml"
+
+	first := h.pushHub(t, []byte(`{"url":"`+url+`","fetch_now":false}`), "u1")
+	feedID := int64(first["id"].(float64))
+
+	ctx := context.Background()
+	now := time.Now().Unix()
+	for _, guid := range []string{"e1", "e2"} {
+		if _, err := h.db.Entry().InsertIfNew(ctx, &store.Entry{
+			FeedID: feedID, GUID: guid, Title: guid, FetchedAt: now,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	entries, _, err := h.db.Entry().List(ctx, store.EntryQuery{FeedID: feedID, Limit: 10})
+	if err != nil || len(entries) != 2 {
+		t.Fatalf("entries = %d, err = %v", len(entries), err)
+	}
+	if err := h.db.Entry().SetRead(ctx, entries[0].ID, true); err != nil {
+		t.Fatal(err)
+	}
+
+	// 只改标题的更新推送：响应里的未读计数必须与列表一致。
+	got := h.pushHub(t, []byte(`{"url":"`+url+`","title":"renamed","fetch_now":false}`), "u2")
+	if got["unread_count"] != float64(1) {
+		t.Errorf("push unread_count = %v, want 1", got["unread_count"])
+	}
+
+	listReq := httptest.NewRequest(http.MethodGet, "/api/v1/hub/subscriptions", nil)
+	signHubRequest(t, listReq, h.hubPriv, nil, "u3")
+	w := h.do(t, listReq)
+	if w.Code != http.StatusOK {
+		t.Fatalf("list = %d: %s", w.Code, w.Body.String())
+	}
+	var list struct {
+		Items []struct {
+			UnreadCount int64 `json:"unread_count"`
+		} `json:"items"`
+	}
+	json.Unmarshal(w.Body.Bytes(), &list)
+	if len(list.Items) != 1 || list.Items[0].UnreadCount != 1 {
+		t.Errorf("list items = %+v, want one item with unread_count 1", list.Items)
+	}
+}
+
+// pushHub 推一次订阅并返回解码后的响应体。
+// 任何 >= 300 都直接失败：这一组测试关心的是响应内容，不是错误路径。
+func (h *harness) pushHub(t *testing.T, body []byte, nonce string) map[string]any {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/hub/subscriptions", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	signHubRequest(t, req, h.hubPriv, body, nonce)
+	w := h.do(t, req)
+	if w.Code >= 300 {
+		t.Fatalf("push %s = %d: %s", body, w.Code, w.Body.String())
+	}
+	var out map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &out); err != nil {
+		t.Fatalf("decode %s: %v", w.Body.String(), err)
+	}
+	return out
+}
+
+// RSS 模块关闭时，四个 hub 端点必须给同一个答案。
+//
+// 之前 refresh 不做检查就直接调 s.RSS.Fetch，RSS 未装配时是一次
+// nil 解引用，被 Recovery 接住变成 500；而 upsert 返回 404、
+// list 返回 200 空数组。宿主无法用一致逻辑判断模块是否可用。
+func TestHubEndpointsAgreeWhenRSSDisabled(t *testing.T) {
+	h := newHarness(t)
+	cfg := h.cfg
+	cfg.RSS.Enabled = false
+	router := NewRouter(Deps{
+		Cfg: cfg, Store: h.db, Blobs: h.blobs, Auth: h.svc,
+		HubVerifier: auth.NewHubVerifier(h.hubPub, time.Minute, time.Minute),
+		Paste:       h.pasteSvc, RSS: nil, Log: nil, Bus: h.bus,
+		Build: BuildInfo{Version: "test"}, Started: time.Now(),
+	})
+
+	cases := []struct {
+		method string
+		path   string
+		body   []byte
+	}{
+		{http.MethodPost, "/api/v1/hub/subscriptions", []byte(`{"url":"https://e.com/f.xml"}`)},
+		{http.MethodGet, "/api/v1/hub/subscriptions", nil},
+		{http.MethodDelete, "/api/v1/hub/subscriptions/1", nil},
+		{http.MethodPost, "/api/v1/hub/subscriptions/1/refresh", nil},
+	}
+	for i, tc := range cases {
+		req := httptest.NewRequest(tc.method, tc.path, bytes.NewReader(tc.body))
+		signHubRequest(t, req, h.hubPriv, tc.body, fmt.Sprintf("disabled-%d", i))
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+		if w.Code != http.StatusNotFound {
+			t.Errorf("%s %s = %d, want 404: %s", tc.method, tc.path, w.Code, w.Body.String())
+		}
+		if !strings.Contains(w.Body.String(), "not_found") {
+			t.Errorf("%s %s body = %s, want JSON not_found", tc.method, tc.path, w.Body.String())
+		}
+	}
+}
+
+// 省略的字段必须保留原值，而不是回落默认。
+//
+// 之前 enabled 缺省写死为 true、interval 缺省写死为 default_interval，
+// 于是一次「只改标题」的推送会把用户显式暂停的订阅悄悄恢复。
+func TestHubUpsertPreservesOmittedFields(t *testing.T) {
+	h := newHarness(t)
+
+	h.pushHub(t, []byte(`{"url":"https://e.com/keep.xml","interval":"45m","fetch_now":false}`), "k1")
+
+	// 宿主显式暂停。
+	paused := h.pushHub(t, []byte(`{"url":"https://e.com/keep.xml","enabled":false,"fetch_now":false}`), "k2")
+	if paused["enabled"] != false {
+		t.Fatalf("enabled = %v, want false", paused["enabled"])
+	}
+
+	// 只改标题：间隔与启用状态都必须原样保留。
+	only := h.pushHub(t, []byte(`{"url":"https://e.com/keep.xml","title":"新标题","fetch_now":false}`), "k3")
+	if only["enabled"] != false {
+		t.Errorf("omitted enabled revived the feed: got %v, want false", only["enabled"])
+	}
+	if only["fetch_interval"] != "45m" {
+		t.Errorf("omitted interval = %v, want 45m", only["fetch_interval"])
+	}
+	if only["title"] != "新标题" {
+		t.Errorf("title = %v, want 新标题", only["title"])
+	}
+}
+
+// 间隔变化必须重排 next_fetch_at；只是重复推送同样间隔则不动。
+//
+// 之前 UPDATE 分支根本不写 next_fetch_at，宿主把间隔从 6h 调到 10m 后
+// 仍要等满 6 小时才按新间隔跑。
+func TestHubUpsertReschedulesOnIntervalChange(t *testing.T) {
+	h := newHarness(t)
+	const url = "https://e.com/pace.xml"
+
+	first := h.pushHub(t, []byte(`{"url":"`+url+`","interval":"6h","fetch_now":false}`), "s1")
+	original, ok := first["next_fetch_at"].(float64)
+	if !ok {
+		t.Fatalf("next_fetch_at = %v, want unix seconds", first["next_fetch_at"])
+	}
+
+	// 同间隔、只改标题：抓取时刻不该被推迟。
+	same := h.pushHub(t, []byte(`{"url":"`+url+`","interval":"6h","title":"t","fetch_now":false}`), "s2")
+	if same["next_fetch_at"].(float64) != original {
+		t.Errorf("next_fetch_at moved without an interval change")
+	}
+
+	// 间隔改成 10m：必须重排到约 now+600s。
+	tightened := h.pushHub(t, []byte(`{"url":"`+url+`","interval":"10m","fetch_now":false}`), "s3")
+	delta := tightened["next_fetch_at"].(float64) - float64(time.Now().Unix())
+	if delta < 500 || delta > 700 {
+		t.Errorf("next_fetch_at in %.0fs, want ~600s after the interval change", delta)
+	}
+}
+
+// 从「连续失败被自动停用」恢复时，error_count 必须清零。
+//
+// 只把 enabled 改回 true 的话，error_count 仍是 10，下一次失败就变 11，
+// 立刻又被停用——宿主看到的是「刚恢复就又停了」。
+func TestHubRevivalResetsErrorCount(t *testing.T) {
+	h := newHarness(t)
+	const url = "https://e.com/dead.xml"
+
+	h.pushHub(t, []byte(`{"url":"`+url+`","fetch_now":false}`), "r1")
+
+	// 直接改库，模拟 markFailure 连续失败 10 次之后的形态。
+	ctx := context.Background()
+	f, err := h.db.Feed().GetByURL(ctx, url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.Enabled = false
+	f.ErrorCount = 10
+	f.LastError = "停用：连续失败 10 次；connection refused"
+	if err := h.db.Feed().Update(ctx, f); err != nil {
+		t.Fatal(err)
+	}
+
+	revived := h.pushHub(t, []byte(`{"url":"`+url+`","enabled":true,"fetch_now":false}`), "r2")
+	if revived["enabled"] != true {
+		t.Fatalf("enabled = %v, want true", revived["enabled"])
+	}
+	if revived["error_count"] != float64(0) {
+		t.Errorf("error_count = %v, want 0 after explicit revival", revived["error_count"])
+	}
+	if revived["last_error"] != "" {
+		t.Errorf("last_error = %q, want empty after explicit revival", revived["last_error"])
+	}
+
+	// 落库也要是清的，不只是响应好看。
+	after, err := h.db.Feed().GetByURL(ctx, url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.ErrorCount != 0 || after.LastError != "" {
+		t.Errorf("persisted error_count=%d last_error=%q, want 0 and empty",
+			after.ErrorCount, after.LastError)
 	}
 }
 
@@ -868,5 +1080,478 @@ func TestEveryListedPasteIsReadable(t *testing.T) {
 	json.Unmarshal(w.Body.Bytes(), &detail)
 	if detail.Body != "detail me" {
 		t.Errorf("正文 = %q", detail.Body)
+	}
+}
+
+// 刷一个不存在的订阅是 404，不是 502。
+//
+// 之前 Fetch 返回的所有错误都被当成上游失败，包括 store.ErrNotFound。
+// 宿主推了一个已被删掉的 id 会拿到 502，误以为「目标站有问题，重试就好」。
+func TestHubRefreshUnknownFeed(t *testing.T) {
+	h := newHarness(t)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/hub/subscriptions/99999/refresh", nil)
+	signHubRequest(t, req, h.hubPriv, nil, "refresh-missing")
+
+	w := h.do(t, req)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("refresh missing feed = %d, want 404: %s", w.Code, w.Body.String())
+	}
+	var body struct {
+		Error struct {
+			Code      string `json:"code"`
+			RequestID string `json:"request_id"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode: %v (%s)", err, w.Body.String())
+	}
+	if body.Error.Code != "not_found" {
+		t.Errorf("code = %q, want not_found", body.Error.Code)
+	}
+	if body.Error.RequestID == "" {
+		t.Error("request_id missing: 统一错误结构必须带它")
+	}
+}
+
+// ---- 宿主签发的长期访问密钥 ----
+
+// issueKey 走真实的签名通道签发一把密钥，返回明文与 id。
+func (h *harness) issueKey(t *testing.T, name, expiresIn string) (plain, id string) {
+	t.Helper()
+	payload := map[string]string{"name": name}
+	if expiresIn != "" {
+		payload["expires_in"] = expiresIn
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/hub/keys", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	signHubRequest(t, req, h.hubPriv, body, "key-"+name)
+	w := h.do(t, req)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("issue key = %d: %s", w.Code, w.Body.String())
+	}
+	var out struct {
+		ID  string `json:"id"`
+		Key string `json:"key"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &out); err != nil {
+		t.Fatal(err)
+	}
+	if out.Key == "" {
+		t.Fatal("签发响应里没有明文密钥")
+	}
+	return out.Key, out.ID
+}
+
+// redeemKey 用密钥换令牌，返回响应体与状态码。
+func (h *harness) redeemKey(t *testing.T, key string) (int, map[string]any) {
+	t.Helper()
+	body, _ := json.Marshal(map[string]string{"key": key})
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/key", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := h.do(t, req)
+	var out map[string]any
+	_ = json.Unmarshal(w.Body.Bytes(), &out)
+	return w.Code, out
+}
+
+// 签发的密钥必须能直接换到可用会话，并且换出来的会话和其他登录方式
+// 完全等价——这是整个特性的验收条件。
+func TestAccessKeyEndToEnd(t *testing.T) {
+	h := newHarness(t)
+	plain, _ := h.issueKey(t, "alice", "")
+
+	code, body := h.redeemKey(t, plain)
+	if code != http.StatusOK {
+		t.Fatalf("redeem = %d: %v", code, body)
+	}
+	token, _ := body["access_token"].(string)
+	if token == "" {
+		t.Fatalf("no access_token: %v", body)
+	}
+
+	// 用它访问一个需要登录的端点。
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/clients", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	w := h.do(t, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("clients with key session = %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// 同一把密钥可以反复兑换：换浏览器、换设备都靠它。
+func TestAccessKeyIsReusable(t *testing.T) {
+	h := newHarness(t)
+	plain, _ := h.issueKey(t, "shared", "")
+
+	_, first := h.redeemKey(t, plain)
+	_, second := h.redeemKey(t, plain)
+	if first["access_token"] == second["access_token"] {
+		t.Error("两次兑换返回了同一个 access token，说明没有签发新会话")
+	}
+}
+
+// 用户从聊天窗口复制来的密钥经常带分隔符、大小写不一、或丢了前缀。
+// 这些都必须能登录——否则每次都要教用户怎么粘贴。
+func TestAccessKeyNormalization(t *testing.T) {
+	h := newHarness(t)
+	plain, _ := h.issueKey(t, "messy", "")
+
+	compact := strings.ReplaceAll(plain, "-", "")
+	bodyOnly := strings.TrimPrefix(compact, auth.AccessKeyPrefix)
+
+	cases := map[string]string{
+		"原样":      plain,
+		"小写":      strings.ToLower(plain),
+		"带空格":     " " + plain + " ",
+		"去掉分隔符":   compact,
+		"省略前缀":    bodyOnly,
+		"全角分隔符混用": strings.ReplaceAll(plain, "-", " "),
+	}
+	for name, input := range cases {
+		if code, body := h.redeemKey(t, input); code != http.StatusOK {
+			t.Errorf("%s: redeem = %d: %v", name, code, body)
+		}
+	}
+}
+
+// 撤销密钥必须同时踢掉已经换出去的会话。
+//
+// 只标记密钥失效的话，用户手里的 refresh token 还能继续续期，
+// "撤销"就成了一个只拦新登录的假动作。
+func TestAccessKeyRevocationKillsSession(t *testing.T) {
+	h := newHarness(t)
+	plain, id := h.issueKey(t, "revoked", "")
+
+	code, body := h.redeemKey(t, plain)
+	if code != http.StatusOK {
+		t.Fatalf("redeem = %d: %v", code, body)
+	}
+	token, _ := body["access_token"].(string)
+
+	// access token 是 15 分钟的无状态 JWT，撤销不会立刻失效它——
+	// 这是既有的取舍，不在这里断言。要验的是 refresh 会话。
+	del := httptest.NewRequest(http.MethodDelete, "/api/v1/hub/keys/"+id, nil)
+	signHubRequest(t, del, h.hubPriv, nil, "revoke-key")
+	if w := h.do(t, del); w.Code != http.StatusNoContent {
+		t.Fatalf("revoke = %d: %s", w.Code, w.Body.String())
+	}
+
+	// 再兑换必须失败。
+	if code, _ := h.redeemKey(t, plain); code != http.StatusUnauthorized {
+		t.Errorf("redeem after revoke = %d, want 401", code)
+	}
+
+	// 用旧 access token 访问需要查库的路径也必须失败：
+	// client 被连带撤销，Authenticate 里 GetClient 之后会拒绝。
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/clients", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	if w := h.do(t, req); w.Code != http.StatusUnauthorized {
+		t.Errorf("old access token after revoke = %d, want 401", w.Code)
+	}
+}
+
+// 过期的密钥不能兑换。
+func TestAccessKeyExpiry(t *testing.T) {
+	h := newHarness(t)
+	// 1 纳秒的 TTL：签发完基本立刻过期。
+	plain, _ := h.issueKey(t, "short", "1ns")
+
+	if code, body := h.redeemKey(t, plain); code != http.StatusUnauthorized {
+		t.Errorf("expired key redeem = %d: %v", code, body)
+	}
+}
+
+// 列表接口永远不能回显明文或哈希。
+func TestAccessKeyListHidesSecret(t *testing.T) {
+	h := newHarness(t)
+	plain, id := h.issueKey(t, "listed", "")
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/hub/keys", nil)
+	signHubRequest(t, req, h.hubPriv, nil, "list-keys")
+	w := h.do(t, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("list keys = %d: %s", w.Code, w.Body.String())
+	}
+	body := w.Body.String()
+	if strings.Contains(body, plain) {
+		t.Error("列表响应里出现了明文密钥")
+	}
+	// 主体部分也不该出现——否则可以离线爆破。
+	compact := strings.ReplaceAll(strings.TrimPrefix(plain, auth.AccessKeyPrefix+"-"), "-", "")
+	if strings.Contains(body, compact) {
+		t.Error("列表响应里出现了密钥主体")
+	}
+	if !strings.Contains(body, id) {
+		t.Errorf("列表里没有刚签发的 key id %s: %s", id, body)
+	}
+}
+
+// 未签名的请求不能签发密钥——否则任何人都能给自造一把长期凭证。
+func TestAccessKeyIssueRequiresSignature(t *testing.T) {
+	h := newHarness(t)
+	body := []byte(`{"name":"evil"}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/hub/keys", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	if w := h.do(t, req); w.Code != http.StatusUnauthorized {
+		t.Errorf("unsigned issue = %d, want 401", w.Code)
+	}
+}
+
+// 同一主人签发的多把密钥共享数据。
+//
+// 这是 0004 迁移引入的语义：每把密钥仍然绑一台独立的无主客户端
+// （会话、撤销各自独立），但它们带同一个 owner_id，所以 owner_hash
+// 一致。效果是轮换密钥不丢数据。
+//
+// 反过来说，这条测试也固定了「密钥之间没有隔离」——在单主人场景下
+// 这正是想要的；如果哪天要按人隔离，先看 docs/architecture.md 待定项 5。
+func TestAccessKeySharesOwnerScope(t *testing.T) {
+	h := newHarness(t)
+
+	keyA, _ := h.issueKey(t, "primary-a", "")
+	keyB, _ := h.issueKey(t, "primary-b", "")
+
+	_, bodyA := h.redeemKey(t, keyA)
+	_, bodyB := h.redeemKey(t, keyB)
+	tokenA, _ := bodyA["access_token"].(string)
+	tokenB, _ := bodyB["access_token"].(string)
+	if tokenA == "" || tokenB == "" {
+		t.Fatal("兑换没拿到 access token")
+	}
+
+	w := h.doJSON(t, http.MethodPost, "/api/v1/pastes", map[string]any{
+		"body": "用 A 写的", "visibility": "private",
+	}, bearer(tokenA))
+	if w.Code != http.StatusCreated {
+		t.Fatalf("创建 = %d: %s", w.Code, w.Body.String())
+	}
+	var created struct {
+		Slug string `json:"slug"`
+	}
+	json.Unmarshal(w.Body.Bytes(), &created)
+
+	// B 读得到：同一个 owner。
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/pastes/"+created.Slug, nil)
+	req.Header.Set("Authorization", "Bearer "+tokenB)
+	if w := h.do(t, req); w.Code != http.StatusOK {
+		t.Errorf("B 读 A 的片段 = %d, want 200", w.Code)
+	}
+
+	// 列表里也有。
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/pastes", nil)
+	req.Header.Set("Authorization", "Bearer "+tokenB)
+	w = h.do(t, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("列表 = %d", w.Code)
+	}
+	var list struct {
+		Items []struct {
+			Slug string `json:"slug"`
+		} `json:"items"`
+	}
+	json.Unmarshal(w.Body.Bytes(), &list)
+	found := false
+	for _, item := range list.Items {
+		if item.Slug == created.Slug {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("B 的列表里没有 A 写的片段，说明两把密钥没共享归属")
+	}
+}
+
+// 配对设备与访问密钥属于同一个主人，数据互相可见。
+//
+// 0005 之后所有 client 都带实例级 owner_id。所以「我在浏览器里建了个
+// 私有片段，换个入口就看不见了」这种事不会发生——同一个人不该因为
+// 换了认证方式就丢数据。
+func TestPairedDeviceAndAccessKeyShareScope(t *testing.T) {
+	h := newHarness(t)
+
+	// 一台配对设备。
+	deviceToken, _ := h.login(t)
+	w := h.doJSON(t, http.MethodPost, "/api/v1/pastes", map[string]any{
+		"body": "设备写的私有内容", "visibility": "private",
+	}, bearer(deviceToken))
+	if w.Code != http.StatusCreated {
+		t.Fatalf("设备创建 = %d: %s", w.Code, w.Body.String())
+	}
+	var fromDevice struct {
+		Slug string `json:"slug"`
+	}
+	json.Unmarshal(w.Body.Bytes(), &fromDevice)
+
+	// 一把访问密钥。
+	key, _ := h.issueKey(t, "primary-key", "")
+	_, keyBody := h.redeemKey(t, key)
+	keyToken, _ := keyBody["access_token"].(string)
+	if keyToken == "" {
+		t.Fatal("密钥兑换失败")
+	}
+
+	// 密钥读得到设备写的片段。
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/pastes/"+fromDevice.Slug, nil)
+	req.Header.Set("Authorization", "Bearer "+keyToken)
+	if w := h.do(t, req); w.Code != http.StatusOK {
+		t.Errorf("密钥读设备写的片段 = %d, want 200", w.Code)
+	}
+
+	// 反过来：设备读得到密钥写的片段。
+	w = h.doJSON(t, http.MethodPost, "/api/v1/pastes", map[string]any{
+		"body": "密钥写的私有内容", "visibility": "private",
+	}, bearer(keyToken))
+	if w.Code != http.StatusCreated {
+		t.Fatalf("密钥创建 = %d: %s", w.Code, w.Body.String())
+	}
+	var fromKey struct {
+		Slug string `json:"slug"`
+	}
+	json.Unmarshal(w.Body.Bytes(), &fromKey)
+
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/pastes/"+fromKey.Slug, nil)
+	req.Header.Set("Authorization", "Bearer "+deviceToken)
+	if w := h.do(t, req); w.Code != http.StatusOK {
+		t.Errorf("设备读密钥写的片段 = %d, want 200", w.Code)
+	}
+
+	// 两个入口的列表看到的是同一批片段。
+	for name, token := range map[string]string{"设备": deviceToken, "密钥": keyToken} {
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/pastes", nil)
+		req.Header.Set("Authorization", "Bearer "+token)
+		w := h.do(t, req)
+		if w.Code != http.StatusOK {
+			t.Fatalf("%s 列表 = %d", name, w.Code)
+		}
+		var list struct {
+			Items []struct {
+				Slug string `json:"slug"`
+			} `json:"items"`
+		}
+		json.Unmarshal(w.Body.Bytes(), &list)
+		seen := map[string]bool{}
+		for _, item := range list.Items {
+			seen[item.Slug] = true
+		}
+		if !seen[fromDevice.Slug] || !seen[fromKey.Slug] {
+			t.Errorf("%s 的列表缺片段：设备写的=%v 密钥写的=%v",
+				name, seen[fromDevice.Slug], seen[fromKey.Slug])
+		}
+	}
+}
+
+// 匿名创建的片段仍然按 token 隔离，不会因为 owner 共享而串到登录身份上。
+func TestAnonymousPasteStaysIsolatedFromPrimaryOwner(t *testing.T) {
+	h := newHarness(t)
+
+	w := h.doJSON(t, http.MethodPost, "/api/v1/pastes", map[string]any{
+		"body": "匿名写的", "visibility": "private",
+	}, nil)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("匿名创建 = %d: %s", w.Code, w.Body.String())
+	}
+	var anon struct {
+		Slug       string `json:"slug"`
+		OwnerToken string `json:"owner_token"`
+	}
+	json.Unmarshal(w.Body.Bytes(), &anon)
+	if anon.OwnerToken == "" {
+		t.Fatal("匿名创建必须返回 owner_token")
+	}
+
+	// 登录身份读不到匿名片段。
+	deviceToken, _ := h.login(t)
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/pastes/"+anon.Slug, nil)
+	req.Header.Set("Authorization", "Bearer "+deviceToken)
+	if w := h.do(t, req); w.Code != http.StatusNotFound {
+		t.Errorf("登录身份读匿名私有片段 = %d, want 404", w.Code)
+	}
+
+	// 只有 owner token 能读。
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/pastes/"+anon.Slug, nil)
+	req.Header.Set("X-Owner-Token", anon.OwnerToken)
+	if w := h.do(t, req); w.Code != http.StatusOK {
+		t.Errorf("凭 owner_token 读 = %d, want 200", w.Code)
+	}
+}
+
+// 轮换密钥不丢数据：撤销旧密钥后，新密钥仍能看到旧密钥写的私有片段。
+//
+// 这是 0004 迁移要解决的核心问题。在此之前的实现里，撤销旧密钥会
+// 连带撤销它绑定的 client，而 owner_hash 由 client id 推导，于是
+// 旧密钥名下的私有片段再也没有凭证能认领——数据没删，但永久失联。
+//
+// 现在每把密钥的 client 带同一个 owner_id，新旧密钥算出同一个
+// owner_hash，轮换对用户完全透明。
+func TestAccessKeyRotationKeepsData(t *testing.T) {
+	h := newHarness(t)
+
+	// 轮换前：用旧密钥建一个私有片段。
+	oldKey, oldID := h.issueKey(t, "before-rotation", "")
+	_, oldBody := h.redeemKey(t, oldKey)
+	oldToken, _ := oldBody["access_token"].(string)
+
+	w := h.doJSON(t, http.MethodPost, "/api/v1/pastes", map[string]any{
+		"body": "轮换前的私有内容", "visibility": "private",
+	}, bearer(oldToken))
+	if w.Code != http.StatusCreated {
+		t.Fatalf("private 创建 = %d: %s", w.Code, w.Body.String())
+	}
+	var private struct {
+		Slug string `json:"slug"`
+	}
+	json.Unmarshal(w.Body.Bytes(), &private)
+
+	// 撤销旧密钥，签发新密钥——典型的轮换。
+	del := httptest.NewRequest(http.MethodDelete, "/api/v1/hub/keys/"+oldID, nil)
+	signHubRequest(t, del, h.hubPriv, nil, "rotate-del")
+	if w := h.do(t, del); w.Code != http.StatusNoContent {
+		t.Fatalf("撤销旧密钥 = %d: %s", w.Code, w.Body.String())
+	}
+
+	newKey, _ := h.issueKey(t, "after-rotation", "")
+	_, newBody := h.redeemKey(t, newKey)
+	newToken, _ := newBody["access_token"].(string)
+	if newToken == "" {
+		t.Fatal("新密钥兑换失败")
+	}
+
+	// 关键断言：新密钥读得到旧密钥写的私有片段。
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/pastes/"+private.Slug, nil)
+	req.Header.Set("Authorization", "Bearer "+newToken)
+	if w := h.do(t, req); w.Code != http.StatusOK {
+		t.Errorf("轮换后读旧私有片段 = %d, want 200: %s", w.Code, w.Body.String())
+	}
+
+	// 列表里也要有。
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/pastes", nil)
+	req.Header.Set("Authorization", "Bearer "+newToken)
+	w = h.do(t, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("列表 = %d", w.Code)
+	}
+	var list struct {
+		Items []struct {
+			Slug string `json:"slug"`
+		} `json:"items"`
+	}
+	json.Unmarshal(w.Body.Bytes(), &list)
+	found := false
+	for _, item := range list.Items {
+		if item.Slug == private.Slug {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("轮换后列表里没有旧密钥写的私有片段")
+	}
+
+	// 旧密钥本身失效——轮换的另一半。
+	if code, _ := h.redeemKey(t, oldKey); code != http.StatusUnauthorized {
+		t.Errorf("旧密钥仍可兑换 = %d, want 401", code)
 	}
 }

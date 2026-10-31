@@ -1,6 +1,8 @@
 package httpapi
 
 import (
+	"context"
+	"errors"
 	"net/http"
 	"strconv"
 	"time"
@@ -45,7 +47,7 @@ func toHubSubscription(f *store.Feed) hubSubscription {
 		Title:         f.Title,
 		SiteURL:       f.SiteURL,
 		Enabled:       f.Enabled,
-		FetchInterval: (time.Duration(f.FetchInterval) * time.Second).String(),
+		FetchInterval: formatInterval(f.FetchInterval),
 		NextFetchAt:   optTS(f.NextFetchAt),
 		LastFetchAt:   optTS(f.LastFetchAt),
 		LastStatus:    f.LastStatus,
@@ -56,25 +58,132 @@ func toHubSubscription(f *store.Feed) hubSubscription {
 	}
 }
 
-// handleHubUpsert 幂等：同一个 URL 重复推送只更新间隔与启用状态，
-// 不会重复建订阅，也不会清空已经学到的标题与站点地址。
+// handleHubUpsert 幂等：同一个 URL 重复推送只更新它说了的字段。
+//
+// 三个字段的省略语义必须分清：
+//   - title / site_url 为空表示「没说」，由 SQL 里的 CASE 保留原值；
+//   - interval 省略沿用已存的间隔，新建时用 default_interval；
+//   - enabled 省略沿用已存的状态，新建时默认 true。
+//
+// 后两条如果直接回落默认值，宿主一次「只改标题」的推送就会把用户
+// 显式暂停的订阅重新启用，并把抓取间隔重置回 30 分钟。
 func (s *server) handleHubUpsert(c *gin.Context) {
-	if !s.Cfg.RSS.Enabled {
-		failWith(c, http.StatusNotFound, "not_found", "RSS 模块未启用")
-		return
-	}
 	var req hubUpsertRequest
 	if !bindJSON(c, &req) {
 		return
 	}
 
+	ctx := c.Request.Context()
+
+	existing, err := s.Store.Feed().GetByURL(ctx, req.URL)
+	if err != nil && !errors.Is(err, store.ErrNotFound) {
+		fail(c, err)
+		return
+	}
+
+	interval, ok := s.resolveInterval(c, req.Interval, existing)
+	if !ok {
+		return
+	}
+
+	enabled := true
+	if existing != nil {
+		enabled = existing.Enabled
+	}
+	if req.Enabled != nil {
+		enabled = *req.Enabled
+	}
+
+	now := time.Now()
+
+	// 间隔没变就保留原定抓取时刻——只改标题不该把下一次抓取整段推迟。
+	// 间隔变了必须重排，否则宿主调小间隔后要等一个旧周期（最长
+	// max_interval）才生效。
+	var next *int64
+	if existing != nil {
+		next = existing.NextFetchAt
+	}
+	if existing == nil || existing.FetchInterval != int64(interval/time.Second) {
+		v := now.Add(interval).Unix()
+		next = &v
+	}
+
+	feed := &store.Feed{
+		URL:           req.URL,
+		Title:         req.Title,
+		Source:        "hub",
+		Enabled:       enabled,
+		FetchInterval: int64(interval / time.Second),
+		NextFetchAt:   next,
+		CreatedAt:     now.Unix(),
+	}
+
+	saved, created, err := s.Store.Feed().Upsert(ctx, feed)
+	if err != nil {
+		fail(c, err)
+		return
+	}
+
+	// 从「连续失败被自动停用」恢复时清零失败计数。
+	//
+	// 只把 enabled 改回 true 没有意义：error_count 还是 10，下一次
+	// 抓取一失败就变成 11，立刻又被停用。宿主看到的是「刚恢复就又停了」，
+	// 而这种源往往正好是抓不动的那个。
+	if req.Enabled != nil && *req.Enabled && existing != nil && !existing.Enabled {
+		s.reviveFeed(ctx, &saved)
+	}
+
+	status := http.StatusOK
+	if created {
+		status = http.StatusCreated
+	}
+
+	// 首推默认立即抓一次，让 Homehub 侧不必再等一个周期。
+	if req.FetchNow == nil || *req.FetchNow {
+		s.kickInitialFetch(saved.ID)
+	}
+
+	c.JSON(status, toHubSubscription(&saved))
+}
+
+// reviveFeed 在宿主显式重新启用一条被自动停用的订阅时清零失败计数。
+func (s *server) reviveFeed(ctx context.Context, saved *store.Feed) {
+	saved.ErrorCount = 0
+	saved.LastError = ""
+	if err := s.Store.Feed().Update(ctx, saved); err != nil {
+		s.Log.Warn("reset error count after revival", "feed_id", saved.ID, "err", err)
+	}
+}
+
+// kickInitialFetch 在请求返回后异步抓一次。
+//
+// 用独立 context：请求结束后仍要跑完，否则宿主推完第一次就再也
+// 看不到内容。
+func (s *server) kickInitialFetch(feedID int64) {
+	go func(id int64) {
+		ctx, cancel := contextWithTimeout(5 * time.Minute)
+		defer cancel()
+		if _, err := s.RSS.Fetch(ctx, id); err != nil {
+			s.Log.Warn("initial fetch failed", "feed_id", id, "err", err)
+		}
+	}(feedID)
+}
+
+// resolveInterval 决定这条推送用哪个抓取间隔，并夹到配置区间内。
+//
+// 缺省值取决于是不是第一次推送：新建用 default_interval，更新则沿用
+// 原值。返回 false 表示已经写过错误响应。
+func (s *server) resolveInterval(c *gin.Context, raw string, existing *store.Feed) (time.Duration, bool) {
 	interval := s.Cfg.RSS.DefaultInterval.Duration
-	if req.Interval != "" {
-		d, err := time.ParseDuration(req.Interval)
+	if existing != nil && existing.FetchInterval > 0 {
+		interval = time.Duration(existing.FetchInterval) * time.Second
+	}
+	if raw != "" {
+		d, err := time.ParseDuration(raw)
 		if err != nil {
 			failWith(c, http.StatusBadRequest, "invalid_request", "interval 格式不正确",
 				FieldError{Field: "interval", Reason: `需要形如 "30m" 的时长`})
-			return
+			return 0, false
 		}
 		interval = d
 	}
@@ -85,53 +194,7 @@ func (s *server) handleHubUpsert(c *gin.Context) {
 	if interval > s.Cfg.RSS.MaxInterval.Duration {
 		interval = s.Cfg.RSS.MaxInterval.Duration
 	}
-
-	enabled := true
-	if req.Enabled != nil {
-		enabled = *req.Enabled
-	}
-
-	now := time.Now()
-	// 首推时 next_fetch_at 设为一个间隔之后，而不是「立刻到期」。
-	//
-	// 下面的异步抓取已经覆盖了"马上抓一次"的需求；如果这里也设成 now，
-	// poller 在 30 秒内扫到它就会重复抓一遍，浪费目标站的带宽。
-	next := now.Add(interval).Unix()
-	feed := &store.Feed{
-		URL:           req.URL,
-		Title:         req.Title,
-		Source:        "hub",
-		Enabled:       enabled,
-		FetchInterval: int64(interval / time.Second),
-		NextFetchAt:   &next,
-		CreatedAt:     now.Unix(),
-	}
-
-	saved, created, err := s.Store.Feed().Upsert(c.Request.Context(), feed)
-	if err != nil {
-		fail(c, err)
-		return
-	}
-
-	status := http.StatusOK
-	if created {
-		status = http.StatusCreated
-	}
-
-	// 首推默认立即抓一次，让 Homehub 侧不必再等一个周期。
-	// RSS 服务为 nil 说明模块未装配（配置禁用或测试环境），跳过即可。
-	if s.RSS != nil && (req.FetchNow == nil || *req.FetchNow) {
-		go func(id int64) {
-			// 用独立 context：请求返回后仍要跑完，否则首页会一直是空的。
-			ctx, cancel := contextWithTimeout(5 * time.Minute)
-			defer cancel()
-			if _, err := s.RSS.Fetch(ctx, id); err != nil {
-				s.Log.Warn("initial fetch failed", "feed_id", id, "err", err)
-			}
-		}(saved.ID)
-	}
-
-	c.JSON(status, toHubSubscription(&saved))
+	return interval, true
 }
 
 func (s *server) handleHubList(c *gin.Context) {
@@ -170,11 +233,104 @@ func (s *server) handleHubRefresh(c *gin.Context) {
 	defer cancel()
 	res, err := s.RSS.Fetch(ctx, id)
 	if err != nil {
-		c.JSON(http.StatusBadGateway, gin.H{
-			"error":   gin.H{"code": "upstream_error", "message": err.Error()},
-			"feed_id": id,
-		})
+		// 订阅不存在是 404，不是 502：宿主推了一个已被删掉的 id，
+		// 重试不会让它变好。
+		if errors.Is(err, store.ErrNotFound) {
+			fail(c, err)
+			return
+		}
+		// 目标站的问题用 502。走统一错误结构，客户端只认 code——
+		// 之前这里手拼了一个缺 request_id、且把错误文本直接回显的 JSON，
+		// 是所有端点里的唯一例外。
+		logFrom(c).Warn("hub refresh failed", "feed_id", id, "err", err)
+		failWith(c, http.StatusBadGateway, "upstream_error", "抓取订阅失败")
 		return
 	}
 	c.JSON(http.StatusOK, res)
+}
+
+// ---- 宿主签发的长期访问密钥 ----
+
+type hubKeyRequest struct {
+	Name string `json:"name"`
+	// ExpiresIn 是时长字符串，"0" 或省略表示永不过期。
+	ExpiresIn string `json:"expires_in"`
+}
+
+// handleHubCreateKey 签发一把用户可直接使用的登录密钥。
+//
+// 明文只在这一次响应里出现：库里存的是 sha256，之后任何接口都拿不回它，
+// 也拿不回原文的哈希。丢了只能重新签发——与配对码的取舍一致。
+func (s *server) handleHubCreateKey(c *gin.Context) {
+	var req hubKeyRequest
+	if !bindJSON(c, &req) {
+		return
+	}
+
+	var ttl time.Duration
+	if req.ExpiresIn != "" {
+		d, err := time.ParseDuration(req.ExpiresIn)
+		if err != nil {
+			failWith(c, http.StatusBadRequest, "invalid_request", "expires_in 格式不正确",
+				FieldError{Field: "expires_in", Reason: `需要形如 "720h" 的时长，省略表示永不过期`})
+			return
+		}
+		if d <= 0 {
+			failWith(c, http.StatusBadRequest, "invalid_request", "expires_in 必须为正",
+				FieldError{Field: "expires_in", Reason: "省略该字段表示永不过期，不要用 0 或负数表达"})
+			return
+		}
+		ttl = d
+	}
+
+	res, err := s.Auth.GenerateAccessKey(c.Request.Context(), req.Name, ttl)
+	if err != nil {
+		fail(c, err)
+		return
+	}
+
+	c.JSON(http.StatusCreated, gin.H{
+		"id":         res.Key.ID,
+		"name":       res.Key.Name,
+		"key":        res.Plain,
+		"client_id":  res.Key.ClientID,
+		"created_at": ts(res.Key.CreatedAt),
+		"expires_at": optTS(res.Key.ExpiresAt),
+	})
+}
+
+// handleHubListKeys 对账用。永远不含明文，也不含哈希。
+func (s *server) handleHubListKeys(c *gin.Context) {
+	keys, err := s.Store.Auth().ListAccessKeys(c.Request.Context())
+	if err != nil {
+		fail(c, err)
+		return
+	}
+	now := time.Now().Unix()
+	out := make([]gin.H, 0, len(keys))
+	for i := range keys {
+		k := &keys[i]
+		out = append(out, gin.H{
+			"id":           k.ID,
+			"name":         k.Name,
+			"client_id":    k.ClientID,
+			"created_at":   ts(k.CreatedAt),
+			"expires_at":   optTS(k.ExpiresAt),
+			"last_used_at": optTS(k.LastUsedAt),
+			"revoked":      k.RevokedAt != nil,
+			// live 让宿主不必自己算过期：它只看这一个布尔。
+			"live": k.Live(now),
+		})
+	}
+	c.JSON(http.StatusOK, gin.H{"items": out})
+}
+
+// handleHubRevokeKey 撤销密钥，并连带踢掉它换出去的会话。
+func (s *server) handleHubRevokeKey(c *gin.Context) {
+	if err := s.Store.Auth().RevokeAccessKey(
+		c.Request.Context(), c.Param("id"), time.Now().Unix()); err != nil {
+		fail(c, err)
+		return
+	}
+	c.Status(http.StatusNoContent)
 }

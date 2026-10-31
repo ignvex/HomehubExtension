@@ -16,6 +16,13 @@ func (d *DB) Feed() store.FeedStore { return feedStore{d} }
 const feedCols = `id, url, site_url, title, enabled, fetch_interval, etag, last_modified,
                   last_fetch_at, next_fetch_at, last_status, last_error, error_count, created_at`
 
+// feedColsWithUnread 在 feedCols 之后追加未读条目数。
+//
+// 子查询必须用 feed.id 限定：entry 自己也有 id 列，不限定的话
+// `e.feed_id = id` 会在子查询作用域里解析成 entry.id，计数永远是错的。
+const feedColsWithUnread = feedCols + `,
+                  (SELECT COUNT(*) FROM entry e WHERE e.feed_id = feed.id AND e.read_at IS NULL)`
+
 func scanFeed(row interface{ Scan(...any) error }) (*store.Feed, error) {
 	var f store.Feed
 	var enabled int
@@ -35,10 +42,37 @@ func scanFeed(row interface{ Scan(...any) error }) (*store.Feed, error) {
 	return &f, nil
 }
 
+// scanFeedWithUnread 对应 feedColsWithUnread。
+//
+// 两个扫描函数而不是一个可变参数版本：列数固定，多一列少一列在
+// 编译期看不出，Scan 只会在运行时报 "expected 15 destination arguments"。
+func scanFeedWithUnread(row interface{ Scan(...any) error }) (*store.Feed, error) {
+	var f store.Feed
+	var enabled int
+	var lastFetch, nextFetch sql.NullInt64
+	err := row.Scan(&f.ID, &f.URL, &f.SiteURL, &f.Title, &enabled, &f.FetchInterval,
+		&f.Etag, &f.LastModified, &lastFetch, &nextFetch,
+		&f.LastStatus, &f.LastError, &f.ErrorCount, &f.CreatedAt, &f.UnreadCount)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, store.ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	f.Enabled = enabled == 1
+	f.LastFetchAt = ptrInt(lastFetch)
+	f.NextFetchAt = ptrInt(nextFetch)
+	return &f, nil
+}
+
 // Upsert 按 url 唯一键插入或更新。
 //
 // 语义刻意区分字段：Homehub 每次推送都应覆盖调度参数（interval、enabled），
 // 但不应清空已经学到的 site_url / title / etag —— 空值视为"没说"，不是"清空"。
+//
+// next_fetch_at 由调用方算好传入，而不是在这里用 now+interval 重算：
+// 只有间隔真的变了才该重排，而「变没变」需要对比旧值，那只有调用方
+// 看得到（本函数拿到的是合并后的新值）。
 func (s feedStore) Upsert(ctx context.Context, f *store.Feed) (store.Feed, bool, error) {
 	var created bool
 	err := s.d.withTx(ctx, func(tx *sql.Tx) error {
@@ -72,10 +106,11 @@ func (s feedStore) Upsert(ctx context.Context, f *store.Feed) (store.Feed, bool,
 				UPDATE feed SET
 				    fetch_interval = ?,
 				    enabled        = ?,
+				    next_fetch_at  = ?,
 				    site_url       = CASE WHEN ? <> '' THEN ? ELSE site_url END,
 				    title          = CASE WHEN ? <> '' THEN ? ELSE title END
 				WHERE id = ?`,
-				f.FetchInterval, boolInt(f.Enabled),
+				f.FetchInterval, boolInt(f.Enabled), nullInt(f.NextFetchAt),
 				f.SiteURL, f.SiteURL,
 				f.Title, f.Title,
 				existingID)
@@ -95,21 +130,24 @@ func (s feedStore) Upsert(ctx context.Context, f *store.Feed) (store.Feed, bool,
 	return *got, created, nil
 }
 
+// Get 带未读计数。
+//
+// 宿主推送订阅后，响应里的 unread_count 就来自这里——如果只查
+// feed 表本身，那个字段永远是 0，而随后的 GET 列表却是有值的。
+// 同一个 toHubSubscription 会给出两种结果，对账时最难查。
 func (s feedStore) Get(ctx context.Context, id int64) (*store.Feed, error) {
-	return scanFeed(s.d.ro.QueryRowContext(ctx, `SELECT `+feedCols+` FROM feed WHERE id = ?`, id))
+	return scanFeedWithUnread(s.d.ro.QueryRowContext(ctx,
+		`SELECT `+feedColsWithUnread+` FROM feed WHERE id = ?`, id))
 }
 
 func (s feedStore) GetByURL(ctx context.Context, url string) (*store.Feed, error) {
-	return scanFeed(s.d.ro.QueryRowContext(ctx, `SELECT `+feedCols+` FROM feed WHERE url = ?`, url))
+	return scanFeedWithUnread(s.d.ro.QueryRowContext(ctx,
+		`SELECT `+feedColsWithUnread+` FROM feed WHERE url = ?`, url))
 }
 
 func (s feedStore) List(ctx context.Context) ([]store.Feed, error) {
-	rows, err := s.d.ro.QueryContext(ctx, `
-		SELECT f.id, f.url, f.site_url, f.title, f.enabled, f.fetch_interval, f.etag,
-		       f.last_modified, f.last_fetch_at, f.next_fetch_at, f.last_status,
-		       f.last_error, f.error_count, f.created_at,
-		       (SELECT COUNT(*) FROM entry e WHERE e.feed_id = f.id AND e.read_at IS NULL)
-		FROM feed f ORDER BY f.id`)
+	rows, err := s.d.ro.QueryContext(ctx,
+		`SELECT `+feedColsWithUnread+` FROM feed ORDER BY id`)
 	if err != nil {
 		return nil, err
 	}
@@ -117,18 +155,11 @@ func (s feedStore) List(ctx context.Context) ([]store.Feed, error) {
 
 	out := make([]store.Feed, 0, 8)
 	for rows.Next() {
-		var f store.Feed
-		var enabled int
-		var lastFetch, nextFetch sql.NullInt64
-		if err := rows.Scan(&f.ID, &f.URL, &f.SiteURL, &f.Title, &enabled, &f.FetchInterval,
-			&f.Etag, &f.LastModified, &lastFetch, &nextFetch, &f.LastStatus,
-			&f.LastError, &f.ErrorCount, &f.CreatedAt, &f.UnreadCount); err != nil {
+		f, err := scanFeedWithUnread(rows)
+		if err != nil {
 			return nil, err
 		}
-		f.Enabled = enabled == 1
-		f.LastFetchAt = ptrInt(lastFetch)
-		f.NextFetchAt = ptrInt(nextFetch)
-		out = append(out, f)
+		out = append(out, *f)
 	}
 	return out, rows.Err()
 }

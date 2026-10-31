@@ -116,6 +116,10 @@ func (s *server) registerAuth(r *gin.Engine) {
 	g.POST("/enroll", limited, s.handleEnroll)
 	g.POST("/challenge", limited, s.handleChallenge)
 	g.POST("/token", limited, s.handleToken)
+	// 密钥兑换也要限流：它是一把长期共享凭证，一旦泄露就是可以
+	// 反复尝试的口令。99 bit 熵下爆破不现实，但限流能让"某个 IP
+	// 在狂试"变成一个看得见的信号，而不是静默的噪音。
+	g.POST("/key", limited, s.handleKeyLogin)
 	g.POST("/refresh", s.handleRefresh)
 	g.POST("/logout", s.handleLogout)
 	g.GET("/server-key", s.handleServerKey)
@@ -132,12 +136,22 @@ func (s *server) registerAuth(r *gin.Engine) {
 // Extension 只存公钥。签名把 method/path/query/body 都覆盖进去，
 // 一条合法请求无法被挪到另一个端点重放。
 func (s *server) registerHub(r *gin.Engine) {
-	g := r.Group("/api/v1/hub",
+	signed := r.Group("/api/v1/hub",
 		RequireHubSignature(s.HubVerifier, s.Cfg.Server.MaxBodyBytes))
-	g.POST("/subscriptions", s.handleHubUpsert)
-	g.GET("/subscriptions", s.handleHubList)
-	g.DELETE("/subscriptions/:id", s.handleHubDelete)
-	g.POST("/subscriptions/:id/refresh", s.handleHubRefresh)
+
+	// 订阅通道额外要求 RSS 模块启用：模块关掉时四个端点统一 404，
+	// 宿主不必逐个猜哪个还活着。
+	subs := signed.Group("", RequireRSSEnabled(s.Cfg.RSS.Enabled, s.RSS))
+	subs.POST("/subscriptions", s.handleHubUpsert)
+	subs.GET("/subscriptions", s.handleHubList)
+	subs.DELETE("/subscriptions/:id", s.handleHubDelete)
+	subs.POST("/subscriptions/:id/refresh", s.handleHubRefresh)
+
+	// 密钥签发只依赖签名，与 RSS 是否启用无关：
+	// 它是一个纯粹的凭证管理操作，跟订阅通道没有业务关系。
+	signed.POST("/keys", s.handleHubCreateKey)
+	signed.GET("/keys", s.handleHubListKeys)
+	signed.DELETE("/keys/:id", s.handleHubRevokeKey)
 }
 
 // registerPaste 挂载 pastebin。

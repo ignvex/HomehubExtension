@@ -2,6 +2,9 @@ package httpapi
 
 import (
 	"encoding/base64"
+	"strconv"
+	"strings"
+	"time"
 
 	"github.com/ignvex/HomehubExtension/internal/store"
 )
@@ -39,6 +42,37 @@ func optTS(sec *int64) *int64 {
 }
 
 func b64Std(b []byte) string { return base64.StdEncoding.EncodeToString(b) }
+
+// formatInterval 把「秒」渲染成配置口径的时长字符串："30m"、"6h"、"1h30m"。
+//
+// 不能用 time.Duration.String()：它输出 "30m0s"、"6h0m0s"。宿主把订阅
+// 间隔原样回显时，用户看到的是 "30m0s"——像解析失败后拼出来的东西，
+// 而 docs/api.md 承诺的写法是 "30m"。推送时的入参本来就接受
+// time.ParseDuration，所以输出必须能原样喂回去。
+//
+// 零值输出 "0s" 而不是空串：空串在 JSON 里与「字段缺失」难分。
+func formatInterval(seconds int64) string {
+	if seconds <= 0 {
+		return "0s"
+	}
+	d := time.Duration(seconds) * time.Second
+	var b strings.Builder
+	if h := d / time.Hour; h > 0 {
+		b.WriteString(strconv.FormatInt(int64(h), 10))
+		b.WriteByte('h')
+		d -= h * time.Hour
+	}
+	if m := d / time.Minute; m > 0 {
+		b.WriteString(strconv.FormatInt(int64(m), 10))
+		b.WriteByte('m')
+		d -= m * time.Minute
+	}
+	if s := d / time.Second; s > 0 {
+		b.WriteString(strconv.FormatInt(int64(s), 10))
+		b.WriteByte('s')
+	}
+	return b.String()
+}
 
 // pasteModel 是 store.Paste 的本地别名，让 handler 里的类型名更短。
 type pasteModel = store.Paste

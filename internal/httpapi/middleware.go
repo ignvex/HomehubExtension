@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/ignvex/HomehubExtension/internal/auth"
+	"github.com/ignvex/HomehubExtension/internal/rss"
 	"github.com/ignvex/HomehubExtension/internal/store"
 
 	"github.com/gin-gonic/gin"
@@ -253,6 +254,24 @@ func subtleCompare(a, b string) bool {
 		diff |= a[i] ^ b[i]
 	}
 	return diff == 0
+}
+
+// RequireRSSEnabled 在 RSS 模块不可用时对整组 hub 端点统一返回 404。
+//
+// 四个端点必须在同一件事上给同一个答案：模块关闭时，宿主不该从
+// upsert 拿到 404、从 refresh 拿到 500。放在中间件而不是每个 handler
+// 里，是为了以后新增端点时不会再漏掉这一条。
+//
+// svc == nil 也要挡：配置写着 enabled=true 但服务没装配时（测试环境、
+// 或者装配阶段失败），handler 里调 svc.Fetch 就是一次 nil 解引用。
+func RequireRSSEnabled(enabled bool, svc *rss.Service) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if !enabled || svc == nil {
+			failWith(c, http.StatusNotFound, "not_found", "RSS 模块未启用")
+			return
+		}
+		c.Next()
+	}
 }
 
 // RequireHubSignature 校验 Homehub 入站请求的签名。
