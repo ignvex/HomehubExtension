@@ -18,7 +18,7 @@ var ErrNotFound = errors.New("config not found")
 func SearchPaths(cwd string) []string {
 	return []string{
 		filepath.Join(cwd, "config.json"),
-		"/etc/homehub-extension/config.json",
+		"/etc/hhe/config.json",
 	}
 }
 

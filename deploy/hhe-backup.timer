@@ -1,5 +1,5 @@
 [Unit]
-Description=HomehubExtension 每日备份
+Description=HomehubExtension 每日备份 (hhe)
 
 [Timer]
 # 凌晨 3 点。cleanup 任务里的 rss-prune（4:30）、blob-gc（5:00）排在它之后，
@@ -12,7 +12,7 @@ Persistent=true
 # 错峰，避免多台实例在同一秒打同一个备份存储。
 RandomizedDelaySec=10m
 
-Unit=homehub-backup.service
+Unit=hhe-backup.service
 
 [Install]
 WantedBy=timers.target

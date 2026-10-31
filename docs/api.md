@@ -132,8 +132,8 @@ homehubext/req/v1
 配对码由运维在服务器上生成，不经过网络：
 
 ```bash
-sudo -u homehub /usr/local/bin/homehub-extension enroll \
-  -config /etc/homehub-extension/config.json \
+sudo -u homehub /usr/bin/homehub-extension enroll \
+  -config /etc/hhe/config.json \
   -name "macbook-chrome"
 ```
 
@@ -204,7 +204,7 @@ nonce 一次性：校验通过后立即写 `consumed_at`，重复提交返回 40
 
 **身份不是一个字段，而是「能签出这个签名」这件事本身。** Extension 里没有宿主账号，没有为它签发的 API key，也没有访问令牌——只有部署时放进去的一把公钥。确认过程就四步：
 
-1. **部署时**：宿主生成 Ed25519 密钥对，公钥放到 `auth.hub.public_key_path`（默认 `/etc/homehub-extension/homehub.pub`）。私钥始终在宿主侧。
+1. **部署时**：宿主生成 Ed25519 密钥对，公钥放到 `auth.hub.public_key_path`（默认 `/etc/hhe/homehub.pub`）。私钥始终在宿主侧。
 2. **每次请求**：宿主用私钥签一条固定格式的消息。
 3. **Extension 验签**：用存着的公钥验。
 4. **验签通过 = 请求方持有对应私钥 = 它是宿主**。

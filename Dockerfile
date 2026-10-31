@@ -46,14 +46,14 @@ FROM alpine:3.21
 # tzdata 用于 cleanup.timezone；ca-certificates 用于抓取 HTTPS 订阅源。
 RUN apk add --no-cache ca-certificates tzdata \
  && addgroup -S -g 10001 homehub \
- && adduser  -S -u 10001 -G homehub -h /var/lib/homehub-extension homehub \
- && mkdir -p /var/lib/homehub-extension/blobs /etc/homehub-extension \
- && chown -R homehub:homehub /var/lib/homehub-extension
+ && adduser  -S -u 10001 -G homehub -h /var/lib/hhe homehub \
+ && mkdir -p /var/lib/hhe/blobs /etc/hhe \
+ && chown -R homehub:homehub /var/lib/hhe
 
-COPY --from=build /out/homehub-extension /usr/local/bin/homehub-extension
+COPY --from=build /out/homehub-extension /usr/bin/homehub-extension
 
 USER homehub
-WORKDIR /var/lib/homehub-extension
+WORKDIR /var/lib/hhe
 
 # 容器内必须监听 0.0.0.0 才能被宿主或同网络的反代访问，
 # 所以这里显式要求配置里设 allow_remote_listen=true。
@@ -62,5 +62,5 @@ EXPOSE 8080
 HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
   CMD wget -qO- http://127.0.0.1:8080/healthz || exit 1
 
-ENTRYPOINT ["/usr/local/bin/homehub-extension"]
-CMD ["serve", "-config", "/etc/homehub-extension/config.json"]
+ENTRYPOINT ["/usr/bin/homehub-extension"]
+CMD ["serve", "-config", "/etc/hhe/config.json"]

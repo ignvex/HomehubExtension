@@ -78,5 +78,5 @@ units: ## 校验 systemd 单元（语法 + 加固评分）
 	  | grep -v "is not executable: No such file"); \
 	  if [ -n "$$out" ]; then echo "$$out"; exit 1; fi; echo "  OK"
 	@echo "== 加固评分 =="
-	@systemd-analyze security --offline=yes deploy/homehub-extension.service 2>&1 \
+	@systemd-analyze security --offline=yes deploy/hhe.service 2>&1 \
 	  | grep "Overall exposure level"

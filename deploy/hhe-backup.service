@@ -1,16 +1,16 @@
 [Unit]
-Description=HomehubExtension 备份
+Description=HomehubExtension 备份 (hhe)
 Documentation=https://github.com/ignvex/HomehubExtension
 # 备份要和主服务读同一份数据库与 blob，但不需要主服务在跑。
 # 排在这里只是为了让它们不会在开机瞬间同时抢 IO。
-After=homehub-extension.service
+After=hhe.service
 
 [Service]
 Type=oneshot
 User=homehub
 Group=homehub
 
-# 备份脚本要读配置与数据目录（只读），写 /var/backups/homehub。
+# 备份脚本要读配置与数据目录（只读），写 /var/backups/hhe。
 ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
@@ -24,10 +24,10 @@ LockPersonality=true
 UMask=0077
 
 # 目录必须先存在：ReadWritePaths 不做创建，路径缺失会让 unit 直接启动失败。
-#   sudo install -d -o homehub -g homehub -m 0750 /var/backups/homehub
-ReadWritePaths=/var/backups/homehub
+#   sudo install -d -o homehub -g homehub -m 0750 /var/backups/hhe
+ReadWritePaths=/var/backups/hhe
 
-ExecStart=/usr/local/bin/homehub-backup.sh
+ExecStart=/usr/bin/homehub-backup.sh
 
 # 备份是重量级 IO：rsync 大目录可能远超默认的 90 秒。
 # oneshot 的启动阶段就是整条命令的执行期，所以卡这里而不是 TimeoutStopSec。

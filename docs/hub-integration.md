@@ -41,7 +41,7 @@ chmod 600 homehub.key
 把 `homehub.pub` 放到 Extension 主机的：
 
 ```text
-/etc/homehub-extension/homehub.pub
+/etc/hhe/homehub.pub
 ```
 
 并在 `config.json` 里确认：
@@ -51,7 +51,7 @@ chmod 600 homehub.key
   "auth": {
     "hub": {
       "enabled": true,
-      "public_key_path": "/etc/homehub-extension/homehub.pub",
+      "public_key_path": "/etc/hhe/homehub.pub",
       "clock_skew": "60s",
       "nonce_ttl": "2m"
     }

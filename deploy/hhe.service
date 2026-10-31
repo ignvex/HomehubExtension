@@ -1,5 +1,5 @@
 [Unit]
-Description=HomehubExtension
+Description=HomehubExtension (hhe)
 Documentation=https://github.com/ignvex/HomehubExtension
 After=network-online.target
 Wants=network-online.target
@@ -23,11 +23,12 @@ Group=homehub
 
 # 数据目录由 systemd 创建并 chown，不再依赖安装时手工 mkdir + chown。
 # 同时它会被自动加入可写集合，ProtectSystem=strict 下依然可写。
-StateDirectory=homehub-extension
+# 展开为 /var/lib/hhe，config.json 里的 database.path 与 blob_dir 必须落在它下面。
+StateDirectory=hhe
 StateDirectoryMode=0750
 
 # 密钥通过环境文件注入，config.json 里用 ${VAR} 引用。
-EnvironmentFile=-/etc/homehub-extension/env
+EnvironmentFile=-/etc/hhe/env
 
 # MemoryMax 是 cgroup 硬墙，撞上就是 OOM kill。GOMEMLIMIT 让 Go 的 GC
 # 提前介入，在触到硬墙之前就压低堆占用——两者要一起配才有意义。
@@ -35,13 +36,13 @@ Environment=GOMEMLIMIT=256MiB
 
 # 迁移放在启动前：失败会停在 ExecStartPre，日志直接指向配置或权限问题，
 # 而不是让 serve 反复崩在 Type=notify 的启动超时上。
-ExecStartPre=/usr/local/bin/homehub-extension migrate -config /etc/homehub-extension/config.json
-ExecStart=/usr/local/bin/homehub-extension serve -config /etc/homehub-extension/config.json
+ExecStartPre=/usr/bin/homehub-extension migrate -config /etc/hhe/config.json
+ExecStart=/usr/bin/homehub-extension serve -config /etc/hhe/config.json
 
 # 这里故意没有 ExecReload。
 # 进程只处理 SIGINT/SIGTERM，SIGHUP 会走默认处置直接终止进程——
 # 写一条 ExecReload 得到的不是热重载，而是 systemctl reload 把服务杀掉。
-# 改配置请 systemctl restart homehub-extension。
+# 改配置请 systemctl restart hhe。
 
 Restart=on-failure
 RestartSec=5s
@@ -84,7 +85,7 @@ RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 # ProtectSystem=strict 会把根文件系统挂成只读。StateDirectory 已自动放行
 # 数据目录，这里保留显式声明：blob_dir 若改到该目录之外，必须在同一行补上，
 # 否则启动即失败，日志只有 permission denied。
-ReadWritePaths=/var/lib/homehub-extension
+ReadWritePaths=/var/lib/hhe
 
 # ---- 资源 ----
 MemoryMax=512M

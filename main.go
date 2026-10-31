@@ -39,7 +39,7 @@ const usage = `HomehubExtension — Homehub 的扩展服务
   homehub-extension version                       打印版本信息
 
 配置查找顺序:
-  -config > $HOMEHUB_CONFIG > ./config.json > /etc/homehub-extension/config.json
+  -config > $HOMEHUB_CONFIG > ./config.json > /etc/hhe/config.json
   显式指定的路径不存在时直接失败，不会回落到下一项。
 `
 

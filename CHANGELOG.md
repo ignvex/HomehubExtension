@@ -3,6 +3,19 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循
 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [未发布]
+
+### 变更
+
+- **部署布局改为 `hhe`**：守护单元改名 `hhe.service`，二进制装到 `/usr/bin/homehub-extension`，
+  配置与宿主公钥放到 `/etc/hhe/`，数据目录 `StateDirectory=hhe` 展开为 `/var/lib/hhe`。
+  备份单元同步改名为 `hhe-backup.service` / `hhe-backup.timer`，备份输出 `/var/backups/hhe`。
+- **发布产物暂存区改为 `dist/`**：`make build` 输出 `dist/homehub-extension`，不再压缩、
+  不入库（`.gitignore` 忽略 `/dist/`）。与前端 `web/dist`（`go:embed` 输入）互不影响。
+- 默认配置搜索路径从 `/etc/homehub-extension/config.json` 改为 `/etc/hhe/config.json`，
+  `homehub-extension --help` 与 `config.example.json` 同步。
+- Dockerfile 镜像内路径同步为 `/usr/bin`、`/etc/hhe`、`/var/lib/hhe`。
+
 ## [1.0.0-alpha] - 2026-10-31
 
 首个对外版本。功能面覆盖路线图 M0–M9；OPML 导入导出（M10）尚未实现。

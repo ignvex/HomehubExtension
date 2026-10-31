@@ -7,7 +7,7 @@
 1. 命令行 `-config /path/to/config.json`（systemd 使用绝对路径）
 2. 环境变量 `HOMEHUB_CONFIG`
 3. `./config.json`
-4. `/etc/homehub-extension/config.json`
+4. `/etc/hhe/config.json`
 
 规则：
 
@@ -249,7 +249,7 @@ Homehub 宿主推送订阅时使用的入站签名通道。
 
 ### 5.1 unit
 
-完整单元见 [`deploy/homehub-extension.service`](../deploy/homehub-extension.service)。
+完整单元见 [`deploy/hhe.service`](../deploy/hhe.service)（守护进程名 `hhe`）。
 这里不再贴副本：文档里曾经贴过一份，结果和实际文件静默漂移了（文档写着
 `Type=simple` 和一条 `ExecReload`，而进程根本不处理 SIGHUP）。唯一来源是 deploy 下的文件。
 
@@ -259,7 +259,7 @@ Homehub 宿主推送订阅时使用的入站签名通道。
   `systemctl start` 返回时服务已经可用，部署脚本和 `After=` 依赖它的 unit 都不必再轮询 `/healthz`。
   心跳每 30 秒一次，超过 60 秒没有心跳 systemd 判定假死并重启——这是 `Restart=on-failure`
   完全看不到的一类故障：进程还在、端口还占着，但已经不干活。
-- **`StateDirectory=homehub-extension`**：目录由 systemd 创建并 chown，同时自动放行给
+- **`StateDirectory=hhe`**：展开为 `/var/lib/hhe`，目录由 systemd 创建并 chown，同时自动放行给
   `ProtectSystem=strict`。安装时不需要手工 `mkdir` + `chown`。
 - **`GOMEMLIMIT=256MiB` 与 `MemoryMax=512M` 必须成对**：前者让 Go 的 GC 提前压低堆，
   后者是 cgroup 硬墙。只配 `MemoryMax` 的话，触墙就是 OOM kill，没有减震。
@@ -275,46 +275,46 @@ Homehub 宿主推送订阅时使用的入站签名通道。
 - **`SystemCallFilter=@system-service` + `SystemCallErrorNumber=EPERM`**：被过滤的调用返回
   错误而不是发 `SIGSYS` 杀进程，真出问题时是一个可读的错误而不是无声崩溃。
 
-加固程度可以量化：`systemd-analyze security --offline=yes deploy/homehub-extension.service`
+加固程度可以量化：`systemd-analyze security --offline=yes deploy/hhe.service`
 当前是 **1.5 OK**（首版是 6.3 MEDIUM）。这个分数越低越好；改完文件后跑一次，
 超过 2.0 就值得看看是哪一项退化了。
 
 ### 5.2 环境文件
 
 ```bash
-# /etc/homehub-extension/env
+# /etc/hhe/env
 HOMEHUB_TOKEN=redacted
 ```
 
 ### 5.3 首次部署
 
 ```bash
-sudo install -m 0755 bin/homehub-extension /usr/local/bin/
-sudo install -m 0755 deploy/backup.sh /usr/local/bin/homehub-backup.sh
+sudo install -m 0755 dist/homehub-extension /usr/bin/
+sudo install -m 0755 deploy/backup.sh /usr/bin/homehub-backup.sh
 # 数据目录由 unit 里的 StateDirectory 创建并 chown，不需要手工 mkdir
-sudo install -d -m 0750 /etc/homehub-extension
-sudo install -m 0640 -o root -g homehub config.json /etc/homehub-extension/config.json
-sudo install -m 0600 -o root -g homehub deploy/env.example /etc/homehub-extension/env
-sudo install -m 0644 deploy/homehub-extension.service \
-                    deploy/homehub-backup.service deploy/homehub-backup.timer /etc/systemd/system/
-sudo install -d -o homehub -g homehub -m 0750 /var/backups/homehub
+sudo install -d -m 0750 /etc/hhe
+sudo install -m 0640 -o root -g homehub config.json /etc/hhe/config.json
+sudo install -m 0600 -o root -g homehub deploy/env.example /etc/hhe/env
+sudo install -m 0644 deploy/hhe.service \
+                    deploy/hhe-backup.service deploy/hhe-backup.timer /etc/systemd/system/
+sudo install -d -o homehub -g homehub -m 0750 /var/backups/hhe
 sudo systemctl daemon-reload
-sudo systemctl enable --now homehub-extension homehub-backup.timer
-journalctl -u homehub-extension -f
+sudo systemctl enable --now hhe hhe-backup.timer
+journalctl -u hhe -f
 ```
 
 `homehub` 系统用户需要先存在：
 
 ```bash
-sudo useradd --system --home /var/lib/homehub-extension \
+sudo useradd --system --home /var/lib/hhe \
   --shell /usr/sbin/nologin homehub
 ```
 
 首次配对：
 
 ```bash
-sudo -u homehub /usr/local/bin/homehub-extension enroll \
-  -config /etc/homehub-extension/config.json \
+sudo -u homehub /usr/bin/homehub-extension enroll \
+  -config /etc/hhe/config.json \
   -name "macbook-chrome"
 ```
 
@@ -340,22 +340,22 @@ sudo -u homehub /usr/local/bin/homehub-extension enroll \
 
 ```bash
 # deploy/backup.sh 每日 03:00 跑一次，保留 7 份；调度交给 systemd timer
-sudo install -m 0755 deploy/backup.sh /usr/local/bin/homehub-backup.sh
-sudo install -m 0644 deploy/homehub-backup.service deploy/homehub-backup.timer /etc/systemd/system/
+sudo install -m 0755 deploy/backup.sh /usr/bin/homehub-backup.sh
+sudo install -m 0644 deploy/hhe-backup.service deploy/hhe-backup.timer /etc/systemd/system/
 sudo install -d -o homehub -g homehub -m 0750 /var/backups/homehub
 sudo systemctl daemon-reload
-sudo systemctl enable --now homehub-backup.timer
-systemctl list-timers homehub-backup.timer
+sudo systemctl enable --now hhe-backup.timer
+systemctl list-timers hhe-backup.timer
 ```
 
-用 timer 而不是 cron：日志直接进 journal（`journalctl -u homehub-backup`），
+用 timer 而不是 cron：日志直接进 journal（`journalctl -u hhe-backup`），
 `Persistent=true` 会补跑关机期间错过的触发点，`RandomizedDelaySec` 负责错峰——
 这三件事 cron 都要另写脚本解决。
 
 数据库备份走二进制自带的子命令，**不依赖系统装 sqlite3**：
 
 ```bash
-homehub-extension backup -config /etc/homehub-extension/config.json -out /var/backups/homehub/2026-10-29
+homehub-extension backup -config /etc/hhe/config.json -out /var/backups/hhe/2026-10-29
 ```
 
 内部用 `VACUUM INTO`：
@@ -370,8 +370,8 @@ homehub-extension backup -config /etc/homehub-extension/config.json -out /var/ba
 
 ```bash
 sudo systemctl stop homehub-extension
-sudo -u homehub cp /var/backups/homehub/2026-10-29/homehub.db /var/lib/homehub-extension/homehub.db
-sudo rm -f /var/lib/homehub-extension/homehub.db-wal /var/lib/homehub-extension/homehub.db-shm
+sudo -u homehub cp /var/backups/hhe/2026-10-29/homehub.db /var/lib/hhe/homehub.db
+sudo rm -f /var/lib/hhe/homehub.db-wal /var/lib/hhe/homehub.db-shm
 sudo systemctl start homehub-extension
 ```
 

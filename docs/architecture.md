@@ -23,8 +23,8 @@
 ```text
 公网 :443 ──► Caddy ──► 127.0.0.1:8080 ──► HomehubExtension
                                               │
-                                              ├─► /var/lib/homehub-extension/homehub.db
-                                              ├─► /var/lib/homehub-extension/blobs/
+                                              ├─► /var/lib/hhe/homehub.db
+                                              ├─► /var/lib/hhe/blobs/
                                               └─► Homehub 宿主 API（局域网或本机）
 ```
 
@@ -139,7 +139,7 @@ POST /api/v1/pastes
 ## 5. 存储布局
 
 ```text
-/var/lib/homehub-extension/
+/var/lib/hhe/
 ├── homehub.db
 ├── homehub.db-wal
 ├── homehub.db-shm
@@ -158,7 +158,7 @@ POST /api/v1/pastes
 ### 5.1 SQLite 打开参数
 
 ```text
-file:/var/lib/homehub-extension/homehub.db
+file:/var/lib/hhe/homehub.db
   ?_pragma=journal_mode(WAL)
   &_pragma=synchronous(NORMAL)
   &_pragma=busy_timeout(5000)

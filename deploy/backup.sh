@@ -12,21 +12,21 @@
 #      所以两者在这一步里连续完成。
 #
 # 用法：
-#   sudo install -m 0755 deploy/backup.sh /usr/local/bin/homehub-backup.sh
-#   sudo install -m 0644 deploy/homehub-backup.{service,timer} /etc/systemd/system/
-#   sudo install -d -o homehub -g homehub -m 0750 /var/backups/homehub
-#   sudo systemctl daemon-reload && sudo systemctl enable --now homehub-backup.timer
+#   sudo install -m 0755 deploy/backup.sh /usr/bin/homehub-backup.sh
+#   sudo install -m 0644 deploy/hhe-backup.{service,timer} /etc/systemd/system/
+#   sudo install -d -o homehub -g homehub -m 0750 /var/backups/hhe
+#   sudo systemctl daemon-reload && sudo systemctl enable --now hhe-backup.timer
 #
-# 调度交给 systemd timer（deploy/homehub-backup.timer），不用 cron：
-# 日志直接进 journal 可以从 `systemctl status homehub-backup` 看，
+# 调度交给 systemd timer（deploy/hhe-backup.timer），不用 cron：
+# 日志直接进 journal 可以从 `systemctl status hhe-backup` 看，
 # Persistent=true 能补跑关机期间错过的触发点，这些 cron 都要另写脚本解决。
 
 set -euo pipefail
 
-BIN="${HOMEHUB_BIN:-/usr/local/bin/homehub-extension}"
-CONFIG="${HOMEHUB_CONFIG:-/etc/homehub-extension/config.json}"
-DATA_DIR="${HOMEHUB_DATA_DIR:-/var/lib/homehub-extension}"
-BACKUP_DIR="${HOMEHUB_BACKUP_DIR:-/var/backups/homehub}"
+BIN="${HOMEHUB_BIN:-/usr/bin/homehub-extension}"
+CONFIG="${HOMEHUB_CONFIG:-/etc/hhe/config.json}"
+DATA_DIR="${HOMEHUB_DATA_DIR:-/var/lib/hhe}"
+BACKUP_DIR="${HOMEHUB_BACKUP_DIR:-/var/backups/hhe}"
 KEEP="${HOMEHUB_BACKUP_KEEP:-7}"
 
 BLOBS="${DATA_DIR}/blobs"

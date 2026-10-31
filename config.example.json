@@ -14,7 +14,7 @@
   },
   "auth": {
     "enabled": true,
-    "server_key_path": "/var/lib/homehub-extension/server.key",
+    "server_key_path": "/var/lib/hhe/server.key",
     "session_ttl": "168h",
     "challenge_ttl": "2m",
     "enrollment_ttl": "15m",
@@ -22,18 +22,18 @@
     "failed_attempt_window": "5m",
     "hub": {
       "enabled": true,
-      "public_key_path": "/etc/homehub-extension/homehub.pub",
+      "public_key_path": "/etc/hhe/homehub.pub",
       "clock_skew": "60s",
       "nonce_ttl": "2m"
     }
   },
   "database": {
-    "path": "/var/lib/homehub-extension/homehub.db",
+    "path": "/var/lib/hhe/homehub.db",
     "busy_timeout": "5s",
     "read_conns": 3
   },
   "storage": {
-    "blob_dir": "/var/lib/homehub-extension/blobs",
+    "blob_dir": "/var/lib/hhe/blobs",
     "tmp_dir": "",
     "max_blob_bytes": 52428800,
     "quota_bytes": 5368709120,

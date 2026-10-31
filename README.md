@@ -143,9 +143,12 @@ go run . enroll -config config.json -name "macbook-chrome"
 构建发布产物：
 
 ```bash
+make build     # 等价的裸命令：
 pnpm --dir web build
-GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "-s -w" -o bin/homehub-extension .
+GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "-s -w" -o dist/homehub-extension .
 ```
+
+产物落在 `dist/`，**不压缩、不入库**（`.gitignore` 忽略 `/dist/`）。与前端 `web/dist` 是两回事：前者是待分发的二进制暂存区，后者是 `go:embed` 的输入。
 
 ## 测试
 
@@ -154,7 +157,7 @@ make lint    # 规范检查：gofmt、vet、deadcode、行宽、函数长度、i
 make test    # go test ./...
 make race    # 并发路径（一次性读取、SSRF 开关、调度器互斥、轮询器）
 make units   # systemd 单元语法 + 加固评分
-make build   # 前端构建 + 交叉编译 linux/amd64
+make build   # 前端构建 + 交叉编译 linux/amd64 → dist/
 ```
 
 `make lint` 落实的是项目采用的 Go 编码规范（阿里规范 + Uber Style Guide 常见实践）。几项阈值写成了脚本，CI 里同样跑：
@@ -263,14 +266,14 @@ curl -X POST https://homehub.example.com/api/v1/hub/keys \
 ## 部署
 
 ```text
-/usr/local/bin/homehub-extension          二进制
-/usr/local/bin/homehub-backup.sh          备份脚本（deploy/backup.sh）
-/etc/homehub-extension/config.json        配置（0640 root:homehub）
-/etc/homehub-extension/env                密钥（0600 root:homehub）
-/etc/homehub-extension/homehub.pub        Homehub 宿主公钥（0644）
-/var/lib/homehub-extension/homehub.db     SQLite（由 StateDirectory 创建）
-/var/lib/homehub-extension/blobs/         媒体文件
-/var/backups/homehub/                     每日备份，保留 7 份
+/usr/bin/homehub-extension               二进制（dist/ 构建后拷入）
+/usr/bin/homehub-backup.sh                备份脚本（deploy/backup.sh）
+/etc/hhe/config.json                      配置（0640 root:homehub）
+/etc/hhe/env                              密钥（0600 root:homehub）
+/etc/hhe/homehub.pub                      Homehub 宿主公钥（0644）
+/var/lib/hhe/homehub.db                   SQLite（由 StateDirectory 创建）
+/var/lib/hhe/blobs/                       媒体文件
+/var/backups/hhe/                         每日备份，保留 7 份
 ```
 
 Caddy 关键片段（完整版见 [`deploy/Caddyfile`](deploy/Caddyfile)）：
@@ -292,27 +295,27 @@ homehub.example.com {
 
 `flush_interval -1` 全局开启而不是只对事件流生效：代价只是普通响应少一层攒批，换来的是不会因为路径写错而只在 SSE 上出问题。
 
-systemd 部署的三个要点（完整单元见 [`deploy/homehub-extension.service`](deploy/homehub-extension.service)，细节见 [docs/config.md](docs/config.md#5-systemd-集成)）：
+systemd 部署的三个要点（守护进程名 `hhe`，完整单元见 [`deploy/hhe.service`](deploy/hhe.service)，细节见 [docs/config.md](docs/config.md#5-systemd-集成)）：
 
 - **`Type=notify`**：进程在端口真正 bind 之后才发 `READY=1`，`systemctl start` 返回时服务已经可用，依赖它的 unit 和部署脚本都不必再轮询 `/healthz`。`WatchdogSec=60s` 配合每 30 秒一次的心跳，能发现「进程还在、端口还占着，但已经不干活」的假死。
-- **`StateDirectory=homehub-extension`**：`/var/lib/homehub-extension` 由 systemd 创建并 chown，同时自动放行给 `ProtectSystem=strict`，安装时不需要手工 `mkdir`。
+- **`StateDirectory=hhe`**：`/var/lib/hhe` 由 systemd 创建并 chown，同时自动放行给 `ProtectSystem=strict`，安装时不需要手工 `mkdir`。
 - **没有 `ExecReload`**：进程只处理 `SIGINT`/`SIGTERM`，SIGHUP 会直接终止它。改配置一律 `systemctl restart`——写一条 `ExecReload=/bin/kill -HUP $MAINPID` 得到的是「reload 把服务杀掉」，而不是热重载。
 
 `GOMEMLIMIT=256MiB` 与 `MemoryMax=512M` 成对生效：前者让 Go 的 GC 提前压低堆，后者是 cgroup 硬墙。只配后者的话，触墙就是 OOM kill，没有减震。
 
-加固程度可量化：`systemd-analyze security --offline=yes deploy/homehub-extension.service` 当前评分为 **1.5 OK**（首版是 6.3 MEDIUM）。
+加固程度可量化：`systemd-analyze security --offline=yes deploy/hhe.service` 当前评分为 **1.5 OK**（首版是 6.3 MEDIUM）。
 
 备份（数据库走二进制的 `backup` 子命令，媒体用 rsync 硬链接增量，不依赖 sqlite3 CLI）：
 
 ```bash
-sudo install -m 0755 deploy/backup.sh /usr/local/bin/homehub-backup.sh
-sudo install -m 0644 deploy/homehub-backup.service deploy/homehub-backup.timer /etc/systemd/system/
-sudo install -d -o homehub -g homehub -m 0750 /var/backups/homehub
-sudo systemctl daemon-reload && sudo systemctl enable --now homehub-backup.timer
-systemctl list-timers homehub-backup.timer
+sudo install -m 0755 deploy/backup.sh /usr/bin/homehub-backup.sh
+sudo install -m 0644 deploy/hhe-backup.service deploy/hhe-backup.timer /etc/systemd/system/
+sudo install -d -o homehub -g homehub -m 0750 /var/backups/hhe
+sudo systemctl daemon-reload && sudo systemctl enable --now hhe-backup.timer
+systemctl list-timers hhe-backup.timer
 ```
 
-调度交给 systemd timer 而不是 cron：`Persistent=true` 会补跑关机期间错过的触发点，日志直接进 journal（`journalctl -u homehub-backup`），`RandomizedDelaySec` 负责错峰。
+调度交给 systemd timer 而不是 cron：`Persistent=true` 会补跑关机期间错过的触发点，日志直接进 journal（`journalctl -u hhe-backup`），`RandomizedDelaySec` 负责错峰。
 
 容器部署见 [`Dockerfile`](Dockerfile)。容器内需要监听 `0.0.0.0`，所以配置里要设 `server.allow_remote_listen: true`。
 
