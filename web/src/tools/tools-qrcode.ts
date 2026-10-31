@@ -7,7 +7,7 @@
 import { h } from "../lib/dom";
 import type { ToolFactory } from "./types";
 import { actions, button, copyButton, errorLine, field, select, setStats, showError, stats, textarea } from "./shared";
-import { encodeQR, type ECLevel, type QRMatrix } from "./qr-encode";
+import { encodeQR, maxPayloadBytes, type ECLevel, type QRMatrix } from "./qr-encode";
 
 /** 画到 canvas。quiet 是四周的静区，标准要求至少 4 个模块。 */
 function drawToCanvas(matrix: QRMatrix, scale: number, quiet = 4): HTMLCanvasElement {
@@ -104,7 +104,7 @@ export const factory: ToolFactory = (ctx) => {
       setStats(statLine, [
         ["版本", String((matrix.size - 17) / 4)],
         ["尺寸", `${matrix.size}×${matrix.size}`],
-        ["内容", `${bytes} 字节`],
+        ["内容", `${bytes} / ${maxPayloadBytes(level.value as ECLevel)} 字节`],
         ["纠错", level.value],
       ]);
     } catch (e) {

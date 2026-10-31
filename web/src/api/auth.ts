@@ -40,3 +40,14 @@ export function enrollDevice(input: EnrollInput, signal?: AbortSignal): Promise<
   const init = { method: "POST", body: input };
   return send<EnrollResponse>("/auth/enroll", signal ? { ...init, signal } : init);
 }
+
+/**
+ * 用宿主签发的长期密钥换取会话。
+ *
+ * 与 exchangeToken 的区别只在于"怎么证明自己"：那边是设备私钥签的
+ * 挑战消息，这里是直接出示密钥。服务端返回的形状完全一致。
+ */
+export function redeemAccessKey(key: string, signal?: AbortSignal): Promise<AuthSessionResponse> {
+  const init = { method: "POST", body: { key } };
+  return send<AuthSessionResponse>("/auth/key", signal ? { ...init, signal } : init);
+}

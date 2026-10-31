@@ -1,8 +1,8 @@
-// QR 码编码（byte mode，版本 1–10）。
+// QR 码编码（byte mode，版本 1–30）。
 //
 // 为什么自己写：项目零运行时依赖，而二维码库通常 20–40KB。
-// 这里只实现文本/链接最常用的 range——byte mode 编码 +
-// 版本 1–10（版本 10-H 可存约 119 字节，覆盖绝大多数场景）。
+// 只实现文本/链接最常用的 range——byte mode 编码 + 版本 1–30
+// （版本 30-H 可存 742 字节，L 可存 1732 字节）。
 //
 // 参考 ISO/IEC 18004。步骤：
 //   1. 选版本：找能装下数据的最小版本
@@ -12,7 +12,14 @@
 //   5. 在矩阵里按之字形放置
 //   6. 选最优掩码，写格式信息
 
-import { ALIGNMENT, EC_BLOCKS, EC_FORMAT_BITS, TOTAL_CODEWORDS, type ECLevel } from "./qr-tables";
+import {
+  ALIGNMENT,
+  EC_BLOCKS,
+  EC_FORMAT_BITS,
+  MAX_VERSION,
+  TOTAL_CODEWORDS,
+  type ECLevel,
+} from "./qr-tables";
 import { rsEncode } from "./qr-rs";
 
 export type { ECLevel };
@@ -61,14 +68,22 @@ class BitBuffer {
   }
 }
 
+/** 某纠错等级下 byte 模式能装的最大字节数。UI 用它显示剩余空间。 */
+export function maxPayloadBytes(level: ECLevel): number {
+  const headerBytes = Math.ceil((4 + charCountBits(MAX_VERSION)) / 8);
+  return dataCodewords(MAX_VERSION, level) - headerBytes;
+}
+
 /** 估算容纳 payload 所需的最小版本。 */
 function chooseVersion(byteLen: number, level: ECLevel): number {
-  for (let v = 1; v <= 10; v += 1) {
+  for (let v = 1; v <= MAX_VERSION; v += 1) {
     const capacityBits = dataCodewords(v, level) * 8;
     const needed = 4 + charCountBits(v) + byteLen * 8;
     if (needed <= capacityBits) return v;
   }
-  throw new Error("内容太长：当前实现支持到版本 10，请缩短文本或降低纠错等级");
+  throw new Error(
+    `内容太长：${level} 级最多 ${maxPayloadBytes(level)} 字节，请缩短文本或降低纠错等级`,
+  );
 }
 
 /** 编码成最终的数据码字序列（含填充）。 */
@@ -211,6 +226,49 @@ function reserveFormatAreas(matrix: (boolean | null)[][]): void {
   }
   // 固定深色模块
   matrix[size - 8]![8] = true;
+}
+
+/**
+ * 版本信息：版本号经 BCH(18,6) 编码，生成多项式 0x1F25。
+ *
+ * 版本 ≥ 7 必须写这两块 18 位信息。少了它，扫描器只能从矩阵尺寸
+ * 猜版本——尺寸能唯一映射到版本，所以不少解码器会"侥幸读到"，
+ * 但这是脱离标准的行为，容错余量被白白吃掉一半。
+ */
+function versionInfoBits(version: number): number {
+  let rem = version;
+  for (let i = 0; i < 12; i += 1) {
+    rem = (rem << 1) ^ ((rem >> 11) * 0x1f25);
+  }
+  return ((version << 12) | rem) >>> 0;
+}
+
+/** 保留版本信息区，确保数据位与掩码都不碰它们。 */
+function reserveVersionAreas(matrix: (boolean | null)[][], version: number): void {
+  if (version < 7) return;
+  const size = matrix.length;
+  for (let i = 0; i < 6; i += 1) {
+    for (let j = 0; j < 3; j += 1) {
+      matrix[i]![size - 11 + j] = false;
+      matrix[size - 11 + j]![i] = false;
+    }
+  }
+}
+
+/** 写入版本信息。位序从最高位开始，两块内容相同、方向不同。 */
+function writeVersion(matrix: boolean[][], version: number): void {
+  if (version < 7) return;
+  const size = matrix.length;
+  const bits = versionInfoBits(version);
+  let index = 0;
+  for (let i = 0; i < 6; i += 1) {
+    for (let j = 0; j < 3; j += 1) {
+      const bit = ((bits >> (17 - index)) & 1) === 1;
+      index += 1;
+      matrix[i]![size - 11 + j] = bit;
+      matrix[size - 11 + j]![i] = bit;
+    }
+  }
 }
 
 /** 按之字形填充数据位。 */
@@ -415,6 +473,7 @@ export function encodeQR(text: string, level: ECLevel = "M"): QRMatrix {
     }
   }
   reserveFormatAreas(nullable);
+  reserveVersionAreas(nullable, version);
 
   const reserved = nullable.map((row) => row.map((v) => v !== null));
 
@@ -434,6 +493,7 @@ export function encodeQR(text: string, level: ECLevel = "M"): QRMatrix {
   // 5. 用最优掩码重画一次（上面循环里最后写入的格式位可能属于别的掩码）
   const finalMatrix = applyMask(filled, reserved, best.index);
   writeFormat(finalMatrix, level, best.index);
+  writeVersion(finalMatrix, version);
 
   return { size, modules: finalMatrix };
 }

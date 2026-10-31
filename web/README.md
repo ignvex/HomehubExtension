@@ -12,11 +12,12 @@ HomehubExtension 的浏览器端。TypeScript + Vite，原生 DOM，手写 CSS3�
 ```bash
 pnpm install       # 安装依赖
 pnpm dev           # 开发服务器 :5173，/api /media /p 代理到 :8080
-pnpm build         # tsc --noEmit && vite build，产物在 dist/
+pnpm build         # 清 dist → tsc --noEmit → vite build，产物在 dist/
 pnpm check         # 只做类型检查
-pnpm check:dist    # 检查产物是否满足 CSP 与体积预算
+pnpm check:dist    # 检查产物是否满足 CSP 与体积预算（需先 build）
+pnpm test:qr       # 二维码容量表对照标准向量
 pnpm test:crypto   # 验证签名逻辑与服务端逐字节一致
-pnpm verify        # 上面四项全跑
+pnpm verify        # 依次跑 check / test:qr / build / check:dist / test:crypto
 ```
 
 开发时后端要先起来：`go run . serve -config ../config.json`。
@@ -34,6 +35,7 @@ src/
 ├── lib/                 DOM 构造、格式化、SSE、文案
 ├── components/          导航、Toast、骨架屏、空状态、图标
 ├── views/               每个路由一个视图
+├── tools/               15 个开发工具：registry + 每个工具一个模块
 └── styles/              @layer 分层样式
 ```
 
@@ -59,9 +61,11 @@ homehubext/auth/v1
 
 ## 体积预算
 
-| 项 | 目标 | 当前 |
+| 项 | 预算 | 当前 |
 | --- | --- | --- |
-| JS（gzip） | < 60 KB | 20.7 KB |
-| CSS（gzip） | < 15 KB | 7.4 KB |
+| 首屏 JS（gzip） | ≤ 40 KB | 27.5 KB（2 个 chunk） |
+| 按需 JS（gzip） | ≤ 80 KB | 27.3 KB（16 个 chunk） |
+| CSS（gzip） | ≤ 20 KB | 8.4 KB |
+| dist 未压缩总量 | ≤ 400 KB | 180.7 KB |
 
-`pnpm check:dist` 在超出预算时失败。体积会悄悄膨胀，必须有闸门。
+`pnpm check:dist` 在超出预算时失败。首屏按「`index.html` 直接引用的入口 chunk + shared」统计，与按需 chunk 分两档——只卡总量会逼着人删功能，只卡首屏则总量可能失控。体积会悄悄膨胀，必须有闸门。

@@ -1784,131 +1784,262 @@
       margin-top: var(--space-4);
     }
   }
-}
 
 /* ---- 订阅源新建表单 ---- */
 
-.feed-create {
+  .feed-create {
   padding: var(--space-4);
   border: 1px solid var(--border);
   border-radius: var(--radius-lg);
   background: var(--surface);
-}
+  }
 
-.feed-create-row {
+  .feed-create-row {
   display: grid;
   gap: var(--space-3);
   /* 地址占大头，名称次之，间隔最窄；窄屏自动堆叠。 */
   grid-template-columns: minmax(0, 2fr) minmax(0, 1fr) minmax(7rem, auto) auto;
   align-items: end;
-}
+  }
 
-.feed-create-row .field--narrow {
+  .feed-create-row .field--narrow {
   min-width: 7rem;
-}
+  }
 
-.feed-create .btn {
+  .feed-create .btn {
   height: 2.375rem; /* 与 .input 的行高对齐 */
   white-space: nowrap;
-}
+  }
 
-@media (max-width: 780px) {
+  @media (max-width: 780px) {
   .feed-create-row {
     grid-template-columns: 1fr;
   }
   .feed-create .btn {
     width: 100%;
   }
-}
-
-/* 订阅源卡片上的操作条：允许换行，否则窄屏会挤成一条。 */
-.feed-actions {
-  flex-wrap: wrap;
-  /* ---------- 开发工具 ---------- */
-
-  .tool-toolbar {
-    margin-bottom: var(--space-4);
   }
 
-  .tool-search {
-    max-width: 28rem;
+/* 订阅源卡片上的操作条：允许换行，否则窄屏会挤成一条。 */
+  .feed-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  margin-top: auto;
+  }
+
+/* ---------- 开发工具：枚举页 ---------- */
+
+/* 搜索条与分类计数同排：搜索占主位，计数靠右，窄屏自然堆叠。 */
+  .tool-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-3);
+  margin-bottom: var(--space-6);
+  }
+
+  .tool-search-wrap {
+  position: relative;
+  flex: 1 1 20rem;
+  max-width: 30rem;
+  }
+
+/* 放大镜贴在输入框左侧；输入框用 padding 让位，不覆盖文字。 */
+  .tool-search-wrap .icon {
+  position: absolute;
+  top: 50%;
+  left: var(--space-3);
+  translate: 0 -50%;
+  width: 16px;
+  height: 16px;
+  color: var(--text-faint);
+  pointer-events: none;
+  }
+
+  .tool-search-wrap .input {
+  padding-left: calc(var(--space-3) * 2 + 16px);
+  height: 2.5rem;
+  }
+
+  .tool-total {
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+  font-variant-numeric: tabular-nums;
+  }
+
+  .tool-section {
+  margin-bottom: var(--space-8);
+  }
+
+  .tool-section:last-child {
+  margin-bottom: 0;
+  }
+
+/* 分类标题：一条细线把标题与计数拉开，替代原来整块的 uppercase
+   ——中文没有大小写，uppercase 只会让中英混排看起来歪。 */
+  .tool-section-head {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-3);
+  margin-bottom: var(--space-4);
+  padding-bottom: var(--space-2);
+  border-bottom: 1px solid var(--border);
+  }
+
+  .tool-section-title {
+  margin: 0;
+  font-size: var(--text-base);
+  font-weight: 600;
+  letter-spacing: 0;
+  color: var(--text);
+  }
+
+  .tool-section-desc {
+  margin: 0;
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+  }
+
+/* 计数推到最右，作为分类的度量信息。 */
+  .tool-section-count {
+  margin-left: auto;
+  padding: 0.1rem var(--space-2);
+  border-radius: var(--radius-pill);
+  background: var(--surface-alt);
+  color: var(--text-muted);
+  font-size: var(--text-xs);
+  font-variant-numeric: tabular-nums;
+  }
+
+  .tool-grid {
+  display: grid;
+  gap: var(--space-3);
+  grid-template-columns: repeat(auto-fill, minmax(min(100%, 15.5rem), 1fr));
+  }
+
+/* 卡片对齐首页 app-card 的质感：同圆角、同阴影、同 hover 位移。
+   卡片内部用纵向布局，描述限两行——不同描述长度不会把网格拉得参差。 */
+  .tool-card {
+  position: relative;
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-3);
+  padding: var(--space-4);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-xl);
+  background: var(--surface);
+  color: var(--text);
+  text-decoration: none;
+  box-shadow: var(--shadow-sm);
+  transition:
+    transform var(--dur) var(--ease),
+    border-color var(--dur) var(--ease),
+    box-shadow var(--dur) var(--ease),
+    background-color var(--dur) var(--ease);
+  }
+
+  .tool-card:hover {
+  border-color: var(--border-strong);
+  color: var(--text);
+  background: var(--surface);
+  box-shadow: var(--shadow-md);
+  transform: translateY(-2px);
+  }
+
+  .tool-card:focus-visible {
+  border-color: var(--accent);
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+  }
+
+  .tool-icon {
+  display: grid;
+  place-items: center;
+  flex: none;
+  width: 2.5rem;
+  height: 2.5rem;
+  border-radius: var(--radius-lg);
+  background: var(--accent-soft, var(--surface-alt));
+  color: var(--accent);
+  transition: background-color var(--dur) var(--ease);
+  }
+
+  .tool-card:hover .tool-icon {
+  background: var(--accent);
+  color: var(--on-accent);
+  }
+
+  .tool-card-text {
+  display: grid;
+  gap: var(--space-1);
+  min-width: 0;
+  flex: 1;
+  }
+
+  .tool-card-title {
+  font-size: var(--text-sm);
+  font-weight: 600;
+  line-height: var(--leading-tight);
+  }
+
+/* 两行截断：描述长短不一，不限制会让卡片高度参差。
+   行数固定后网格是整齐的，扫视成本也低。 */
+  .tool-card-desc {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
+  overflow: hidden;
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+  line-height: 1.5;
+  min-height: 3em;
+  }
+
+/* 箭头只在 hover 时滑入，呼应首页 app-card 的 chevron，
+   但在静态列表里不占视觉重量。 */
+  .tool-card-arrow {
+  align-self: center;
+  flex: none;
+  display: grid;
+  place-items: center;
+  width: 1.25rem;
+  height: 1.25rem;
+  color: var(--text-faint);
+  opacity: 0;
+  translate: -4px 0;
+  transition:
+    opacity var(--dur) var(--ease),
+    translate var(--dur) var(--ease),
+    color var(--dur) var(--ease);
+  }
+
+  .tool-card:hover .tool-card-arrow,
+  .tool-card:focus-visible .tool-card-arrow {
+  opacity: 1;
+  translate: 0 0;
+  color: var(--accent);
+  }
+
+@media (max-width: 599px) {
+  .tool-toolbar {
+    margin-bottom: var(--space-5);
+  }
+
+  .tool-search-wrap {
+    flex-basis: 100%;
+    max-width: none;
   }
 
   .tool-section {
     margin-bottom: var(--space-6);
   }
 
-  .tool-section-head {
-    margin-bottom: var(--space-3);
-  }
-
-  .tool-section-title {
-    margin: 0;
-    font-size: var(--text-sm);
-    font-weight: 600;
-    letter-spacing: 0.02em;
-    text-transform: uppercase;
-    color: var(--text-muted);
-  }
-
-  .tool-section-desc {
-    margin: var(--space-1) 0 0;
-    font-size: var(--text-xs);
-    color: var(--text-muted);
-  }
-
+  /* 窄屏单列，卡片横向布局仍然成立，省掉纵向堆叠的空白。 */
   .tool-grid {
-    display: grid;
-    gap: var(--space-3);
-    grid-template-columns: repeat(auto-fill, minmax(17rem, 1fr));
+    grid-template-columns: 1fr;
   }
-
-  .tool-card {
-    display: flex;
-    gap: var(--space-3);
-    align-items: flex-start;
-    padding: var(--space-4);
-    border: 1px solid var(--border);
-    border-radius: var(--radius-lg);
-    background: var(--surface);
-    color: inherit;
-    text-decoration: none;
-    transition:
-      border-color var(--dur) var(--ease),
-      transform var(--dur) var(--ease);
-  }
-
-  .tool-card:hover {
-    border-color: var(--accent);
-    transform: translateY(-1px);
-  }
-
-  .tool-icon {
-    display: grid;
-    place-items: center;
-    flex: none;
-    width: 2.25rem;
-    height: 2.25rem;
-    border-radius: var(--radius-md);
-    background: var(--accent-soft, var(--surface-alt));
-    color: var(--accent);
-  }
-
-  .tool-card-text {
-    display: grid;
-    gap: 2px;
-    min-width: 0;
-  }
-
-  .tool-card-title {
-    font-size: var(--text-sm);
-    font-weight: 600;
-  }
-
-  .tool-card-desc {
-    font-size: var(--text-xs);
-    color: var(--text-muted);
-    line-height: 1.5;
   }
 
   /* ---------- 工具详情 ---------- */
@@ -2188,7 +2319,6 @@
     image-rendering: pixelated;
   }
 
-}
 
   /* ---- 片段详情 ---- */
 
@@ -2262,3 +2392,4 @@
     white-space: pre;
     tab-size: 2;
   }
+}

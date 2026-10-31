@@ -15,7 +15,7 @@ import type { ViewFactory } from "../router";
 function toolCard(tool: ToolMeta): HTMLElement {
   return h(
     "a",
-    { class: "tool-card card", attrs: { href: `/tools/${encodeURIComponent(tool.id)}` } },
+    { class: "tool-card", attrs: { href: `/tools/${encodeURIComponent(tool.id)}` } },
     h("span", { class: "tool-icon", attrs: { "aria-hidden": "true" } }, icon(tool.icon as never)),
     h(
       "span",
@@ -23,11 +23,21 @@ function toolCard(tool: ToolMeta): HTMLElement {
       h("span", { class: "tool-card-title" }, tool.name),
       h("span", { class: "tool-card-desc" }, tool.description),
     ),
+    // 箭头是纯装饰：hover 时才出现，读屏不该念它。
+    h("span", { class: "tool-card-arrow", attrs: { "aria-hidden": "true" } }, icon("chevron-right")),
   );
 }
 
-export const toolsView: ViewFactory = (ctx) => {
+function toolGrid(tools: readonly ToolMeta[]): HTMLElement {
+  const grid = h("div", { class: "tool-grid" });
+  for (const tool of tools) grid.append(toolCard(tool));
+  return grid;
+}
+
+export const toolsView: ViewFactory = () => {
   const gridHost = h("div", {});
+  const totalLabel = h("span", { class: "tool-total" });
+
   const searchInput = h("input", {
     class: "input tool-search",
     attrs: {
@@ -35,29 +45,33 @@ export const toolsView: ViewFactory = (ctx) => {
       placeholder: "搜索工具…",
       "aria-label": "搜索工具",
       autocomplete: "off",
+      spellcheck: "false",
     },
   });
 
   const render = (query: string): void => {
     const matched = searchTools(query);
+    const trimmed = query.trim();
     gridHost.replaceChildren();
+
+    // 计数条始终反映「当前看到几个」，搜索时它就是结果数。
+    totalLabel.textContent =
+      trimmed === "" ? `共 ${matched.length} 个工具` : `找到 ${matched.length} 个`;
 
     if (matched.length === 0) {
       gridHost.append(
         emptyState({
           title: "没有匹配的工具",
-          description: `没有找到与「${query.trim()}」相关的工具。换个关键词试试。`,
+          description: `没有找到与「${trimmed}」相关的工具。换个关键词试试，或清空搜索查看全部。`,
           icon: "search",
         }),
       );
       return;
     }
 
-    if (query.trim() !== "") {
+    if (trimmed !== "") {
       // 搜索时平铺，不分组——分组会让少量结果之间的联系变得难以扫视。
-      const grid = h("div", { class: "tool-grid" });
-      for (const tool of matched) grid.append(toolCard(tool));
-      gridHost.append(grid);
+      gridHost.append(toolGrid(matched));
       return;
     }
 
@@ -65,8 +79,6 @@ export const toolsView: ViewFactory = (ctx) => {
     for (const category of CATEGORIES) {
       const list = groups.get(category.id);
       if (!list || list.length === 0) continue;
-      const grid = h("div", { class: "tool-grid" });
-      for (const tool of list) grid.append(toolCard(tool));
       gridHost.append(
         h(
           "section",
@@ -76,8 +88,9 @@ export const toolsView: ViewFactory = (ctx) => {
             { class: "tool-section-head" },
             h("h2", { class: "tool-section-title" }, category.name),
             h("p", { class: "tool-section-desc" }, category.description),
+            h("span", { class: "tool-section-count" }, `${list.length}`),
           ),
-          grid,
+          toolGrid(list),
         ),
       );
     }
@@ -95,12 +108,19 @@ export const toolsView: ViewFactory = (ctx) => {
     pageHeader("开发工具", "全部在浏览器本地运行，不上传、不联网、不追踪。", [
       h("a", { class: "btn", attrs: { href: "/" } }, icon("arrow-left"), "返回工具台"),
     ]),
-    h("div", { class: "tool-toolbar" }, searchInput),
+    h(
+      "div",
+      { class: "tool-toolbar" },
+      h(
+        "div",
+        { class: "tool-search-wrap" },
+        icon("search"),
+        searchInput,
+      ),
+      totalLabel,
+    ),
     gridHost,
   );
-
-  // 搜索结果为空时把焦点留在搜索框，方便继续改关键词。
-  ctx.signal.addEventListener("abort", () => {}, { once: true });
 
   return { element };
 };

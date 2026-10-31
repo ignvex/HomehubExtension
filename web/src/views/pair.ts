@@ -1,4 +1,11 @@
-import { enrollThisDevice, forgetDevice, getSession, hasLocalDeviceKey, loginWithDevice } from "../auth/session";
+import {
+  enrollThisDevice,
+  forgetDevice,
+  getSession,
+  hasLocalDeviceKey,
+  loginWithAccessKey,
+  loginWithDevice,
+} from "../auth/session";
 import { webCryptoAvailable } from "../auth/keys";
 import type { SessionSnapshot } from "../auth/session";
 import { loadingBlock } from "../components/states";
@@ -29,6 +36,23 @@ export function normalizePairingToken(raw: string): string {
   }
   const groups = body.match(/.{1,4}/gu)?.join("-") ?? body;
   return `HH-${groups}`;
+}
+
+/**
+ * 判断输入是配对码还是登录密钥。
+ *
+ * 两者都靠人复制粘贴，但生命周期完全不同：配对码 15 分钟、用一次就废；
+ * 密钥长期有效、可反复使用。认错方向的代价是用户看到一句毫不相关的
+ * "配对码无效"，所以这里按长度和前缀区分，而不是靠用户自己选。
+ *
+ * 规范化后的长度：
+ *   配对码  HH + 12        = 14
+ *   密钥    HHE + 20       = 23
+ *   密钥主体（省略前缀）     = 20
+ */
+function looksLikeAccessKey(raw: string): boolean {
+  const compact = raw.toUpperCase().replace(/[^0-9A-Z]/gu, "");
+  return compact.length === 23 || compact.length === 20;
 }
 
 function brand(): HTMLElement {
@@ -84,7 +108,11 @@ export const pairView: ViewFactory = (ctx) => {
             "p",
             { class: "notice notice--warning" },
             icon("alert"),
-            h("span", {}, "本机私钥已丢失。当前会话仍然有效，但过期后需要重新配对。"),
+            h(
+              "span",
+              {},
+              "本机没有设备私钥：当前会话来自登录密钥，或私钥已被清除。会话过期后，前者重新输入同一串密钥，后者需要重新配对。",
+            ),
           ),
     );
 
@@ -226,11 +254,11 @@ export const pairView: ViewFactory = (ctx) => {
         id: "pair-token",
         name: "token",
         type: "text",
-        placeholder: "HH-XXXX-XXXX-XXXX",
+        placeholder: "HH-XXXX-XXXX-XXXX 或 HHE-XXXX-…",
         autocomplete: "off",
         autocapitalize: "characters",
         spellcheck: "false",
-        maxlength: "17",
+        maxlength: "32",
         required: true,
       },
     });
@@ -260,12 +288,12 @@ export const pairView: ViewFactory = (ctx) => {
       h(
         "div",
         { class: "field" },
-        h("label", { class: "label", attrs: { for: "pair-token" } }, "配对码"),
+        h("label", { class: "label", attrs: { for: "pair-token" } }, "配对码或登录密钥"),
         token,
         h(
           "p",
           { class: "field-help" },
-          "在服务器上运行 enroll 命令生成，形如 HH-7QK4-2M9X-P3TB，15 分钟内有效。",
+          "两种都可以：配对码 HH-7QK4-2M9X-P3TB 由服务端 enroll 命令生成，15 分钟一次有效；登录密钥 HHE-… 由 Homehub 签发，长期可重复使用。",
         ),
       ),
       h(
@@ -280,7 +308,11 @@ export const pairView: ViewFactory = (ctx) => {
     );
 
     token.addEventListener("blur", () => {
-      if (token.value.trim() !== "") token.value = normalizePairingToken(token.value);
+      const value = token.value.trim();
+      // 密钥不能套配对码的规范化：它会把 23 位的主体按 4 位一组重排，
+      // 用户看到的是一串已经变了样的凭证。
+      if (value === "" || looksLikeAccessKey(value)) return;
+      token.value = normalizePairingToken(value);
     });
 
     const form = h(
@@ -300,13 +332,41 @@ export const pairView: ViewFactory = (ctx) => {
       event.preventDefault();
       error.hidden = true;
 
-      const tokenValue = normalizePairingToken(token.value);
-      const nameValue = name.value.trim() || suggestDeviceName();
-      if (tokenValue.trim() === "") {
-        setError(error, "请输入配对码");
+      const raw = token.value.trim();
+      if (raw === "") {
+        setError(error, "请输入配对码或登录密钥");
         token.focus();
         return;
       }
+
+      // 密钥登录：不生成设备密钥，也不需要设备名。
+      // 它换到的会话与设备登录完全等价，区别只是会话过期后
+      // 要重新输入同一串密钥，而不是用本机私钥再签一次。
+      if (looksLikeAccessKey(raw)) {
+        fieldset.disabled = true;
+        submit.textContent = "正在验证…";
+        void (async () => {
+          try {
+            await loginWithAccessKey(raw, ctx.signal);
+            if (ctx.signal.aborted) return;
+            ctx.toast.show("已用登录密钥进入", "success");
+            go();
+          } catch (reason) {
+            if (ctx.signal.aborted) return;
+            setError(error, describeError(reason));
+          } finally {
+            fieldset.disabled = false;
+            submit.replaceChildren(icon("key"), "登记本设备");
+          }
+        })();
+        return;
+      }
+
+      const tokenValue = normalizePairingToken(raw);
+      const nameValue = name.value.trim() || suggestDeviceName();
+
+      // 这个检查必须在禁用表单之前：early return 之后没有再恢复的机会，
+      // 用户会停在一个点不动的表单上。
       if (!webCryptoAvailable()) {
         setError(error, "当前环境不支持 WebCrypto，请使用 HTTPS 或 localhost 访问");
         return;

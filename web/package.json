@@ -14,7 +14,8 @@
     "check": "tsc --noEmit",
     "check:dist": "node scripts/check-dist.mjs",
     "test:crypto": "node scripts/test-crypto.mjs",
-    "verify": "pnpm run check && pnpm run build && pnpm run check:dist && pnpm run test:crypto"
+    "verify": "pnpm run check && pnpm run test:qr && pnpm run build && pnpm run check:dist && pnpm run test:crypto",
+    "test:qr": "node scripts/test-qr-tables.mjs"
   },
   "devDependencies": {
     "@types/node": "^26.6.6",

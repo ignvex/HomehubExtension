@@ -1,4 +1,10 @@
-import { requestChallenge, exchangeToken, refreshToken, enrollDevice } from "../api/auth";
+import {
+  requestChallenge,
+  exchangeToken,
+  refreshToken,
+  enrollDevice,
+  redeemAccessKey,
+} from "../api/auth";
 import type { AuthClient, AuthSessionResponse, EnrollResponse } from "../api/types";
 import { authMessage, generateDeviceKey, signMessage } from "./keys";
 import {
@@ -166,6 +172,25 @@ export async function enrollThisDevice(
 
   await loginWithDevice(signal);
   return response;
+}
+
+/**
+ * 用宿主签发的长期密钥登录。
+ *
+ * 这条路不生成也不读取设备私钥：密钥本身就是凭证，可以反复使用，
+ * 换浏览器、换设备都靠同一串。代价是它不像设备私钥那样"不可导出"，
+ * 所以明文必须由用户自己保管好。
+ *
+ * 登录后仍然落一个 client_id：refresh 续期要靠它判断本机是否登记过。
+ * 但 hasLocalDeviceKey() 会是 false，配对页据此提示"当前会话来自登录密钥"。
+ */
+export async function loginWithAccessKey(
+  key: string,
+  signal?: AbortSignal,
+): Promise<AuthClient> {
+  const response = await redeemAccessKey(key, signal);
+  applySession(response);
+  return response.client;
 }
 
 /** 清除本机密钥与本地 client_id；服务端设备仍然存在，可再用配对码登记新密钥。 */
