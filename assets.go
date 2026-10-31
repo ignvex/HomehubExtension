@@ -7,8 +7,13 @@ import (
 
 // all:web/dist 把前端构建产物打进二进制。
 //
-// 仓库里提交了 web/dist/index.html 作为占位，保证全新 clone 直接
-// go build 不会失败；`pnpm --dir web build` 会用真实产物覆盖它。
+// 仓库里只提交 web/dist/.gitkeep 作为占位：go:embed 要求目录存在且
+// 至少有一个匹配文件，空目录会让全新 clone 直接编译失败。
+//
+// `.gitkeep` 是空文件，只能满足编译，不能当页面：serve 启动时读不到
+// index.html，任何页面路径都会拿到一行纯文本「前端尚未构建」
+// （见 httpapi/spa.go 的 serveIndex）。要看到真实界面，先跑
+// `pnpm --dir web build` 再重新编译。
 //
 //go:embed all:web/dist
 var webFS embed.FS

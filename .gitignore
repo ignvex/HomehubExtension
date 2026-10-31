@@ -25,3 +25,8 @@ web/*.local
 .idea/
 .vscode/
 *.swp
+
+# 外部参考材料：从 Windows 下载的资料与浏览器标记，不属于本仓库
+/transit.md
+# 不带点：`*.Zone.Identifier` 不匹配 `name:Zone.Identifier` 这种带冒号的文件名
+*Zone.Identifier

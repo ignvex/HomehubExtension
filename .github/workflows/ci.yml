@@ -34,6 +34,11 @@ jobs:
       - name: 规范检查
         run: make lint
 
+      # 单元文件也是交付物：语法错或加固项写错，只会在部署到服务器时
+      # 才暴露。这里用离线模式校验，不依赖 unit 真的被加载过。
+      - name: systemd 单元检查
+        run: make units
+
       - name: 静态检查
         run: go vet ./...
 

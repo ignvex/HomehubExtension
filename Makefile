@@ -1,4 +1,4 @@
-.PHONY: help dev-api dev-web build test race vet fmt web clean
+.PHONY: help dev-api dev-web build test race vet fmt web clean lint units
 
 BINARY := bin/homehub-extension
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
@@ -57,7 +57,10 @@ lint: ## 规范检查（Golang Specification skill）
 	@echo "== go vet =="
 	@go vet ./... && echo "  OK"
 	@echo "== deadcode =="
-	@command -v deadcode >/dev/null && deadcode -test ./... || echo "  (未安装，跳过)"
+	@# 不能写成 `command -v deadcode && deadcode … || echo 跳过`：那种写法下
+	@# deadcode 自己失败也会走进 `||`，把真问题报成「未安装」。
+	@if command -v deadcode >/dev/null; then deadcode -test ./... || exit 1; \
+	  else echo "  (未安装，跳过)"; fi
 	@echo "== 超长行 (>120) =="
 	@for f in $$(find . -name '*.go' -not -path './web/*' -not -name '*_test.go'); do \
 	  awk -v F="$$f" 'length>120 {printf "%s:%d (%d)\n", F, FNR, length}' "$$f"; done; echo "  OK"
@@ -65,3 +68,15 @@ lint: ## 规范检查（Golang Specification skill）
 	@python3 scripts/check-gofunc.py
 	@echo "== import 分组 =="
 	@python3 scripts/check-goimports.py
+
+units: ## 校验 systemd 单元（语法 + 加固评分）
+	@command -v systemd-analyze >/dev/null || { echo "  未安装 systemd-analyze，跳过"; exit 0; }
+	@echo "== 单元语法 =="
+	@# verify 会抱怨 ExecStart 指向的二进制在本机不存在，这是预期的：
+	@# 目标环境是服务器，本地只校配置文件本身；其余任何输出都是真问题。
+	@out=$$(systemd-analyze verify deploy/*.service deploy/*.timer 2>&1 \
+	  | grep -v "is not executable: No such file"); \
+	  if [ -n "$$out" ]; then echo "$$out"; exit 1; fi; echo "  OK"
+	@echo "== 加固评分 =="
+	@systemd-analyze security --offline=yes deploy/homehub-extension.service 2>&1 \
+	  | grep "Overall exposure level"
