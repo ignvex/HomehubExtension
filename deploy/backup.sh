@@ -12,10 +12,14 @@
 #      所以两者在这一步里连续完成。
 #
 # 用法：
-#   sudo -u homehub ./backup.sh
+#   sudo install -m 0755 deploy/backup.sh /usr/local/bin/homehub-backup.sh
+#   sudo install -m 0644 deploy/homehub-backup.{service,timer} /etc/systemd/system/
+#   sudo install -d -o homehub -g homehub -m 0750 /var/backups/homehub
+#   sudo systemctl daemon-reload && sudo systemctl enable --now homehub-backup.timer
 #
-# 建议 cron：
-#   0 3 * * *  /usr/local/bin/homehub-backup.sh >> /var/log/homehub-backup.log 2>&1
+# 调度交给 systemd timer（deploy/homehub-backup.timer），不用 cron：
+# 日志直接进 journal 可以从 `systemctl status homehub-backup` 看，
+# Persistent=true 能补跑关机期间错过的触发点，这些 cron 都要另写脚本解决。
 
 set -euo pipefail
 

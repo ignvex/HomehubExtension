@@ -4,21 +4,51 @@ Documentation=https://github.com/ignvex/HomehubExtension
 After=network-online.target
 Wants=network-online.target
 
+# 配置写错、端口被占这类启动失败重试 5 次就停在 failed，
+# 而不是无限重启刷日志。
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
 [Service]
-Type=simple
+# 由 sd_notify(READY=1) 判定就绪：systemctl start 返回时端口已经在监听，
+# 部署脚本和 After= 依赖它的 unit 都不必再自己轮询 /healthz。
+Type=notify
+NotifyAccess=main
+# 每 30 秒一次 WATCHDOG=1 心跳。超过 60 秒没有心跳，systemd 判定假死并重启。
+# 这是 Restart=on-failure 看不到的一类故障：进程还在、端口还占着，但已经不干活。
+WatchdogSec=60s
+
 User=homehub
 Group=homehub
+
+# 数据目录由 systemd 创建并 chown，不再依赖安装时手工 mkdir + chown。
+# 同时它会被自动加入可写集合，ProtectSystem=strict 下依然可写。
+StateDirectory=homehub-extension
+StateDirectoryMode=0750
 
 # 密钥通过环境文件注入，config.json 里用 ${VAR} 引用。
 EnvironmentFile=-/etc/homehub-extension/env
 
+# MemoryMax 是 cgroup 硬墙，撞上就是 OOM kill。GOMEMLIMIT 让 Go 的 GC
+# 提前介入，在触到硬墙之前就压低堆占用——两者要一起配才有意义。
+Environment=GOMEMLIMIT=256MiB
+
+# 迁移放在启动前：失败会停在 ExecStartPre，日志直接指向配置或权限问题，
+# 而不是让 serve 反复崩在 Type=notify 的启动超时上。
+ExecStartPre=/usr/local/bin/homehub-extension migrate -config /etc/homehub-extension/config.json
 ExecStart=/usr/local/bin/homehub-extension serve -config /etc/homehub-extension/config.json
-ExecReload=/bin/kill -HUP $MAINPID
+
+# 这里故意没有 ExecReload。
+# 进程只处理 SIGINT/SIGTERM，SIGHUP 会走默认处置直接终止进程——
+# 写一条 ExecReload 得到的不是热重载，而是 systemctl reload 把服务杀掉。
+# 改配置请 systemctl restart homehub-extension。
 
 Restart=on-failure
 RestartSec=5s
-# 必须大于应用内部的 20 秒关闭预算，否则 WAL 来不及 checkpoint。
-TimeoutStopSec=25s
+# 必须大于应用内部的 20 秒关闭预算，否则 systemd 会强杀，WAL 来不及 checkpoint。
+TimeoutStopSec=30s
+TimeoutStartSec=90s
+KillSignal=SIGTERM
 
 # ---- 加固 ----
 NoNewPrivileges=true
@@ -28,18 +58,39 @@ PrivateTmp=true
 PrivateDevices=true
 ProtectKernelTunables=true
 ProtectKernelModules=true
+ProtectKernelLogs=true
 ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+ProcSubset=pid
 RestrictSUIDSGID=true
+RestrictNamespaces=true
+RestrictRealtime=true
 LockPersonality=true
+UMask=0077
+
+# 纯静态 Go 二进制不需要任何 capability。
+CapabilityBoundingSet=
+AmbientCapabilities=
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+# 被过滤的调用返回 EPERM 而不是发 SIGSYS 杀进程：真出问题时表现为
+# 一个可读的错误，而不是一次无声的崩溃。
+SystemCallErrorNumber=EPERM
+
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 
-# ProtectSystem=strict 会把根文件系统挂成只读。
-# 数据目录必须在这里显式放行，否则启动即失败（日志只有 permission denied）。
+# ProtectSystem=strict 会把根文件系统挂成只读。StateDirectory 已自动放行
+# 数据目录，这里保留显式声明：blob_dir 若改到该目录之外，必须在同一行补上，
+# 否则启动即失败，日志只有 permission denied。
 ReadWritePaths=/var/lib/homehub-extension
 
 # ---- 资源 ----
 MemoryMax=512M
+TasksMax=256
 LimitNOFILE=4096
+OOMPolicy=stop
 
 [Install]
 WantedBy=multi-user.target

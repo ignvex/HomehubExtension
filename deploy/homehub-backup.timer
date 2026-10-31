@@ -1,0 +1,18 @@
+[Unit]
+Description=HomehubExtension 每日备份
+
+[Timer]
+# 凌晨 3 点。cleanup 任务里的 rss-prune（4:30）、blob-gc（5:00）排在它之后，
+# 所以备份拿到的是清理前的完整快照——删掉的东西在备份里有，需要时可以捞回来。
+OnCalendar=*-*-* 03:00:00
+
+# 关机错过触发点时，开机后补跑一次。没有它，一台每晚关机的机器永远不备份。
+Persistent=true
+
+# 错峰，避免多台实例在同一秒打同一个备份存储。
+RandomizedDelaySec=10m
+
+Unit=homehub-backup.service
+
+[Install]
+WantedBy=timers.target
