@@ -42,8 +42,15 @@ func (b *Bus) Publish(kind string, data any) {
 		At:   time.Now().Unix(),
 	}
 
-	b.mu.RLock()
-	defer b.mu.RUnlock()
+	// 必须用写锁：循环里可能在 dropLocked 中 delete(map) 与 close(ch)。
+	// 用读锁时多个 Publish 会并发遍历同一个 map 并互相删除，触发
+	// data race 甚至 "concurrent map writes" 直接崩溃。
+	//
+	// 用整段持写锁而不是「读锁收集 + 写锁删除」两阶段：两阶段之间
+	// 仍可能有其它 Publish 往即将被 close 的通道发送，导致
+	// "send on closed channel" panic。持同一把锁才能保证 send 与 close 互斥。
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	for id, ch := range b.subs {
 		select {
 		case ch <- ev:
@@ -75,6 +82,22 @@ func (b *Bus) Subscribe() (<-chan Event, func()) {
 		})
 	}
 	return ch, cancel
+}
+
+// Close 关闭所有订阅，让阻塞在通道上的 SSE handler 立即返回。
+//
+// 优雅关闭时需要它：http.Server.Shutdown 只停止接受新连接并等待在途
+// 请求完成，不会取消已有请求的 context。SSE 是长连接，不主动断开就会
+// 一直拖到 Shutdown 超时。
+//
+// 幂等：重复调用不会 double close（map 里已经没有条目）。
+func (b *Bus) Close() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for id, ch := range b.subs {
+		delete(b.subs, id)
+		close(ch)
+	}
 }
 
 func (b *Bus) dropLocked(id uint64) {
