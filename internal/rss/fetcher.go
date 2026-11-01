@@ -343,7 +343,13 @@ func (s *Service) ingestItem(
 		referer = feed.SiteURL
 	}
 
-	used, _ := s.st.Blob().TotalSize(ctx)
+	used, err := s.st.Blob().TotalSize(ctx)
+	if err != nil {
+		// 不能把查询失败当成 0：那等于关掉配额，让一次抓取无限写盘。
+		// 保留 0 但留下日志，磁盘余量检查（min_free_bytes）仍在兜底。
+		s.log.Warn("blob total size unavailable, quota check degraded",
+			"feed_id", feed.ID, "err", err)
+	}
 	results := s.dl.DownloadAll(ctx, doc.Targets, referer, used)
 
 	// 重写必须在 Render 之前：落库的 HTML 就是读者最终看到的形态。

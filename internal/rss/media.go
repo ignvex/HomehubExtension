@@ -218,7 +218,17 @@ func checkHost(u *url.URL, allowPrivate bool) error {
 //
 // 整个过程流式：先读 512 字节嗅探类型，再把这 512 字节与剩余流拼起来交给
 // blob.Put，峰值内存只有几十 KB。
+//
+// 单次下载没有批次可共享，因此不传 QuotaTracker：并发安全由
+// Store 内部的锁保证，但多次调用之间的用量不会互相累加。
+// 需要批量下载时用 DownloadAll。
 func (d *Downloader) Download(ctx context.Context, rawURL, referer string, used int64) MediaResult {
+	return d.download(ctx, rawURL, referer, used, nil)
+}
+
+func (d *Downloader) download(
+	ctx context.Context, rawURL, referer string, used int64, quota *blob.QuotaTracker,
+) MediaResult {
 	res := MediaResult{URL: rawURL}
 
 	// data: URI 是内联内容，没有 host 可检查、也不需要网络。
@@ -226,7 +236,7 @@ func (d *Downloader) Download(ctx context.Context, rawURL, referer string, used 
 	//   - base64 比原始字节大 33%，一篇图多的文章会把 content_html 撑到几 MB；
 	//   - 转为内容寻址后，相同的内联图在多篇文章之间自动去重。
 	if raw, declaredMIME, ok := decodeDataURI(rawURL); ok {
-		return d.storeInline(ctx, res, raw, declaredMIME, used)
+		return d.storeInline(ctx, res, raw, declaredMIME, used, quota)
 	}
 
 	if err := d.preflight(rawURL); err != nil {
@@ -270,7 +280,7 @@ func (d *Downloader) Download(ctx context.Context, rawURL, referer string, used 
 		return res
 	}
 
-	return d.sniffAndStore(ctx, res, resp, used)
+	return d.sniffAndStore(ctx, res, resp, used, quota)
 }
 
 // preflight 校验 URL 的 scheme、host 与端口。
@@ -308,7 +318,7 @@ func (d *Downloader) fetch(ctx context.Context, rawURL, referer string) (*http.R
 // 以嗅探结果为准、响应头只作参考：服务端声称 image/png 而内容是 HTML
 // 是常见的内容注入手法。
 func (d *Downloader) sniffAndStore(
-	ctx context.Context, res MediaResult, resp *http.Response, used int64,
+	ctx context.Context, res MediaResult, resp *http.Response, used int64, quota *blob.QuotaTracker,
 ) MediaResult {
 	head := make([]byte, 512)
 	n, err := io.ReadFull(resp.Body, head)
@@ -328,7 +338,7 @@ func (d *Downloader) sniffAndStore(
 
 	// 嗅探用的 512 字节要拼回数据流的开头，否则文件开头会缺一段。
 	body := io.MultiReader(bytes.NewReader(head), resp.Body)
-	put, err := d.blobs.Put(ctx, body, blob.PutOptions{Ext: ext, Used: used})
+	put, err := d.blobs.Put(ctx, body, blob.PutOptions{Ext: ext, Used: used, Quota: quota})
 	if err != nil {
 		res.Status, res.Error = classifyPutError(err)
 		return res
@@ -364,6 +374,7 @@ func (d *Downloader) storeInline(
 	raw []byte,
 	declaredMIME string,
 	used int64,
+	quota *blob.QuotaTracker,
 ) MediaResult {
 	if len(raw) == 0 {
 		res.Status, res.Error = "unsupported", "empty inline data"
@@ -383,7 +394,7 @@ func (d *Downloader) storeInline(
 		return res
 	}
 
-	put, err := d.blobs.Put(ctx, bytes.NewReader(raw), blob.PutOptions{Ext: ext, Used: used})
+	put, err := d.blobs.Put(ctx, bytes.NewReader(raw), blob.PutOptions{Ext: ext, Used: used, Quota: quota})
 	if err != nil {
 		switch {
 		case errors.Is(err, blob.ErrTooLarge):
@@ -467,6 +478,9 @@ func truncErr(err error) string {
 
 // DownloadAll 并发下载一组资源，返回 URL → 结果。
 // 同一 URL 只下载一次。
+//
+// 所有并发写入共享一个 QuotaTracker：否则每个 goroutine 都拿调用方
+// 传入的同一份旧快照去检查配额，各自都能通过，合计可写入 N 倍配额。
 func (d *Downloader) DownloadAll(
 	ctx context.Context,
 	targets []Target,
@@ -477,6 +491,8 @@ func (d *Downloader) DownloadAll(
 	var mu sync.Mutex
 	seen := make(map[string]struct{})
 	var wg sync.WaitGroup
+
+	quota := blob.NewQuotaTracker(used)
 
 	for _, t := range targets {
 		url := t.Resolved
@@ -494,7 +510,7 @@ func (d *Downloader) DownloadAll(
 		wg.Add(1)
 		go func(u string) {
 			defer wg.Done()
-			r := d.Download(ctx, u, referer, used)
+			r := d.download(ctx, u, referer, used, quota)
 			mu.Lock()
 			out[u] = r
 			mu.Unlock()

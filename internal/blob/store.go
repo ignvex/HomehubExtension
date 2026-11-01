@@ -35,7 +35,9 @@ type Store struct {
 	quota   int64
 	minFree int64
 
-	mu sync.Mutex // 串行化配额判断，避免并发下载同时通过检查
+	// mu 串行化「最终配额判定 + 落位」。没有它，多个并发写入会各自
+	// 用同一份过期快照通过检查，然后一起 rename，合计超出配额。
+	mu sync.Mutex
 }
 
 // Options 是打开存储的参数。零值字段使用默认值。
@@ -79,6 +81,47 @@ func Open(opts Options) (*Store, error) {
 type PutOptions struct {
 	Ext  string
 	Used int64
+	// Quota 让一批并发写入共享同一份累加视图。为 nil 时只用 Used，
+	// 并发写入之间的窗口由 Store.mu 串行化收窄，但各自仍看到同一份快照。
+	Quota *QuotaTracker
+}
+
+// QuotaTracker 让一组并发写入共享同一份配额视图。
+//
+// 调用方在批次开始时查一次数据库得到基线，之后每个成功落盘的写入把
+// 实际字节数累加进来。没有它时，N 个并发下载都拿同一份快照去检查
+// 配额，各自都能通过，合计可以写入 N 倍配额。
+type QuotaTracker struct {
+	mu    sync.Mutex
+	total int64
+}
+
+// NewQuotaTracker 用当前已占用字节数开一个批次视图。
+func NewQuotaTracker(used int64) *QuotaTracker {
+	return &QuotaTracker{total: used}
+}
+
+// Used 返回当前用量：基线 + 本批次已落盘字节。
+// nil 接收者返回 0，方便调用方不写分支。
+func (q *QuotaTracker) Used() int64 {
+	if q == nil {
+		return 0
+	}
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return q.total
+}
+
+// lockQuota 取得配额判定所需的锁。
+// 有 tracker 时用它的锁，让同一批次共享累加值；否则退回 Store.mu，
+// 至少保证「检查」与「落位」不交叠。
+func (s *Store) lockQuota(q *QuotaTracker) func() {
+	if q != nil {
+		q.mu.Lock()
+		return q.mu.Unlock
+	}
+	s.mu.Lock()
+	return s.mu.Unlock
 }
 
 // Result 是一次写入的结果。Existed 表示内容已存在，本次没有落盘。
@@ -90,10 +133,61 @@ type Result struct {
 	Existed bool
 }
 
+// place 在配额锁内做最终判定并把临时文件安置到内容寻址位置。
+//
+// 单独拆出来有三个原因：Put 的主体只负责流式写入；
+// 「检查 — stat — rename」必须是连续的一段；
+// rename 失败时临时文件的清理只写一次。
+func (s *Store) place(tmpName, sum string, ext string, written int64, opt PutOptions) (*Result, error) {
+	unlock := s.lockQuota(opt.Quota)
+	defer unlock()
+
+	used := opt.Used
+	if opt.Quota != nil {
+		used = opt.Quota.total
+	}
+
+	// 写完再检查一次真实大小：Content-Length 可能撒谎或缺失。
+	if s.quota > 0 && used+written > s.quota {
+		os.Remove(tmpName)
+		return nil, ErrQuotaExceeded
+	}
+	if err := s.checkSpace(used, written); err != nil {
+		os.Remove(tmpName)
+		return nil, err
+	}
+
+	dest := s.Path(sum, ext)
+	if _, err := os.Stat(dest); err == nil {
+		os.Remove(tmpName)
+		return &Result{SHA256: sum, Size: written, Path: dest, Existed: true}, nil
+	}
+	if err := os.MkdirAll(filepath.Dir(dest), 0o750); err != nil {
+		os.Remove(tmpName)
+		return nil, err
+	}
+	// 同一文件系统内的 rename 是原子的：读者要么看不到文件，要么看到完整文件。
+	if err := os.Rename(tmpName, dest); err != nil {
+		os.Remove(tmpName)
+		return nil, fmt.Errorf("move into place: %w", err)
+	}
+	// 只有新增内容才计入用量：内容寻址去重命中时没有多占空间。
+	if opt.Quota != nil {
+		opt.Quota.total += written
+	}
+	return &Result{SHA256: sum, Size: written, Path: dest}, nil
+}
+
 // Put 把 r 流式写入临时文件并移动到内容寻址位置。
 func (s *Store) Put(ctx context.Context, r io.Reader, opt PutOptions) (*Result, error) {
 	// 先做一次便宜的检查，避免为注定被拒的下载浪费带宽。
-	if err := s.checkSpace(opt.Used, 0); err != nil {
+	// 这一步用旧快照无妨：并发窗口里可能多下载一次，但下面落位前的
+	// 检查才是有效约束，超配额的内容不会真的落盘。
+	preUsed := opt.Used
+	if opt.Quota != nil {
+		preUsed = opt.Quota.Used()
+	}
+	if err := s.checkSpace(preUsed, 0); err != nil {
 		return nil, err
 	}
 
@@ -122,34 +216,12 @@ func (s *Store) Put(ctx context.Context, r io.Reader, opt PutOptions) (*Result, 
 		return nil, err
 	}
 
-	// 写完再检查一次真实大小：Content-Length 可能撒谎或缺失。
-	if s.quota > 0 && opt.Used+written > s.quota {
-		os.Remove(tmpName)
-		return nil, ErrQuotaExceeded
-	}
-	if err := s.checkSpace(opt.Used, written); err != nil {
-		os.Remove(tmpName)
-		return nil, err
-	}
-
-	sum := hex.EncodeToString(h.Sum(nil))
-	ext := normalizeExt(opt.Ext)
-	dest := s.Path(sum, ext)
-
-	if _, err := os.Stat(dest); err == nil {
-		os.Remove(tmpName)
-		return &Result{SHA256: sum, Size: written, Path: dest, Existed: true}, nil
-	}
-	if err := os.MkdirAll(filepath.Dir(dest), 0o750); err != nil {
-		os.Remove(tmpName)
-		return nil, err
-	}
-	// 同一文件系统内的 rename 是原子的：读者要么看不到文件，要么看到完整文件。
-	if err := os.Rename(tmpName, dest); err != nil {
-		os.Remove(tmpName)
-		return nil, fmt.Errorf("move into place: %w", err)
-	}
-	return &Result{SHA256: sum, Size: written, Path: dest}, nil
+	// 最终检查必须与落位在同一把锁内：否则两个并发写入可以各自
+	// 通过检查，然后一起 rename，合计超出配额。
+	//
+	// 锁只覆盖一次 stat 与一次 rename，不是整个流式写入，
+	// 所以不会把并发下载串行化。
+	return s.place(tmpName, hex.EncodeToString(h.Sum(nil)), normalizeExt(opt.Ext), written, opt)
 }
 
 func copyLimited(ctx context.Context, dst io.Writer, src io.Reader, limit int64) (int64, error) {
