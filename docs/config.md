@@ -292,7 +292,7 @@ HOMEHUB_TOKEN=redacted
 sudo install -m 0755 dist/homehub-extension /usr/bin/
 sudo install -m 0755 deploy/backup.sh /usr/bin/homehub-backup.sh
 # 数据目录由 unit 里的 StateDirectory 创建并 chown，不需要手工 mkdir
-sudo install -d -m 0750 /etc/hhe
+sudo install -d -o root -g homehub -m 0750 /etc/hhe   # 组必须是服务用户的主组
 sudo install -m 0640 -o root -g homehub config.json /etc/hhe/config.json
 sudo install -m 0600 -o root -g homehub deploy/env.example /etc/hhe/env
 sudo install -m 0644 deploy/hhe.service \
@@ -342,7 +342,7 @@ sudo -u homehub /usr/bin/homehub-extension enroll \
 # deploy/backup.sh 每日 03:00 跑一次，保留 7 份；调度交给 systemd timer
 sudo install -m 0755 deploy/backup.sh /usr/bin/homehub-backup.sh
 sudo install -m 0644 deploy/hhe-backup.service deploy/hhe-backup.timer /etc/systemd/system/
-sudo install -d -o homehub -g homehub -m 0750 /var/backups/homehub
+sudo install -d -o homehub -g homehub -m 0750 /var/backups/hhe
 sudo systemctl daemon-reload
 sudo systemctl enable --now hhe-backup.timer
 systemctl list-timers hhe-backup.timer

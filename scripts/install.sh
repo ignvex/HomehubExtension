@@ -148,7 +148,11 @@ fi
 # ---- 配置 ----
 
 step "配置文件"
-run install -d -m 0750 "$CONF_DIR"
+# 目录的组必须是服务用户的主组。只写 `install -d -m 0750` 会建成
+# root:root，而 0750 对 other 不给任何权限——homehub 用户属于 other，
+# 连目录都进不去，随后读 config.json 就是 permission denied。
+# 文件本身 0640 root:homehub 明明可读，卡住的是父目录的搜索位。
+run install -d -o root -g "$SVC_GROUP" -m 0750 "$CONF_DIR"
 if [ -f "$CONF_DIR/config.json" ]; then
   ok "保留已有配置（$CONF_DIR/config.json）"
   NEW_CONFIG=0
@@ -161,7 +165,10 @@ else
   NEW_CONFIG=1
 fi
 
-[ -d "$DATA_DIR" ] || run install -d -o "$SVC_USER" -g "$SVC_GROUP" -m 0750 "$DATA_DIR"
+# install -d 幂等：目录已存在时也会纠正权限与属主。
+# 不写成 `[ -d ... ] ||`：那样会跳过纠正，一个手工建错的
+# 数据目录就永远不会被修好。
+run install -d -o "$SVC_USER" -g "$SVC_GROUP" -m 0750 "$DATA_DIR"
 ok "数据目录 $DATA_DIR"
 
 # ---- systemd ----
