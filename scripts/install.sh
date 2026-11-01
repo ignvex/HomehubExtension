@@ -52,6 +52,17 @@ run() {
   fi
 }
 
+# as_user USER CMD... → 以指定用户身份执行，用于验证权限而不是看权限位。
+# runuser 来自 util-linux（Debian/Ubuntu 默认有）；没有就退回 su。
+as_user() {
+  local user="$1"; shift
+  if command -v runuser >/dev/null 2>&1; then
+    runuser -u "$user" -- "$@"
+  else
+    su -s /bin/sh "$user" -c "$(printf '%q ' "$@")"
+  fi
+}
+
 # ask QUESTION DEFAULT(y|n) → 返回 0 表示 yes
 ask() {
   local q="$1" def="$2" hint answer
@@ -170,6 +181,37 @@ fi
 # 数据目录就永远不会被修好。
 run install -d -o "$SVC_USER" -g "$SVC_GROUP" -m 0750 "$DATA_DIR"
 ok "数据目录 $DATA_DIR"
+
+# 数据目录必须可写：SQLite 要在里面建 .db / -wal / -shm。
+if [ "$DRY_RUN" -eq 0 ] && [ "$(id -u)" -eq 0 ]; then
+  if as_user "$SVC_USER" test -w "$DATA_DIR" 2>/dev/null; then
+    ok "服务用户 $SVC_USER 可写数据目录"
+  else
+    ls -ld "$DATA_DIR" 2>/dev/null || true
+    die "服务用户 $SVC_USER 写不了 $DATA_DIR
+    修复：chown -R $SVC_USER:$SVC_GROUP $DATA_DIR"
+  fi
+fi
+
+# 以服务用户的身份实际读一次配置。
+#
+# 光看权限位不够：目录可能是 0750 root:root（服务用户属于 other），
+# 也可能是 ACL 或挂载选项在挡。这类问题只会在 ExecStartPre 阶段
+# 炸成一句 "permission denied"，跟配置文件本身的权限毫无关系——
+# stat() 只需要路径上每一级目录的搜索位。
+# 安装时验一次，问题就停在安装这一步，而不是 systemd 的重启循环里。
+if [ "$DRY_RUN" -eq 0 ] && [ "$(id -u)" -eq 0 ]; then
+  if as_user "$SVC_USER" test -r "$CONF_DIR/config.json" 2>/dev/null; then
+    ok "服务用户 $SVC_USER 可读配置"
+  else
+    printf '\n' 
+    namei -l "$CONF_DIR/config.json" 2>/dev/null || ls -ld "$CONF_DIR" "$CONF_DIR/config.json"
+    die "服务用户 $SVC_USER 读不到 $CONF_DIR/config.json
+    注意：stat() 只需要路径上每一级目录的搜索位（x），不需要文件本身的读权限。
+    报 permission denied 时先看上面每一级目录的权限，而不是文件的。
+    修复：chown root:$SVC_GROUP $CONF_DIR && chmod 0750 $CONF_DIR"
+  fi
+fi
 
 # ---- systemd ----
 
