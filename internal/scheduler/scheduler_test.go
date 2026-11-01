@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -140,5 +141,64 @@ func TestApplyAcceptsValidCron(t *testing.T) {
 	}})
 	if err := s.Apply([]Plan{{Name: "job-log-prune", Schedule: "0 6 * * 1", Enabled: true}}); err != nil {
 		t.Fatalf("Apply: %v", err)
+	}
+}
+
+// cron 在自己的 goroutine 里跑任务，未恢复的 panic 会终止整个进程。
+// 调度器必须自己兜住，并且照样写 job_run 的终态——否则任务会永远
+// 停在 running，前端「系统 → 任务」里看不到任何结束时间。
+func TestPanicIsRecoveredAndRecorded(t *testing.T) {
+	s, db := newScheduler(t)
+	s.Register(Task{Name: "blob-gc", Run: func(ctx context.Context, p map[string]any) (string, error) {
+		panic("nil map write")
+	}})
+
+	// 关键断言：调用本身不能把进程带走。
+	_, err := s.RunByName(context.Background(), "blob-gc")
+	if err == nil {
+		t.Fatal("panic 应当以 error 形式返回")
+	}
+	if !strings.Contains(err.Error(), "panic") {
+		t.Errorf("err = %v, 应带 panic 字样", err)
+	}
+
+	runs, err := db.Job().Recent(context.Background(), 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(runs) != 1 {
+		t.Fatalf("job runs = %d, want 1", len(runs))
+	}
+	if runs[0].Status != "failed" {
+		t.Errorf("status = %q, want failed", runs[0].Status)
+	}
+	if runs[0].FinishedAt == nil {
+		t.Error("panic 后必须写 finished_at，否则任务永远显示为运行中")
+	}
+	if runs[0].Detail == "" {
+		t.Error("panic 信息应写进 detail")
+	}
+}
+
+// 一旦 panic 过，同一任务的下一次运行不能被上一次残留的 running 标记挡住。
+func TestPanicDoesNotBlockNextRun(t *testing.T) {
+	s, _ := newScheduler(t)
+	var calls atomic.Int32
+	s.Register(Task{Name: "media-retry", Run: func(ctx context.Context, p map[string]any) (string, error) {
+		if calls.Add(1) == 1 {
+			panic("first run explodes")
+		}
+		return "ok", nil
+	}})
+
+	if _, err := s.RunByName(context.Background(), "media-retry"); err == nil {
+		t.Fatal("首次应当 panic 成 error")
+	}
+	detail, err := s.RunByName(context.Background(), "media-retry")
+	if err != nil {
+		t.Fatalf("第二次运行失败: %v", err)
+	}
+	if detail != "ok" {
+		t.Errorf("detail = %q, want ok", detail)
 	}
 }

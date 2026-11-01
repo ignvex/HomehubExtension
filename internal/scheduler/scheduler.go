@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"runtime/debug"
 	"sync"
 	"time"
 
@@ -157,7 +158,11 @@ func (s *Scheduler) runOnce(task Task) {
 }
 
 // RunNow 同步执行一次任务并写 job_run。手动触发也走这条路径。
-func (s *Scheduler) RunNow(ctx context.Context, task Task) (string, error) {
+//
+// 任务的 panic 必须在这里挡住：cron 在自己的 goroutine 里跑任务，
+// 未恢复的 panic 会终止整个进程（cron/v3 默认不带 Recover chain）。
+// 同时无论正常还是 panic，job_run 都要落终态，否则任务永远显示为运行中。
+func (s *Scheduler) RunNow(ctx context.Context, task Task) (detail string, runErr error) {
 	started := time.Now()
 	runID, err := s.jobs.Start(ctx, task.Name, started.Unix())
 	if err != nil {
@@ -167,8 +172,33 @@ func (s *Scheduler) RunNow(ctx context.Context, task Task) (string, error) {
 	runCtx, cancel := context.WithTimeout(ctx, task.Timeout)
 	defer cancel()
 
-	detail, runErr := task.Run(runCtx, task.Params)
 	status := "ok"
+	defer func() {
+		if r := recover(); r != nil {
+			status = "failed"
+			msg := fmt.Sprintf("panic: %v", r)
+			s.log.Error("job panicked", "job", task.Name,
+				"panic", r, "stack", string(debug.Stack()))
+			if detail == "" {
+				detail = truncate(msg, 500)
+			} else {
+				detail = truncate(detail+" | "+msg, 500)
+			}
+			runErr = errors.New(msg)
+		}
+
+		finish := time.Now()
+		if err := s.jobs.Finish(ctx, runID, status, detail, finish.Unix()); err != nil {
+			s.log.Error("record job finish", "job", task.Name, "err", err)
+		}
+		s.log.Info("job finished", "job", task.Name, "status", status,
+			"took", finish.Sub(started).String(), "detail", detail)
+		if s.onFinish != nil {
+			s.onFinish(task.Name, status, detail)
+		}
+	}()
+
+	detail, runErr = task.Run(runCtx, task.Params)
 	if runErr != nil {
 		switch {
 		case errors.Is(runCtx.Err(), context.DeadlineExceeded):
@@ -183,16 +213,6 @@ func (s *Scheduler) RunNow(ctx context.Context, task Task) (string, error) {
 		} else {
 			detail = truncate(detail+" | "+runErr.Error(), 500)
 		}
-	}
-
-	finish := time.Now()
-	if err := s.jobs.Finish(ctx, runID, status, detail, finish.Unix()); err != nil {
-		s.log.Error("record job finish", "job", task.Name, "err", err)
-	}
-	s.log.Info("job finished", "job", task.Name, "status", status,
-		"took", finish.Sub(started).String(), "detail", detail)
-	if s.onFinish != nil {
-		s.onFinish(task.Name, status, detail)
 	}
 	return detail, runErr
 }
