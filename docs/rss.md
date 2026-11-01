@@ -43,7 +43,7 @@ ETag/304  统一模型  剥离脚本     解析 srcset   校验+哈希    失败
 GET <feed url> HTTP/1.1
 User-Agent: HomehubExtension/1.0 (+https://homehub.example.com)
 Accept: application/rss+xml, application/atom+xml, application/feed+json, application/xml;q=0.9, */*;q=0.5
-Accept-Encoding: gzip, br, zstd
+Accept-Encoding: gzip
 If-None-Match: <etag>
 If-Modified-Since: <last-modified>
 ```
@@ -53,7 +53,8 @@ If-Modified-Since: <last-modified>
 - 响应体：`io.LimitReader(max_feed_bytes + 1)`，超出即判失败，不截断解析（截断的 XML 会给出误导性错误）。
 - `304 Not Modified`：只更新 `next_fetch_at` 与 `last_status`，不碰条目。
 - 非 2xx：记录 `last_status` 与响应体前 512 字节（去掉控制字符），`error_count++`。
-- 压缩由 `net/http` 自动处理，但 `br`/`zstd` 需要显式注册解码器；首版只接受 `gzip`，减少依赖。
+- 压缩**交给 `net/http` 自动协商**：代码里不要自己设置 `Accept-Encoding`。Transport 只在自己加了这个头时才透明解压（`addedGzip`），手写 `gzip` 会拿到未解压的字节。只请求 `gzip`，不写 `br`/`zstd`——前者无需额外依赖，后者需要显式注册解码器。HTTP/1.1 与 HTTP/2 两条路径都是同样行为。
+- 服务端无视协商、回了未请求的编码（如 `br`）：标准库解完 gzip 会删掉 `Content-Encoding`，所以此时该头仍在就意味着 Body 是压缩字节。直接报 `unexpected content-encoding` 并终止，**不交给解析器**——否则错误会变成误导性的 `failed to detect feed type`。
 
 ### 2.2 退避
 
@@ -235,7 +236,7 @@ a[href] 且（有 download 属性 或 扩展名属于媒体/文档白名单）
 
 1. **URL 校验**：scheme 必须是 http/https，长度 ≤ 2048。
 2. **SSRF 检查**（第 7 节），每一跳重定向都检查。
-3. `GET`，带 `Referer`（按 `rss.referer` 配置）、与 feed 相同的 UA、`Accept-Encoding: identity`（避免解压炸弹）。
+3. `GET`，带 `Referer`（按 `rss.referer` 配置）、与 feed 相同的 UA、`Accept-Encoding: identity`（避免解压炸弹）。若响应仍带非 `identity` 的 `Content-Encoding`，在嗅探前判 `failed` 并记下编码名：压缩字节会让类型嗅探误判成 `unsupported`，把一个传输层问题伪装成类型问题。
 4. 先看 `Content-Length`：超过 `max_blob_bytes` 直接记 `too_large`，不读 body。
 5. 流式读 `io.LimitReader(max_blob_bytes+1)` 到 `tmp/<random>`，边读边算 sha256，同时累计配额。
 6. 读完后若长度超限，删除临时文件，记 `too_large`。
@@ -280,7 +281,7 @@ SVG 特殊处理：允许下载，因为 `<img>` 上下文里的 SVG 不执行�
 | `too_large` | 超单文件或配额 | 占位块，`<img>` 保留 `alt` |
 | `blocked` | SSRF 检查拒绝 | 直接移除该元素 |
 | `unsupported` | 类型不在白名单 | 直接移除该元素 |
-| `failed` | 网络错误、4xx/5xx | 占位块，由 `media-retry` 重试 |
+| `failed` | 网络错误、4xx/5xx、无视 `identity` 回了压缩体 | 占位块，由 `media-retry` 重试 |
 | `quota_exceeded` | 全局配额或磁盘不足 | 占位块，写 `system.alert` |
 
 占位块是一个内联 SVG data URI（灰色方块 + 图标），**不含原始 URL**。原 URL 只存在于 `media_fetch.source_url`，用于重试与排查；不渲染到页面，避免用户误点或前端脚本自动加载。

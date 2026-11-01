@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/netip"
 	"net/url"
+	"strings"
 	"sync"
 	"time"
 
@@ -256,6 +257,16 @@ func (d *Downloader) Download(ctx context.Context, rawURL, referer string, used 
 	}
 	if resp.ContentLength > d.cfg.MaxBytes {
 		res.Status, res.Error = "too_large", fmt.Sprintf("content-length %d", resp.ContentLength)
+		return res
+	}
+
+	// 请求时明确声明了 identity，但 CDN 仍可能无视它回压缩体。
+	// 此时下面嗅探到的是压缩字节，必然误判类型；而解压又要承担
+	// 解压炸弹风险（这正是 identity 的目的）。所以直接判失败，
+	// 并把编码名写进错误，让排查不必从 "unsupported" 猜起。
+	if enc := resp.Header.Get("Content-Encoding"); enc != "" && !strings.EqualFold(enc, "identity") {
+		res.Status = "failed"
+		res.Error = fmt.Sprintf("unexpected content-encoding %q (requested identity)", enc)
 		return res
 	}
 

@@ -1,6 +1,8 @@
 package rss
 
 import (
+	"bytes"
+	"compress/gzip"
 	"context"
 	"net/http"
 	"net/http/httptest"
@@ -233,5 +235,140 @@ func TestFetchDeduplicatesOnSecondRun(t *testing.T) {
 	unread, _ := db.Entry().UnreadCount(context.Background(), feed.ID)
 	if unread != 2 {
 		t.Errorf("未读数 = %d, want 2（重复抓取不该翻倍）", unread)
+	}
+}
+
+// 压缩协商必须交给 net/http。手动写 Accept-Encoding 会让 Transport 认为
+// 压缩是调用方自己要求的，从而跳过解压——gofeed 收到的是 gzip 二进制。
+// 若再在头里写上 br/zstd，CDN 还会选一个根本没有解码器的编码（dmhy 现象）。
+func TestFetchDecodesCompressedFeed(t *testing.T) {
+	dir := t.TempDir()
+	db, err := sqlite.Open(context.Background(), filepath.Join(dir, "f.db"), sqlite.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+
+	blobs, err := blob.Open(blob.Options{
+		Root:   filepath.Join(dir, "blobs"),
+		TmpDir: filepath.Join(dir, "blobs", "tmp"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var mu sync.Mutex
+	var acceptEncoding string
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		acceptEncoding = r.Header.Get("Accept-Encoding")
+		mu.Unlock()
+
+		body := strings.ReplaceAll(sampleFeed, "%BASE%", "http://"+r.Host)
+		var compressed bytes.Buffer
+		zw := gzip.NewWriter(&compressed)
+		if _, err := zw.Write([]byte(body)); err != nil {
+			t.Errorf("gzip write: %v", err)
+			return
+		}
+		if err := zw.Close(); err != nil {
+			t.Errorf("gzip close: %v", err)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/rss+xml")
+		w.Header().Set("Content-Encoding", "gzip")
+		_, _ = w.Write(compressed.Bytes())
+	}))
+	defer srv.Close()
+
+	svc := NewService(db, blobs, Config{
+		UserAgent: "test/1", RequestTimeout: 5 * time.Second,
+		FetchTimeout: 20 * time.Second, MaxFeedBytes: 1 << 20,
+		MaxEntryBytes: 1 << 20, DefaultInterval: 30 * time.Minute,
+		MinInterval: 10 * time.Minute, MaxInterval: 6 * time.Hour,
+		AllowPrivateHosts: true,
+	}, nil)
+
+	now := time.Now().Unix()
+	feed, _, err := db.Feed().Upsert(context.Background(), &store.Feed{
+		URL: srv.URL + "/feed.xml", Source: "hub", Enabled: true,
+		FetchInterval: 1800, CreatedAt: now,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	res, err := svc.Fetch(context.Background(), feed.ID)
+	if err != nil {
+		t.Fatalf("Fetch: %v（响应体未解压？）", err)
+	}
+	if res.NewEntries != 2 {
+		t.Errorf("new entries = %d, want 2", res.NewEntries)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if acceptEncoding != "gzip" {
+		t.Errorf("Accept-Encoding = %q, want gzip（标准库协商，且不含 br/zstd）", acceptEncoding)
+	}
+}
+
+// 服务端无视协商、发了没请求的编码时，错误必须指向编码本身。
+// 否则 gofeed 只会报 "failed to detect feed type"，把排查引向解析器，
+// 而真正的原因在传输层（dmhy 的 CDN 就是这样）。
+func TestFetchRejectsUnhandledContentEncoding(t *testing.T) {
+	dir := t.TempDir()
+	db, err := sqlite.Open(context.Background(), filepath.Join(dir, "f.db"), sqlite.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+
+	blobs, err := blob.Open(blob.Options{
+		Root:   filepath.Join(dir, "blobs"),
+		TmpDir: filepath.Join(dir, "blobs", "tmp"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/rss+xml")
+		w.Header().Set("Content-Encoding", "br")
+		_, _ = w.Write([]byte("\x1b\x02\x00\xa4not-really-brotli"))
+	}))
+	defer srv.Close()
+
+	svc := NewService(db, blobs, Config{
+		UserAgent: "test/1", RequestTimeout: 5 * time.Second,
+		FetchTimeout: 20 * time.Second, MaxFeedBytes: 1 << 20,
+		MaxEntryBytes: 1 << 20, DefaultInterval: 30 * time.Minute,
+		MinInterval: 10 * time.Minute, MaxInterval: 6 * time.Hour,
+		AllowPrivateHosts: true,
+	}, nil)
+
+	now := time.Now().Unix()
+	feed, _, err := db.Feed().Upsert(context.Background(), &store.Feed{
+		URL: srv.URL + "/feed.xml", Source: "hub", Enabled: true,
+		FetchInterval: 1800, CreatedAt: now,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = svc.Fetch(context.Background(), feed.ID)
+	if err == nil {
+		t.Fatal("未请求的 Content-Encoding 应当导致失败")
+	}
+	if !strings.Contains(err.Error(), "content-encoding") {
+		t.Errorf("错误应指明编码问题，got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "br") {
+		t.Errorf("错误应带出具体编码名，got: %v", err)
+	}
+	if strings.Contains(err.Error(), "failed to detect feed type") {
+		t.Errorf("错误指向了解析器而不是传输层，got: %v", err)
 	}
 }

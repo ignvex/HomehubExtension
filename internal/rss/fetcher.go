@@ -204,7 +204,10 @@ func (s *Service) fetchDocument(ctx context.Context, feed *store.Feed) (fetchedD
 		"application/xml;q=0.9",
 		"*/*;q=0.5",
 	}, ", "))
-	req.Header.Set("Accept-Encoding", "gzip")
+	// 不要自己设置 Accept-Encoding。net/http 只在自己发起压缩协商时
+	// 才透明解压（Transport 的 addedGzip 标记），手写这个头会让 resp.Body
+	// 停在压缩字节上，gofeed 拿到的是二进制。交给 Transport 协商：它只
+	// 请求 gzip，并且负责解压。
 	if feed.Etag != "" {
 		req.Header.Set("If-None-Match", feed.Etag)
 	}
@@ -243,6 +246,14 @@ func (s *Service) fetchDocument(ctx context.Context, feed *store.Feed) (fetchedD
 		// 保留响应体前 512 字节便于排查：403 常带一段说明。
 		preview, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
 		return doc, fmt.Errorf("http %d: %s", doc.Status, sanitizePreview(preview))
+	}
+
+	// 标准库解完 gzip 会把 Content-Encoding 删掉。走到这里还留着它，
+	// 说明服务端没按协商来（dmhy 的 CDN 会直接回 br）：此时 Body 是
+	// 压缩字节，交给 gofeed 只会得到误导性的 "failed to detect feed type"。
+	// 必须在读正文前拦住，否则报错指向解析器，而不是真正的原因。
+	if enc := resp.Header.Get("Content-Encoding"); enc != "" && !strings.EqualFold(enc, "identity") {
+		return doc, fmt.Errorf("unexpected content-encoding %q: server ignored Accept-Encoding negotiation", enc)
 	}
 
 	// 多读 1 字节用于判断是否超限。截断的 XML 会给出误导性错误，

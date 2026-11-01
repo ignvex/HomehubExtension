@@ -16,6 +16,17 @@
   `homehub-extension --help` 与 `config.example.json` 同步。
 - Dockerfile 镜像内路径同步为 `/usr/bin`、`/etc/hhe`、`/var/lib/hhe`。
 
+### 修复
+
+- **RSS 抓取把压缩字节当成正文**：请求头声明了 `gzip, br, zstd`，但只注册了 gzip 解码器；
+  且手写 `Accept-Encoding` 会让 `net/http` 认为压缩由调用方处理、跳过透明解压。
+  CDN 返回 Brotli 时（如 dmhy），`gofeed` 拿到二进制并报 `failed to detect feed type`。
+  改为交给标准库协商（只请求 gzip），并在服务端无视协商时返回明确的
+  `unexpected content-encoding` 错误，不再把排查引向解析器。
+- **媒体下载不再把编码问题误报成类型问题**：响应带非 `identity` 的 `Content-Encoding` 时，
+  在类型嗅探之前判 `failed` 并记下编码名——压缩字节会被嗅探成 `unsupported`，
+  掩盖真正的传输层原因。
+
 ## [1.0.0-alpha] - 2026-10-31
 
 首个对外版本。功能面覆盖路线图 M0–M9；OPML 导入导出（M10）尚未实现。
