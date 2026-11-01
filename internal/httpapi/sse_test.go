@@ -7,6 +7,7 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -168,4 +169,62 @@ func (h *harness) newSessionCookie(t *testing.T) string {
 	}
 	t.Fatal("登录响应里没有 hh_session cookie")
 	return ""
+}
+
+// 优雅关闭必须先断开 SSE：http.Server.Shutdown 不会取消在途请求的
+// context，长连接会一直把 Shutdown 拖到 15 秒超时。
+// app.shutdown 的做法是调用 Bus.Close()，这里验证那个机制真的能让
+// handler 立刻返回，而不是等客户端自己断开。
+func TestBusCloseEndsSSEStream(t *testing.T) {
+	h := newHarness(t)
+	session := h.newSessionCookie(t)
+
+	srv := httptest.NewServer(h.router)
+	defer srv.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
+		srv.URL+"/api/v1/events/stream", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Cookie", "hh_session="+session)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200（SSE 未建立，后续断言无意义）", resp.StatusCode)
+	}
+
+	reader := bufio.NewReader(resp.Body)
+	// 首帧是 ": connected"，读到它才说明流真的建立了。
+	line, err := reader.ReadString('\n')
+	if err != nil {
+		t.Fatalf("读首帧: %v", err)
+	}
+	if !strings.Contains(line, "connected") {
+		t.Fatalf("首帧 = %q, want 包含 connected", line)
+	}
+
+	// 这一步对应 app.shutdown 里的 a.bus.Close()。
+	h.bus.Close()
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := io.Copy(io.Discard, reader)
+		done <- err
+	}()
+
+	select {
+	case <-done:
+		// EOF：handler 收到关闭的通道并返回了。
+	case <-time.After(2 * time.Second):
+		t.Fatal("Bus.Close 后 SSE 流未结束，关闭会被拖到 Shutdown 超时")
+	}
 }

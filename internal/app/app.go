@@ -403,6 +403,13 @@ func (a *App) shutdown() {
 		a.sched.Stop(10 * time.Second)
 	}
 
+	// 主动断开 SSE：http.Server.Shutdown 不会取消在途请求的 context，
+	// 不先关掉订阅通道，长连接会一直把 Shutdown 拖到 15 秒超时。
+	// 放在 Shutdown 之前，顺序不能反。
+	if a.bus != nil {
+		a.bus.Close()
+	}
+
 	if a.server != nil {
 		// 给在途请求 15 秒；SSE 连接由客户端断开或进程退出终止。
 		sctx, scancel := context.WithTimeout(ctx, 15*time.Second)
