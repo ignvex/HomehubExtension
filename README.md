@@ -265,6 +265,23 @@ curl -X POST https://homehub.example.com/api/v1/hub/keys \
 
 ## 部署
 
+`make build` 会把二进制、安装脚本、systemd 单元与配置模板汇总到 `dist/`。
+整个目录拷到服务器后，一条命令完成安装：
+
+```bash
+make build                      # 产出 dist/（不入库）
+scp -r dist user@host:/tmp/hhe  # 整个目录拷过去
+
+# 服务器上
+cd /tmp/hhe && sudo ./install.sh
+```
+
+脚本会把二进制装到 `/usr/bin`、建 `/etc/hhe` 放配置、装 systemd 单元，
+然后**询问是否开机自启、是否立即启动**。已有 `/etc/hhe/config.json` 会原样保留，
+所以重复执行等于升级。`--yes` 全部取默认值（是），`--dry-run` 只打印动作。
+
+目录布局：
+
 ```text
 /usr/bin/homehub-extension               二进制（dist/ 构建后拷入）
 /usr/bin/homehub-backup.sh                备份脚本（deploy/backup.sh）

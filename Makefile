@@ -18,11 +18,20 @@ dev-api: ## 后端开发服务器
 dev-web: ## 前端开发服务器（Vite，代理到 8080）
 	pnpm --dir web dev
 
-build: web ## 交叉编译 linux/amd64 单二进制
+build: web ## 交叉编译 linux/amd64 单二进制，并汇总分发包到 dist/
 	# -a 强制重建：go:embed 的目录变化在 9p / 网络文件系统上
 	# 可能检测不到 mtime 变化，导致二进制里嵌的是旧前端。
 	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -a -trimpath -ldflags "$(LDFLAGS)" -o $(BINARY) .
-	@ls -lh $(BINARY)
+	@echo "== 汇总分发包 =="
+	@# dist/ 是一个可整体拷到服务器的自包含目录：二进制 + 安装脚本
+	@# + 它需要的单元与配置模板。脚本不内嵌这些内容，避免与 deploy/
+	@# 下的唯一来源漂移。
+	@install -m 0755 scripts/install.sh dist/install.sh
+	@install -m 0755 deploy/backup.sh dist/backup.sh
+	@install -m 0644 deploy/hhe.service deploy/hhe-backup.service \
+	  deploy/hhe-backup.timer dist/
+	@install -m 0644 config.example.json dist/config.example.json
+	@ls -lh dist/
 
 web: ## 构建前端
 	pnpm --dir web install --frozen-lockfile
