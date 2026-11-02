@@ -142,12 +142,27 @@ func (s *Store) place(tmpName, sum string, ext string, written int64, opt PutOpt
 	unlock := s.lockQuota(opt.Quota)
 	defer unlock()
 
+	// 去重检查必须排在配额检查之前。
+	//
+	// 内容已在库里意味着这次写入不占任何新空间（数据库的 SUM(size)
+	// 也只算一份）。若先查配额，接近上限时同一张被多篇文章引用的
+	// 图片会被判成 quota_exceeded —— 一个纯粹由检查顺序制造的失败，
+	// 而用户在界面上看到的是「图片加载失败」。
+	dest := s.Path(sum, ext)
+	if _, err := os.Stat(dest); err == nil {
+		os.Remove(tmpName)
+		return &Result{SHA256: sum, Size: written, Path: dest, Existed: true}, nil
+	}
+
+	// 这里读 opt.Quota.total 而不是调 Quota.Used()：
+	// 上面的 lockQuota 已经持有 q.mu，而 sync.Mutex 不可重入，
+	// 再进 Used() 会直接死锁（测试表现为整个包超时）。
 	used := opt.Used
 	if opt.Quota != nil {
 		used = opt.Quota.total
 	}
 
-	// 写完再检查一次真实大小：Content-Length 可能撒谎或缺失。
+	// 到这里才确定要新增 written 字节。
 	if s.quota > 0 && used+written > s.quota {
 		os.Remove(tmpName)
 		return nil, ErrQuotaExceeded
@@ -157,11 +172,6 @@ func (s *Store) place(tmpName, sum string, ext string, written int64, opt PutOpt
 		return nil, err
 	}
 
-	dest := s.Path(sum, ext)
-	if _, err := os.Stat(dest); err == nil {
-		os.Remove(tmpName)
-		return &Result{SHA256: sum, Size: written, Path: dest, Existed: true}, nil
-	}
 	if err := os.MkdirAll(filepath.Dir(dest), 0o750); err != nil {
 		os.Remove(tmpName)
 		return nil, err

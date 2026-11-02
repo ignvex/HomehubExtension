@@ -127,3 +127,55 @@ func TestQuotaTrackerNilSafe(t *testing.T) {
 		t.Errorf("nil tracker Used() = %d, want 0", got)
 	}
 }
+
+// 去重命中不能因为「接近配额」被拒。
+//
+// 配额检查一度排在去重检查之前：一张被多篇文章引用的图片，
+// 在存储接近上限时会被判成 quota_exceeded，而实际上它一个字节
+// 都不需要新写。用户看到的是「图片加载失败」，排查会指向网络。
+func TestPutDedupHitIgnoresQuota(t *testing.T) {
+	const size = 100
+	// 配额刚好放得下一份。
+	s := newStore(t, Options{Quota: size})
+	ctx := context.Background()
+
+	body := bytes.Repeat([]byte("d"), size)
+
+	first, err := s.Put(ctx, bytes.NewReader(body), PutOptions{Ext: "bin"})
+	if err != nil {
+		t.Fatalf("首次写入: %v", err)
+	}
+	if first.Existed {
+		t.Fatal("首次写入不应命中 Existed")
+	}
+
+	// 此时用量已经等于配额。再写同一份内容不占新空间，必须成功。
+	second, err := s.Put(ctx, bytes.NewReader(body), PutOptions{Ext: "bin"})
+	if err != nil {
+		t.Fatalf("去重命中被判失败: %v（配额检查排在了去重检查之前）", err)
+	}
+	if !second.Existed {
+		t.Error("相同内容应返回 Existed=true")
+	}
+	if second.SHA256 != first.SHA256 {
+		t.Errorf("sha 不一致: %s vs %s", first.SHA256, second.SHA256)
+	}
+}
+
+// 真正新增的内容仍然要被配额挡住：修去重顺序不能把配额一起关掉。
+func TestPutNewContentStillRespectsQuota(t *testing.T) {
+	const size = 100
+	s := newStore(t, Options{Quota: size})
+	ctx := context.Background()
+
+	if _, err := s.Put(ctx, bytes.NewReader(bytes.Repeat([]byte("a"), size)), PutOptions{Ext: "bin"}); err != nil {
+		t.Fatal(err)
+	}
+
+	// 不带 tracker 时 Used 是调用方给的快照：第一份已占满配额。
+	_, err := s.Put(ctx, bytes.NewReader(bytes.Repeat([]byte("b"), size)),
+		PutOptions{Ext: "bin", Used: size})
+	if !errors.Is(err, ErrQuotaExceeded) {
+		t.Fatalf("err = %v, want ErrQuotaExceeded", err)
+	}
+}
