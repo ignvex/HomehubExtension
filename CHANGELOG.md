@@ -56,6 +56,24 @@
 - **gosec 安全门禁**：CI 新增 `make sec`，severity ≥ medium 必须清零。
   既有 8 处告警逐个审查后在行内用 `#nosec Gxxx -- 理由` 标注；
   只排除 G104（清理操作的未处理错误）。
+- **依赖与工具链升级**：`govulncheck` 报出 14 个可达漏洞，
+  其中两个命中清洗路径（`html.Render` 的命名空间检查、文本合并的
+  二次复杂度）。`x/net` → v0.62.0、`quic-go` → v0.59.1、
+  Go 指令 → 1.27.3。复查为 0 个可达漏洞。
+- **SSRF：拆开 IPv6 内嵌的 IPv4**：NAT64（`64:ff9b::/96`）、6to4
+  （`2002::/16`）、IPv4-compatible（`::/96`）在 IPv6 表面看是公网
+  地址，实际可路由到内网。`http://[64:ff9b::a9fe:a9fe]/` 曾能直通
+  云元数据。Teredo 整段封禁。
+- **请求体上限下沉到读取层**：原先只看 `Content-Length`，chunked
+  编码下该值为 -1，检查被绕过。实测 1 MiB 上限下 20 MiB 的 body
+  被完整读入。现用 `http.MaxBytesReader` 封顶。
+- **登出 cookie 的 Secure 属性**：反代部署下（TLS 在 Caddy 终止）
+  登出下发的是不带 Secure 的同名 cookie，浏览器拒绝用它覆盖已存在
+  的 Secure cookie，refresh token 会留在浏览器里。
+- **paste 归属检查 fail-closed**：迁移前的历史片段 `owner_hash` 为空，
+  私有片段曾对匿名开放（两边都空被判为匹配），且任何人知道 slug
+  就能改写或删除。现在要求归属非空且匹配。
+- **blob 路径加固**：`Store.Path` 自己对扩展名消毒，不再依赖调用方。
 
 ### 修复
 
