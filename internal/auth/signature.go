@@ -95,7 +95,9 @@ func RequestMessage(r *http.Request, body []byte) string {
 	}
 	return strings.Join([]string{
 		reqDomain,
-		r.Method,
+		// 方法一律大写参与签名。宿主侧是 strings.ToUpper(method)，
+		// 直接签 r.Method 会让非标准客户端算出不同的待签消息。
+		strings.ToUpper(r.Method),
 		path,
 		r.URL.RawQuery,
 		hex.EncodeToString(sum[:]),

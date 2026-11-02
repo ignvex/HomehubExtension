@@ -89,6 +89,10 @@
 
 ### 修复
 
+- **签名校验未规范化 HTTP 方法**：`RequestMessage` 直接签 `r.Method`，而宿主侧
+  是 `strings.ToUpper(method)`。Go 的 `http` 包总发大写所以现在不会触发，
+  但换一个客户端库就会让两侧算出不同的待签消息，表现为极难定位的 401。
+  现在两侧统一按大写签名。
 - **statfs 溢出让大容量卷不可写**：`int64(blocks) * int64(bsize)`
   在极端值下溢出成负数，`checkSpace` 因此把卷误判成空间不足。
   改为饱和转换，非正值取 0、超上限取 `MaxInt64`。
