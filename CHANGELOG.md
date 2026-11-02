@@ -25,6 +25,11 @@
 
 ### 新增
 
+- **`dist/hhe.sh`：脚本 + 自备二进制**：`make build` 现在顺带产出一个约
+  46 KB 的自包含脚本，systemd 单元、配置模板与备份脚本都内嵌在里面。
+  运行目录里只放一个 `homehub-extension` 即可，换平台只换二进制。
+  安装前会验 ELF 类型与架构，架不匹配在本机跑不起来时直接停下，
+  不会装到 `/usr/bin` 之后才在 systemd 里报 `Exec format error`。
 - **一体化运维脚本与单文件安装包**：`scripts/install.sh` 改为子命令式，
   覆盖 `install` / `update`（含自动备份与失败回滚）/ `update --rollback` /
   `uninstall [--purge]` / `restart` / `status` / `logs` / `doctor` /

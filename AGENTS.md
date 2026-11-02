@@ -38,8 +38,9 @@ web/src/             前端 SPA
 ## 常用命令
 
 ```bash
-make build     # 交叉编译 linux/amd64 单二进制，前端 embed 进去
-make bundle    # 再打一步：dist/hhe-installer-<ver>-linux-amd64.run（单文件自解压）
+make build      # 交叉编译 linux/amd64 单二进制，前端 embed 进去；顺带产出 dist/hhe.sh
+make bundle     # dist/hhe-installer-<ver>-linux-amd64.run（连二进制一起打包）
+make standalone # 只重新生成 dist/hhe.sh（内嵌 unit 与配置模板，二进制自备）
 make test      # go test ./...
 make race      # 并发相关用例
 make vet       # go vet + 前端 tsc

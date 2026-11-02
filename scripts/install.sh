@@ -1,28 +1,35 @@
 #!/usr/bin/env bash
 # HomehubExtension 一体化运维脚本
 #
-# 安装包目录里执行（或直接运行单文件 .run）：
-#   sudo ./install.sh install            全新安装（默认子命令）
-#   sudo ./install.sh update             更新安装：保留配置与数据
-#   sudo ./install.sh update --rollback  回滚到上一个二进制
-#   sudo ./install.sh uninstall          卸载，保留配置与数据
-#   sudo ./install.sh uninstall --purge  连配置、数据与运行用户一起删
-#   sudo ./install.sh restart            重启服务
-#   sudo ./install.sh start|stop|status|logs|enable|disable
-#   sudo ./install.sh key import         导入宿主公钥（PEM 或单行 base64）
-#   sudo ./install.sh key show           查看已配置公钥的指纹
-#        ./install.sh key normalize      只校验并规范化一段公钥，不改系统
-#   sudo ./install.sh doctor             一次自检：版本、服务、配置、公钥、健康
-#        ./install.sh version            打印已安装版本
+# 两种用法，行为一致：
+#   目录模式  把脚本与 homehub-extension 放同一目录（或解包后的 dist/）
+#   单文件    直接运行 dist/hhe.sh；它已内嵌 unit 与配置模板，
+#             只需要你把自己平台的 homehub-extension 放同一目录
+#
+#   sudo ./hhe.sh install              全新安装（默认子命令）
+#   sudo ./hhe.sh update               更新安装：保留配置与数据
+#   sudo ./hhe.sh update --rollback    回滚到上一个二进制
+#   sudo ./hhe.sh uninstall            卸载，保留配置与数据
+#   sudo ./hhe.sh uninstall --purge    连配置、数据与运行用户一起删
+#   sudo ./hhe.sh restart              重启服务
+#   sudo ./hhe.sh start|stop|status|logs|enable|disable
+#   sudo ./hhe.sh key import           导入宿主公钥（PEM 或单行 base64）
+#   sudo ./hhe.sh key show             查看已配置公钥的指纹
+#        ./hhe.sh key normalize        只校验并规范化一段公钥，不改系统
+#   sudo ./hhe.sh doctor               一次自检：版本、服务、配置、公钥、健康
+#        ./hhe.sh version              打印已安装版本
 #
 # 安装后脚本自身会装到 /usr/bin/hhe，之后上面的维护命令都可以直接写
 #   sudo hhe update
 #   sudo hhe key import --file homehub.pub
 #
-# 目录模式需要同目录存在：
-#   homehub-extension、hhe.service、config.example.json（必需）
-#   backup.sh、hhe-backup.service、hhe-backup.timer（可选，一起装才启用备份）
-# 单文件 .run 模式已把这些内容打包在尾部，不需要额外文件。
+# 同目录需要的文件：
+#   homehub-extension   必需，是你自己平台的构建产物（amd64 或 arm64）
+#   hhe.service、config.example.json  目录模式下必需；dist/hhe.sh 已内嵌
+#   backup.sh、hhe-backup.*           可选；dist/hhe.sh 已内嵌
+#
+# 脚本会先验二进制：不是 ELF、或在本机跑不起来（架构不匹配）时直接停下，
+# 不会装到 /usr/bin 之后才发现 Exec format error。
 #
 # 通用选项：
 #   -y, --yes       全部按默认值回答，不交互
@@ -150,29 +157,58 @@ is_installed() { [ -x "$BIN_DIR/$BIN_NAME" ] && [ -f "$UNIT_DIR/$SVC_NAME.servic
 
 # ---- 单文件包自解压 ----
 
-# 目录模式下直接返回；.run 模式下把尾部负载解到临时目录，
+# 目录模式下直接返回；单文件（.sh / .run）模式下把尾部负载解到临时目录，
 # 再用解出来的干净副本重新执行同一批参数。
+#
+# 负载里可以没有二进制：dist/hhe.sh 只内嵌 unit 与配置模板，二进制由
+# 使用者放在脚本旁边。那种形态下把它一并收进负载目录，让后续步骤
+# 只从一个地方取文件。
 maybe_unpack_payload() {
   [ -n "${HHE_PAYLOAD_DIR:-}" ] && return 0
 
-  local marker_line tmp status
-  marker_line=$(grep -a -m1 -n -- "$PAYLOAD_MARKER" "$0" 2>/dev/null | cut -d: -f1 || true)
+  local marker_line tmp status orig_dir src pkg
+  src=$0
+  marker_line=$(grep -a -m1 -n -- "$PAYLOAD_MARKER" "$src" 2>/dev/null | cut -d: -f1 || true)
+
+  # /usr/bin/hhe 自己不带负载。使用者手边通常留着安装时那个 hhe.sh，
+  # 并且就在当前目录里跑 `sudo hhe update`——找一下它，省得记路径。
+  if [ -z "$marker_line" ] && [ -f "$PWD/hhe.sh" ] && [ "$PWD/hhe.sh" != "$src" ]; then
+    if pkg=$(grep -a -m1 -n -- "$PAYLOAD_MARKER" "$PWD/hhe.sh" 2>/dev/null | cut -d: -f1); then
+      if [ -n "$pkg" ]; then
+        src=$PWD/hhe.sh
+        marker_line=$pkg
+      fi
+    fi
+  fi
   [ -n "$marker_line" ] || return 0
+
+  # 二进制放在脚本旁边。要在切到临时目录之前记下来。
+  orig_dir=$(cd -- "$(dirname -- "$src")" && pwd)
 
   tmp=$(mktemp -d)
   chmod 0700 "$tmp"
   mkdir -p "$tmp/payload"
-  tail -n +"$((marker_line + 1))" "$0" > "$tmp/payload.tar.gz"
+  tail -n +"$((marker_line + 1))" "$src" > "$tmp/payload.tar.gz"
   tar xzf "$tmp/payload.tar.gz" -C "$tmp/payload" || {
     rm -rf "$tmp"
     die "单文件包的负载解压失败（文件可能不完整，请重新下载）"
   }
+
+  # 负载里没有二进制时，从脚本旁边取。两种形态都支持：
+  #   .run —— 负载自带二进制，旁边不需要任何文件
+  #   .sh  —— 只内嵌 unit/配置，二进制由使用者放同一目录
+  if [ ! -f "$tmp/payload/$BIN_NAME" ] && [ -f "$orig_dir/$BIN_NAME" ]; then
+    cp "$orig_dir/$BIN_NAME" "$tmp/payload/$BIN_NAME"
+    chmod 0755 "$tmp/payload/$BIN_NAME"
+  fi
+
   # 干净副本：只保留标记之前的脚本正文，不含二进制负载。
-  sed -n "1,$((marker_line - 1))p" "$0" > "$tmp/install.sh"
+  sed -n "1,$((marker_line - 1))p" "$src" > "$tmp/install.sh"
   chmod 0700 "$tmp/install.sh"
 
   export HHE_PAYLOAD_DIR="$tmp/payload"
   export HHE_SELF_SCRIPT="$tmp/install.sh"
+  export HHE_ORIG_DIR="$orig_dir"
 
   set +e
   bash "$tmp/install.sh" "${ORIG_ARGS[@]}"
@@ -396,10 +432,59 @@ check_legacy_key_field() {
 
 ensure_payload() {
   [ -f "$SRC_DIR/$BIN_NAME" ] || die "找不到 $BIN_NAME
-    目录模式：把二进制与脚本放在同一目录，或先跑 make build 生成 dist/
-    单文件模式：重新下载完整的 .run（当前文件缺少负载）"
-  [ -f "$SRC_DIR/$SVC_NAME.service" ] || die "找不到 $SVC_NAME.service（systemd 单元）"
-  [ -f "$SRC_DIR/config.example.json" ] || die "找不到 config.example.json（配置模板）"
+    把你自己平台的 $BIN_NAME 放在脚本旁边（同一个目录）
+    查找过的位置：
+      ${HHE_ORIG_DIR:-$SRC_DIR}/$BIN_NAME
+      $SRC_DIR/$BIN_NAME"
+  [ -f "$SRC_DIR/$SVC_NAME.service" ] || die "找不到 $SVC_NAME.service（systemd 单元）
+    $SRC_DIR 不是安装包目录（里面只有二进制是不够的）
+    三种都能用：
+      sudo bash /path/to/hhe.sh install          单文件脚本，已内嵌 unit 与配置模板
+      cd /path/to/dist && sudo ./install.sh install
+      sudo hhe update --from /path/to/dist"
+  [ -f "$SRC_DIR/config.example.json" ] || die "找不到 config.example.json（配置模板）
+    同上：用 dist/hhe.sh 或解包后的完整 dist/，那里才有配置模板"
+}
+
+# 验一眼二进制：是不是 ELF、什么架构、能不能在本机跑。
+#
+# 这里不硬性要求 x86-64（Go 也能产出 arm64 的合法构建），但拷错文件
+# ——比如把 .run、压缩包或者 Windows 的 .exe 放进来——必须在装之前
+# 就停下来。装到 /usr/bin 之后才发现「Exec format error」意味着服务
+# 已经处于 restart 循环里，排查要绕一圈。
+check_binary() {
+  local bin="$SRC_DIR/$BIN_NAME" magic machine arch ver
+  [ -f "$bin" ] || return 0
+
+  magic=$(od -An -tx1 -N4 "$bin" 2>/dev/null | tr -d ' \n')
+  if [ "$magic" != "7f454c46" ]; then
+    die "$BIN_NAME 不是 ELF 可执行文件（前 4 字节：$magic）
+    常见原因：放进去的是下载页、压缩包，或者 Windows/macOS 的构建产物
+    需要的是 linux 平台的二进制"
+  fi
+
+  # e_machine 在 ELF 头偏移 18，小端 2 字节。
+  machine=$(od -An -tx1 -j18 -N2 "$bin" 2>/dev/null | tr -d ' \n')
+  case "$machine" in
+    3e00) arch=x86-64 ;;
+    b700) arch=aarch64 ;;
+    0300) arch=i386 ;;
+    *)    arch="未知($machine)" ;;
+  esac
+  ok "ELF / $arch"
+
+  if [ "$OPT_DRY" -eq 1 ]; then
+    return 0
+  fi
+  if ! [ -x "$bin" ]; then
+    chmod 0755 "$bin" 2>/dev/null || true
+  fi
+  if ! ver=$("$bin" version 2>/dev/null); then
+    die "$BIN_NAME 无法在本机执行
+    架构是 $arch，与当前主机（$(uname -m)）不匹配，或者文件已损坏
+    用对应的构建产物：GOARCH=amd64 或 GOARCH=arm64"
+  fi
+  ok "版本：$ver"
 }
 
 detect_backup_bundle() {
@@ -512,11 +597,7 @@ cmd_install() {
   ok "root 权限"
   ok "systemd 可用"
   ok "$BIN_NAME 存在（$SRC_DIR）"
-  if [ "$OPT_DRY" -eq 0 ] && [ -x "$SRC_DIR/$BIN_NAME" ]; then
-    local ver
-    ver=$("$SRC_DIR/$BIN_NAME" version 2>/dev/null || true)
-    [ -n "$ver" ] && ok "版本：$ver"
-  fi
+  check_binary
 
   step "准备运行用户"
   prepare_user
@@ -655,19 +736,26 @@ cmd_update() {
 
   SRC_DIR=$(resolve_src_dir)
   if [ ! -f "$SRC_DIR/$BIN_NAME" ]; then
-    die "找不到安装包
-    已安装的 hhe 自己不带新版本，更新时要提供安装件：
-      sudo bash /path/to/hhe-installer-<ver>-linux-amd64.run install
-    或先把新版 dist/ 放到某个目录，再指定：
-      sudo hhe update --from /path/to/dist"
+    die "找不到 $BIN_NAME
+    已安装的 hhe 自己不带新版本。更新时把新版二进制放到脚本旁边，
+    或者直接重跑安装包：
+      sudo bash /path/to/hhe.sh install
+    也可以指定一个目录：
+      sudo hhe update --from /path/to/dist
+    当前查找目录：$SRC_DIR"
   fi
   ensure_payload
   detect_backup_bundle
 
   step "检查更新包"
   local new_ver old_ver
-  old_ver=$("$BIN_DIR/$BIN_NAME" version 2>/dev/null || echo unknown)
-  new_ver=$("$SRC_DIR/$BIN_NAME" version 2>/dev/null || echo unknown)
+  # version 的输出是 "homehub-extension vX (commit …, built …)"，
+  # 取第二列当版本名，别把整行塞进「旧 → 新」里。
+  old_ver=$("$BIN_DIR/$BIN_NAME" version 2>/dev/null | awk '{print $2}')
+  old_ver=${old_ver:-unknown}
+  check_binary
+  new_ver=$("$SRC_DIR/$BIN_NAME" version 2>/dev/null | awk '{print $2}')
+  new_ver=${new_ver:-unknown}
   ok "当前：$old_ver"
   ok "目标：$new_ver"
 
@@ -851,9 +939,12 @@ key_import() {
   # 用服务自己的迁移入口做一次加载校验：它走的就是 ExecStartPre 那条路径，
   # 能通过就意味着服务能读到这份配置。失败则立刻回滚，不把坏配置留给重启。
   if [ "$OPT_DRY" -eq 0 ] && [ -x "$BIN_DIR/$BIN_NAME" ]; then
-    if ! as_user "$SVC_USER" "$BIN_DIR/$BIN_NAME" migrate -config "$CONF_FILE" >/dev/null 2>&1; then
+    if ! verify_out=$(as_user "$SVC_USER" "$BIN_DIR/$BIN_NAME" migrate -config "$CONF_FILE" 2>&1); then
       warn "新配置未通过加载校验，回滚"
-      install -m 0640 -o root -g "$(svc_group)" "$backup" "$CONF_FILE"
+      # 把最后几行原样打出来：失败可能是公钥、也可能是数据库路径，
+      # 只说「校验失败」会让人去改已经正确的公钥。
+      printf '    %s\n' "$(printf '%s\n' "$verify_out" | tail -n 3)"
+      run install -m 0640 -o root -g "$(svc_group)" "$backup" "$CONF_FILE"
       die "公钥写入失败，已恢复原配置。用 hhe key normalize 先验证内容"
     fi
     ok "配置加载校验通过"

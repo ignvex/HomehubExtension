@@ -265,26 +265,36 @@ curl -X POST https://homehub.example.com/api/v1/hub/keys \
 
 ## 部署
 
-两种产物，选一种：
+`make build` 之后，`dist/` 里最省事的是 `hhe.sh`：
 
 ```bash
-make bundle     # 单个自解压脚本：dist/hhe-installer-<ver>-linux-amd64.run
-make build      # 目录形式：dist/（二进制 + 单元 + 配置模板 + 脚本）
+make build                      # 产出 dist/homehub-extension 与 dist/hhe.sh
+
+scp dist/hhe.sh dist/homehub-extension user@host:/tmp/hhe/
+ssh user@host 'cd /tmp/hhe && sudo ./hhe.sh install'
 ```
 
-单文件包拷过去就能装，不需要其他文件：
+`hhe.sh` 把 systemd 单元、配置模板、备份脚本都内嵌在自己里面（约 46 KB），
+运行目录里**只需要一个 `homehub-extension`**。换平台就换那个二进制，
+脚本本身不用动：
 
 ```bash
-scp dist/hhe-installer-*.run user@host:/tmp/
-ssh user@host 'sudo bash /tmp/hhe-installer-*.run install'
+CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -o dist/homehub-extension .
 ```
 
-目录形式适合想先看一眼内容再装：
+装之前会先验二进制：不是 ELF、或者架构与本机不符（比如把 arm64 装到
+x86-64 上），会在写 `/usr/bin` 之前就停下来，而不是等 systemd 报
+`Exec format error`。
+
+另外两种产物，按需使用：
 
 ```bash
-scp -r dist user@host:/tmp/hhe
-ssh user@host 'cd /tmp/hhe && sudo ./install.sh install'
+make bundle    # dist/hhe-installer-<ver>-linux-amd64.run，连二进制一起打包（11 MB）
+make build     # dist/ 目录形式：二进制 + 单元 + 配置模板 + 脚本
 ```
+
+`.run` 适合发给没有现成二进制的人；目录形式适合想先翻一遍内容再装
+（`cd dist && sudo ./install.sh install`）。
 
 安装后脚本自身装到 `/usr/bin/hhe`，之后的维护都走它：
 
