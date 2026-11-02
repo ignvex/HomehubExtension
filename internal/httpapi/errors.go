@@ -95,6 +95,15 @@ func failWith(c *gin.Context, status int, code, msg string, details ...FieldErro
 // bindJSON 统一处理绑定错误。
 func bindJSON(c *gin.Context, dst any) bool {
 	if err := c.ShouldBindJSON(dst); err != nil {
+		// 超限要报 413 而不是 400：前者是「太大了」，后者是「格式错了」，
+		// 客户端据此决定「改小重发」还是「修格式」。
+		// MaxBytesReader 只在 chunked 或声明长度不为 0 时才会真正生效，
+		// 但两种路径的错误都包成 *http.MaxBytesError。
+		var mbe *http.MaxBytesError
+		if errors.As(err, &mbe) {
+			failWith(c, http.StatusRequestEntityTooLarge, "payload_too_large", "请求体过大")
+			return false
+		}
 		failWith(c, http.StatusBadRequest, "invalid_request", "请求体格式不正确",
 			FieldError{Field: "body", Reason: cleanBindError(err)})
 		return false

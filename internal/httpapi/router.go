@@ -3,6 +3,7 @@ package httpapi
 import (
 	"io/fs"
 	"log/slog"
+	"net/http"
 	"time"
 
 	"github.com/ignvex/HomehubExtension/internal/auth"
@@ -75,10 +76,22 @@ func NewRouter(d Deps) *gin.Engine {
 	r.Use(SecurityHeaders(d.DevMode))
 	r.Use(func(c *gin.Context) {
 		c.Header("X-Content-Type-Options", "nosniff")
-		if c.Request.ContentLength > d.Cfg.Server.MaxBodyBytes && d.Cfg.Server.MaxBodyBytes > 0 {
-			failWith(c, 413, "payload_too_large", "请求体过大")
+		if d.Cfg.Server.MaxBodyBytes <= 0 {
+			c.Next()
 			return
 		}
+		// Content-Length 的快速拒绝只对声明了长度的请求有效。
+		// chunked 编码下 ContentLength 是 -1，这个判断会被整段绕过，
+		// 而 bindJSON 会把 body 全部读进内存——一个不声明长度的
+		// 大请求就能把 512M 的进程撞上 OOM。
+		//
+		// MaxBytesReader 在读取层面封顶：超出时返回 *http.MaxBytesError，
+		// 不管客户端用不用 chunked。
+		if c.Request.ContentLength > d.Cfg.Server.MaxBodyBytes {
+			failWith(c, http.StatusRequestEntityTooLarge, "payload_too_large", "请求体过大")
+			return
+		}
+		c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, d.Cfg.Server.MaxBodyBytes)
 		c.Next()
 	})
 
