@@ -109,7 +109,7 @@ func AccessLog(log *slog.Logger, enabled bool) gin.HandlerFunc {
 		c.Next()
 		l.Info("http",
 			"method", c.Request.Method,
-			"path", c.Request.URL.Path,
+			"path", loggedPath(c),
 			"status", c.Writer.Status(),
 			"bytes", c.Writer.Size(),
 			"took_ms", time.Since(start).Milliseconds(),
@@ -118,13 +118,21 @@ func AccessLog(log *slog.Logger, enabled bool) gin.HandlerFunc {
 	}
 }
 
+// loggedPath 返回可以进日志的路径。
+//
+// 头像路由里的 hash 是邮箱的 MD5，与来源 IP 写在同一行就是可关联信息。
+// 但不能为了这个把整条路由从日志里删掉——那样未签名的探测就完全不可见了。
+// 换成路由模版：能看出「有人在打这个端点」，看不出是谁的头像。
+func loggedPath(c *gin.Context) string {
+	if c.FullPath() == "/api/v1/avatar/:hash" {
+		return "/api/v1/avatar/{hash}"
+	}
+	return c.Request.URL.Path
+}
+
 func skipLog(route string) bool {
 	switch route {
 	case "/healthz", "/readyz", "/media/:name":
-		return true
-	case "/api/v1/avatar/:hash":
-		// 路径里的 hash 是邮箱的 MD5。它和来源 IP 出现在同一行日志里
-		// 就是可关联信息，而宿主只是来取一张图，不需要这种审计轨迹。
 		return true
 	}
 	return strings.HasPrefix(route, "/_app/")
@@ -136,7 +144,7 @@ func Recovery(log *slog.Logger) gin.HandlerFunc {
 		defer func() {
 			if r := recover(); r != nil {
 				log.Error("panic", "request_id", requestID(c), "panic", r,
-					"path", c.Request.URL.Path)
+					"path", loggedPath(c))
 				failWith(c, http.StatusInternalServerError, "internal", "服务器内部错误")
 			}
 		}()

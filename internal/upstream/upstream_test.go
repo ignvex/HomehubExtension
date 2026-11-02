@@ -3,6 +3,7 @@ package upstream
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -119,6 +120,36 @@ func TestFetchFeedBlocksSSRFTargets(t *testing.T) {
 		if _, err := c.FetchFeed(context.Background(), raw); !errors.Is(err, ErrBlockedHost) {
 			t.Errorf("%s: err = %v, want ErrBlockedHost", raw, err)
 		}
+	}
+}
+
+// 字面 IP 在预检就拦住了。名字形式的地址（这里是 localhost）会通过预检，
+// 真正的拦截发生在拨号期——这条路径正是 extension.md 警告的绕过方式，
+// 必须实际跑一遍真实 Transport，而不是只测 allowedIP。
+func TestFetchFeedBlocksLoopbackResolvedAtDialTime(t *testing.T) {
+	c := New(Config{FeedTimeout: 3 * time.Second})
+	_, err := c.FetchFeed(context.Background(), "http://localhost/feed")
+	if !errors.Is(err, ErrBlockedHost) {
+		t.Fatalf("err = %v, want ErrBlockedHost from the dialer", err)
+	}
+	if errors.Is(err, ErrUpstream) {
+		t.Fatalf("SSRF rejection must not be flattened into ErrUpstream: %v", err)
+	}
+}
+
+// 拨号期拒绝必须保留哨兵，否则 handler 只能回 502，
+// 把一个「地址不允许」的可修问题报成上游故障。
+type blockedTransport struct{}
+
+func (blockedTransport) RoundTrip(*http.Request) (*http.Response, error) {
+	return nil, fmt.Errorf("%w: feed.test resolves to 127.0.0.1", ErrBlockedHost)
+}
+
+func TestFetchFeedKeepsBlockedHostFromTransport(t *testing.T) {
+	c := newClient(Config{FeedTimeout: time.Second}, blockedTransport{}, http.DefaultTransport)
+	_, err := c.FetchFeed(context.Background(), "http://feed.test/feed.xml")
+	if !errors.Is(err, ErrBlockedHost) {
+		t.Fatalf("err = %v, want ErrBlockedHost", err)
 	}
 }
 

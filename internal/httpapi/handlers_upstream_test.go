@@ -3,6 +3,7 @@ package httpapi
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -150,6 +151,32 @@ func TestFetchProxyRejectsBlockedHost(t *testing.T) {
 	}
 }
 
+// 拨号期（名字解析到内网）拒绝也是 400，不是 502。
+// 包了一层之后哨兵丢失的回归会在这里暴露。
+func TestFetchProxyMapsDialTimeBlockTo400(t *testing.T) {
+	h := newHarness(t)
+	h.useUpstream(&fakeUpstream{feedErr: fmt.Errorf("%w: feed.test resolves to 127.0.0.1", upstream.ErrBlockedHost)})
+	w := signedGET(t, h, "/api/v1/fetch?url=http%3A%2F%2Ffeed.test%2Ffeed.xml",
+		"fetch-dial-blocked", nil)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400: %s", w.Code, w.Body.String())
+	}
+}
+
+// 不跟随重定向，也不能把没有 Location 的 3xx 回给宿主。
+func TestFetchProxyMapsUpstreamRedirectTo502(t *testing.T) {
+	h := newHarness(t)
+	h.useUpstream(&fakeUpstream{feed: upstream.FeedResponse{Status: http.StatusFound}})
+	w := signedGET(t, h, "/api/v1/fetch?url=https%3A%2F%2Fexample.com%2Ffeed.xml",
+		"fetch-redirect", nil)
+	if w.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502: %s", w.Code, w.Body.String())
+	}
+	if loc := w.Header().Get("Location"); loc != "" {
+		t.Errorf("Location = %q, must not be forwarded", loc)
+	}
+}
+
 func TestAvatarProxyPassesThrough304(t *testing.T) {
 	h := newHarness(t)
 	fake := &fakeUpstream{avatar: upstream.AvatarResponse{
@@ -207,7 +234,10 @@ func TestAvatarProxyRejectsInvalidHash(t *testing.T) {
 
 func TestAvatarProxyMapsUpstreamFailureTo502(t *testing.T) {
 	h := newHarness(t)
-	h.useUpstream(&fakeUpstream{avatar: upstream.AvatarResponse{Status: http.StatusInternalServerError}})
+	h.useUpstream(&fakeUpstream{avatar: upstream.AvatarResponse{
+		Status: http.StatusInternalServerError,
+		ETag:   `"stale"`,
+	}})
 
 	hash := strings.Repeat("b", 32)
 	w := signedGET(t, h, "/api/v1/avatar/"+hash, "avatar-500", nil)
@@ -218,5 +248,30 @@ func TestAvatarProxyMapsUpstreamFailureTo502(t *testing.T) {
 	json.Unmarshal(w.Body.Bytes(), &body)
 	if body.Error.Code != "upstream_error" || body.Error.RequestID == "" {
 		t.Errorf("error = %+v", body.Error)
+	}
+	// 错误体不能带上游的验证器：宿主会把它当成一次有效的缓存描述。
+	if got := w.Header().Get("ETag"); got != "" {
+		t.Errorf("error response carried ETag %q", got)
+	}
+}
+
+func TestAvatarProxyNotFoundCarriesNoValidators(t *testing.T) {
+	h := newHarness(t)
+	h.useUpstream(&fakeUpstream{avatar: upstream.AvatarResponse{
+		Status:       http.StatusNotFound,
+		ETag:         `"v1"`,
+		LastModified: "Wed, 21 Oct 2025 07:28:00 GMT",
+		CacheControl: "public, max-age=86400",
+	}})
+
+	hash := strings.Repeat("c", 32)
+	w := signedGET(t, h, "/api/v1/avatar/"+hash, "avatar-404", nil)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404: %s", w.Code, w.Body.String())
+	}
+	for _, hdr := range []string{"ETag", "Last-Modified", "Cache-Control"} {
+		if got := w.Header().Get(hdr); got != "" {
+			t.Errorf("404 carried %s = %q", hdr, got)
+		}
 	}
 }

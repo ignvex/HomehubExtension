@@ -48,6 +48,13 @@ func (s *server) handleFetch(c *gin.Context) {
 			c.Status(http.StatusNotModified)
 			return
 		}
+		if res.Status >= 300 && res.Status < 400 {
+			// 本端不信重定向，但也不能把一个没有 Location 的 3xx 回给宿主：
+			// 那既不是可跟随的跳转，也不是明确的失败。按上游故障处理。
+			failWith(c, http.StatusBadGateway, "upstream_error",
+				fmt.Sprintf("上游返回重定向 %d（不跟随）", res.Status))
+			return
+		}
 		failWith(c, res.Status, "upstream_error",
 			fmt.Sprintf("上游返回 HTTP %d", res.Status))
 		return
@@ -102,22 +109,20 @@ func (s *server) handleAvatar(c *gin.Context) {
 		return
 	}
 
-	if res.ETag != "" {
-		c.Header("ETag", res.ETag)
-	}
-	if res.LastModified != "" {
-		c.Header("Last-Modified", res.LastModified)
-	}
-	if res.CacheControl != "" {
-		c.Header("Cache-Control", res.CacheControl)
-	}
-
 	switch res.Status {
 	case http.StatusNotModified:
+		// 304 必须带验证器：宿主靠它们判断「还是同一张图」。
+		copyAvatarValidators(c, res)
 		c.Status(http.StatusNotModified)
 	case http.StatusNotFound:
 		failWith(c, http.StatusNotFound, "not_found", "上游没有该头像")
 	case http.StatusOK:
+		// 验证器与 Cache-Control 只跟随成功响应。404/502 的错误体
+		// 若带着上游的 ETag，宿主可能把它当成一次有效缓存命中。
+		copyAvatarValidators(c, res)
+		if res.CacheControl != "" {
+			c.Header("Cache-Control", res.CacheControl)
+		}
 		contentType := res.ContentType
 		if contentType == "" {
 			contentType = "application/octet-stream"
@@ -128,5 +133,14 @@ func (s *server) handleAvatar(c *gin.Context) {
 		// 并写负缓存，不需要知道上游到底回了什么。
 		failWith(c, http.StatusBadGateway, "upstream_error",
 			fmt.Sprintf("头像上游返回 HTTP %d", res.Status))
+	}
+}
+
+func copyAvatarValidators(c *gin.Context, res upstream.AvatarResponse) {
+	if res.ETag != "" {
+		c.Header("ETag", res.ETag)
+	}
+	if res.LastModified != "" {
+		c.Header("Last-Modified", res.LastModified)
 	}
 }

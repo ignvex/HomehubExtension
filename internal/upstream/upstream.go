@@ -106,14 +106,30 @@ type Client struct {
 	avatarHTTP *http.Client
 }
 
-// New 构造生产客户端。两条通路都走与媒体下载相同的 SSRF 防护：
-// 头像地址虽然由代码固定为 Gravatar，但 DNS 被污染时仍可能指向内网，
-// 拨号期的校验同样有意义。
+// New 构造生产客户端。
+//
+// /fetch 走与媒体下载相同的 SSRF 防护：目标地址由调用方给出，拨号期
+// 必须拒绝任何解析到内网的地址。
+//
+// /avatar 是例外，原因不是「它不重要」，而是目标主机由代码固定为
+// https 的 Gravatar、hash 已严格校验、重定向不跟随——这三条叠起来，
+// 拨号期白名单无法再多挡什么。保留环境代理是因为没有直连出口的部署
+// （比如国内 VPS）不配代理时头像永远 502；而代理本身是运维配的，
+// 属于可信出口。
 func New(cfg Config) *Client {
-	return newClient(cfg,
-		rss.NewOutboundTransport(false, 8),
-		rss.NewOutboundTransport(false, 4),
-	)
+	return newClient(cfg, rss.NewOutboundTransport(false, 8), avatarTransport())
+}
+
+func avatarTransport() *http.Transport {
+	return &http.Transport{
+		Proxy:                 http.ProxyFromEnvironment,
+		MaxIdleConns:          8,
+		MaxIdleConnsPerHost:   4,
+		IdleConnTimeout:       60 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: time.Second,
+		ForceAttemptHTTP2:     true,
+	}
 }
 
 func newClient(cfg Config, feedTransport, avatarTransport http.RoundTripper) *Client {
