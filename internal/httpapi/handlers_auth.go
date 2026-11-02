@@ -93,13 +93,29 @@ func (s *server) handleRefresh(c *gin.Context) {
 	s.respondTokens(c, tokens, false)
 }
 
+// cookieSecure 判断下发的 cookie 是否要带 Secure。
+//
+// 两个条件任一成立：
+//   - 到应用层就是 TLS（直连，不经反代）；
+//   - public_url 是 https（生产部署：TLS 在 Caddy 终止，
+//     到 Go 这里是明文 HTTP，Request.TLS 永远为 nil）。
+//
+// 设置与清除必须用同一个判断。清除时只看 Request.TLS 的话，
+// 反代部署下会下发一个不带 Secure 的同名 cookie，
+// 而浏览器（RFC 6265bis 的完整性保护）拒绝用非 Secure cookie
+// 覆盖已存在的 Secure cookie —— 结果就是「点了登出，
+// refresh token 还在浏览器里」。
+func (s *server) cookieSecure(c *gin.Context) bool {
+	return c.Request.TLS != nil || strings.HasPrefix(s.Cfg.Server.PublicURL, "https://")
+}
+
 // respondTokens 统一签发响应。
 //
 // refresh_token 默认只写 HttpOnly cookie，不进响应体：
 // 放进 JSON 的话 XSS 一个 fetch 就能带走长期凭证，HttpOnly 就白设了。
 // 机器客户端显式声明 client_kind=machine 时才在 body 里返回。
 func (s *server) respondTokens(c *gin.Context, t *auth.Tokens, machine bool) {
-	secure := c.Request.TLS != nil || strings.HasPrefix(s.Cfg.Server.PublicURL, "https://")
+	secure := s.cookieSecure(c)
 	sessionTTL := int(s.Cfg.Auth.SessionTTL.Duration / time.Second)
 
 	body := gin.H{
@@ -124,7 +140,7 @@ func (s *server) respondTokens(c *gin.Context, t *auth.Tokens, machine bool) {
 }
 
 func (s *server) clearAuthCookies(c *gin.Context) {
-	secure := c.Request.TLS != nil
+	secure := s.cookieSecure(c)
 	c.SetSameSite(http.SameSiteLaxMode)
 	c.SetCookie(cookieSession, "", -1, "/", "", secure, true)
 	c.SetCookie(cookieCSRF, "", -1, "/", "", secure, false)
