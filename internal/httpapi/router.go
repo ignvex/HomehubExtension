@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"context"
 	"io/fs"
 	"log/slog"
 	"net/http"
@@ -14,6 +15,7 @@ import (
 	"github.com/ignvex/HomehubExtension/internal/rss"
 	"github.com/ignvex/HomehubExtension/internal/scheduler"
 	"github.com/ignvex/HomehubExtension/internal/store"
+	"github.com/ignvex/HomehubExtension/internal/upstream"
 
 	"github.com/gin-gonic/gin"
 )
@@ -23,6 +25,13 @@ type BuildInfo struct {
 	Version   string `json:"version"`
 	Commit    string `json:"commit"`
 	BuildTime string `json:"build_time"`
+}
+
+// Upstream 是 /fetch 与 /avatar 依赖的资源代理。
+// 抽成接口是为了让 handler 测试能注入假实现，生产使用 upstream.Client。
+type Upstream interface {
+	FetchFeed(context.Context, string) (upstream.FeedResponse, error)
+	FetchAvatar(context.Context, upstream.AvatarRequest) (upstream.AvatarResponse, error)
 }
 
 // Deps 是路由层的全部依赖。nil 字段表示对应模块未启用。
@@ -36,6 +45,8 @@ type Deps struct {
 	RSS         *rss.Service
 	Scheduler   *scheduler.Scheduler
 	Bus         *events.Bus
+	// Upstream 为 nil 时按配置构造默认代理客户端。
+	Upstream Upstream
 	// Limiter 限制认证端点的失败次数。nil 表示不限制（仅测试环境）。
 	Limiter *auth.AttemptLimiter
 	Log     *slog.Logger
@@ -47,7 +58,8 @@ type Deps struct {
 
 type server struct {
 	Deps
-	spa *SPA
+	spa      *SPA
+	upstream Upstream
 }
 
 // NewRouter 组装 gin engine。
@@ -68,7 +80,15 @@ func NewRouter(d Deps) *gin.Engine {
 	// 只信任回环：Caddy 就在本机，其余来源的 X-Forwarded-For 不可信。
 	_ = r.SetTrustedProxies(d.Cfg.Server.TrustedProxies)
 
-	s := &server{Deps: d, spa: NewSPA(d.WebFS, d.DevMode)}
+	up := d.Upstream
+	if up == nil {
+		up = upstream.New(upstream.Config{
+			UserAgent:    d.Cfg.RSS.UserAgent,
+			FeedTimeout:  d.Cfg.RSS.RequestTimeout.Duration,
+			MaxFeedBytes: 0, // 使用 /fetch 契约里的 32MB，不复用入库上限
+		})
+	}
+	s := &server{Deps: d, spa: NewSPA(d.WebFS, d.DevMode), upstream: up}
 
 	r.Use(RequestID())
 	r.Use(Recovery(d.Log))
@@ -149,8 +169,15 @@ func (s *server) registerAuth(r *gin.Engine) {
 // Extension 只存公钥。签名把 method/path/query/body 都覆盖进去，
 // 一条合法请求无法被挪到另一个端点重放。
 func (s *server) registerHub(r *gin.Engine) {
-	signed := r.Group("/api/v1/hub",
+	signedAPI := r.Group("/api/v1",
 		RequireHubSignature(s.HubVerifier, s.Cfg.Server.MaxBodyBytes))
+
+	// 资源代理与 /hub/* 共用同一把密钥、同一套待签消息，不引入
+	// 第二种凭据。它们不依赖 RSS 模块是否启用：这两条只是取字节。
+	signedAPI.GET("/fetch", s.handleFetch)
+	signedAPI.GET("/avatar/:hash", s.handleAvatar)
+
+	signed := signedAPI.Group("/hub")
 
 	// 订阅通道额外要求 RSS 模块启用：模块关掉时四个端点统一 404，
 	// 宿主不必逐个猜哪个还活着。

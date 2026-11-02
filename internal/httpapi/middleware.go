@@ -122,6 +122,10 @@ func skipLog(route string) bool {
 	switch route {
 	case "/healthz", "/readyz", "/media/:name":
 		return true
+	case "/api/v1/avatar/:hash":
+		// 路径里的 hash 是邮箱的 MD5。它和来源 IP 出现在同一行日志里
+		// 就是可关联信息，而宿主只是来取一张图，不需要这种审计轨迹。
+		return true
 	}
 	return strings.HasPrefix(route, "/_app/")
 }

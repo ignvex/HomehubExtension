@@ -249,6 +249,20 @@ homehubext/req/v1
 
 公钥没配置时返回 **503 `unavailable`** 而不是 401——那是部署缺失，不是请求方的问题。
 
+### 2.7.1 资源代理：`/fetch` 与 `/avatar`
+
+宿主还可以通过同一个签名通道取回两类外部资源：
+
+| 端点 | 行为 |
+| --- | --- |
+| `GET /api/v1/fetch?url=` | 返回上游原始 XML，**不解析、不入库** |
+| `GET /api/v1/avatar/{hash}?s=&d=&r=` | 代理 Gravatar，透传 304 与 `ETag` / `Last-Modified` |
+
+两条都只认签名头，与 `/hub/*` 共用同一把密钥，不引入 Bearer。协议细节（SSRF
+要求、响应上限、状态码语义）以 Homehub 仓库的
+[`docs/extension.md`](https://github.com/ignvex/Homehub/blob/main/docs/extension.md)
+为准；本仓库只负责实现，不维护副本。
+
 ### 2.8 CSRF
 
 Cookie 认证的写请求必须带 `X-CSRF-Token`，值与 `hh_csrf` cookie 一致（双提交）。`SameSite=Lax` 已经阻断跨站表单，双提交是第二道防线。Bearer 认证的请求豁免，因为浏览器不会自动附加该头。

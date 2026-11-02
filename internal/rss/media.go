@@ -277,6 +277,21 @@ func checkHost(u *url.URL, allowPrivate bool) error {
 	return nil
 }
 
+// CheckOutboundURL 校验一个来自外部的出站地址。
+//
+// 供 /fetch 代理这类会把自身暴露成跳板的端点复用；媒体下载与代理必须
+// 用同一套规则，否则一条路径能访问的地址会随入口而变。allowPrivate=false
+// 时回环、私网、链路本地（含云元数据）与非白名单端口一律拒绝。
+func CheckOutboundURL(u *url.URL, allowPrivate bool) error { return checkHost(u, allowPrivate) }
+
+// NewOutboundTransport 返回带拨号期 SSRF 校验的 Transport。
+//
+// 校验发生在 DNS 解析之后、建连之前，不存在“校验完再解析一次”的
+// DNS rebinding 窗口。调用方负责禁止重定向：跟随跳转会绕过这里。
+func NewOutboundTransport(allowPrivate bool, conns int) *http.Transport {
+	return newSafeTransport(allowPrivate, conns)
+}
+
 // Download 抓取一个资源并落入 blob 存储。
 //
 // 整个过程流式：先读 512 字节嗅探类型，再把这 512 字节与剩余流拼起来交给

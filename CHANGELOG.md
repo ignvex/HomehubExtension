@@ -25,6 +25,10 @@
 
 ### 新增
 
+- **宿主资源代理**：`GET /api/v1/fetch?url=` 原样返回订阅源字节，不解析、
+  不入库；`GET /api/v1/avatar/{hash}` 代理 Gravatar，透传 304 与
+  `ETag` / `Last-Modified`。两条都走 Ed25519 签名，与 `/hub/*` 共用同一把
+  密钥。`/fetch` 的 SSRF 校验与媒体下载共用同一套规则，内网地址返回 400。
 - **OPML 导入导出（M10）**：`GET /api/v1/feeds/export` 导出全部订阅，
   `POST /api/v1/feeds/import` 批量导入。导入按递归收集分组嵌套的
   `<outline>`（多数阅读器导出会套两层文件夹），单条失败不中断整批并

@@ -73,6 +73,7 @@ make sec       # gosec，medium 及以上必须清零
 - 验签通过之后才登记 nonce：未通过的请求不该污染去重表
 - 公钥只接受 Ed25519；`auth.hub.public_key` 存的是**内容**（PEM 或裸
   base64），不是文件路径——不要把路径当成隐式支持的形态
+- `/fetch` 与 `/avatar` 与 `/hub/*` 共用同一把密钥、同一套签名校验
 
 ## 部署约束
 
