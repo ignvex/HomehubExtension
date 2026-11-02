@@ -39,6 +39,7 @@ web/src/             前端 SPA
 
 ```bash
 make build     # 交叉编译 linux/amd64 单二进制，前端 embed 进去
+make bundle    # 再打一步：dist/hhe-installer-<ver>-linux-amd64.run（单文件自解压）
 make test      # go test ./...
 make race      # 并发相关用例
 make vet       # go vet + 前端 tsc

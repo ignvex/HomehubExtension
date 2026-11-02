@@ -265,25 +265,62 @@ curl -X POST https://homehub.example.com/api/v1/hub/keys \
 
 ## 部署
 
-`make build` 会把二进制、安装脚本、systemd 单元与配置模板汇总到 `dist/`。
-整个目录拷到服务器后，一条命令完成安装：
+两种产物，选一种：
 
 ```bash
-make build                      # 产出 dist/（不入库）
-scp -r dist user@host:/tmp/hhe  # 整个目录拷过去
-
-# 服务器上
-cd /tmp/hhe && sudo ./install.sh
+make bundle     # 单个自解压脚本：dist/hhe-installer-<ver>-linux-amd64.run
+make build      # 目录形式：dist/（二进制 + 单元 + 配置模板 + 脚本）
 ```
 
-脚本会把二进制装到 `/usr/bin`、建 `/etc/hhe` 放配置、装 systemd 单元，
-然后**询问是否开机自启、是否立即启动**。已有 `/etc/hhe/config.json` 会原样保留，
-所以重复执行等于升级。`--yes` 全部取默认值（是），`--dry-run` 只打印动作。
+单文件包拷过去就能装，不需要其他文件：
+
+```bash
+scp dist/hhe-installer-*.run user@host:/tmp/
+ssh user@host 'sudo bash /tmp/hhe-installer-*.run install'
+```
+
+目录形式适合想先看一眼内容再装：
+
+```bash
+scp -r dist user@host:/tmp/hhe
+ssh user@host 'cd /tmp/hhe && sudo ./install.sh install'
+```
+
+安装后脚本自身装到 `/usr/bin/hhe`，之后的维护都走它：
+
+| 命令 | 作用 |
+| --- | --- |
+| `sudo hhe install` | 全新安装；已安装时自动转为 update |
+| `sudo hhe update` | 更新：备份旧二进制与配置，启动失败自动回滚 |
+| `sudo hhe update --rollback` | 回到上一个二进制 |
+| `sudo hhe update --from DIR` | 从解包后的 `dist/` 更新 |
+| `sudo hhe uninstall` | 卸载，保留配置与数据 |
+| `sudo hhe uninstall --purge` | 连配置、数据与运行用户一起删 |
+| `sudo hhe restart` / `start` / `stop` | 服务操作，启动后自动做健康检查 |
+| `sudo hhe status` / `logs -f` | 状态与日志 |
+| `sudo hhe doctor` | 版本、权限、公钥、健康一次查完 |
+| `sudo hhe key import --file homehub.pub` | 导入宿主公钥 |
+| `sudo hhe key show` | 查看已配置公钥的指纹 |
+
+公钥导入按与运行时相同的规则校验，并统一存成单行 base64：
+
+```bash
+sudo hhe key import --file homehub.pub     # PKIX PEM
+sudo hhe key import --key '<单行 base64>'  # 32 字节 raw 公钥
+cat homehub.pub | sudo hhe key import -    # stdin
+hhe key normalize --file homehub.pub       # 只校验，不写配置、不需要 root
+```
+
+粘成 PEM body 的 DER base64（44 字节）也能识别并转换。写入后会用服务的
+`migrate` 入口再验一次配置能否加载，失败就回滚并留下备份。
+
+`--yes` 全部取默认值，`--dry-run` 只打印动作。
 
 目录布局：
 
 ```text
 /usr/bin/homehub-extension               二进制（dist/ 构建后拷入）
+/usr/bin/hhe                              维护脚本（安装时自动装入）
 /usr/bin/homehub-backup.sh                备份脚本（deploy/backup.sh）
 /etc/hhe/config.json                      配置（0640 root:homehub）
 /etc/hhe/env                              密钥（0600 root:homehub）

@@ -25,6 +25,13 @@
 
 ### 新增
 
+- **一体化运维脚本与单文件安装包**：`scripts/install.sh` 改为子命令式，
+  覆盖 `install` / `update`（含自动备份与失败回滚）/ `update --rollback` /
+  `uninstall [--purge]` / `restart` / `status` / `logs` / `doctor` /
+  `key import|show|normalize`。安装后脚本自身装到 `/usr/bin/hhe`。
+  `make bundle` 把 `dist/` 打成单个自解压 `.run`，一个文件即可部署。
+  公钥导入按与运行时相同的规则校验并统一成单行 base64，写入后用
+  `migrate` 入口再验证一次配置可加载。
 - **宿主资源代理**：`GET /api/v1/fetch?url=` 原样返回订阅源字节，不解析、
   不入库；`GET /api/v1/avatar/{hash}` 代理 Gravatar，透传 304 与
   `ETag` / `Last-Modified`。两条都走 Ed25519 签名，与 `/hub/*` 共用同一把

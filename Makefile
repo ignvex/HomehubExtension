@@ -1,4 +1,4 @@
-.PHONY: help dev-api dev-web build test race vet fmt web clean lint units sec
+.PHONY: help dev-api dev-web build bundle test race vet fmt web clean lint units sec
 
 BINARY := dist/homehub-extension
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
@@ -32,6 +32,9 @@ build: web ## 交叉编译 linux/amd64 单二进制，并汇总分发包到 dist
 	  deploy/hhe-backup.timer dist/
 	@install -m 0644 config.example.json dist/config.example.json
 	@ls -lh dist/
+
+bundle: build ## 打成单个自解压安装脚本（dist/hhe-installer-<ver>-linux-amd64.run）
+	@scripts/bundle.sh "$(VERSION)"
 
 web: ## 构建前端
 	pnpm --dir web install --frozen-lockfile
