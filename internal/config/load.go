@@ -44,6 +44,15 @@ func Load(explicit string) (Config, string, error) {
 		return Config{}, path, joinErrs(expandErrs)
 	}
 
+	// 已删除字段要给出「该改成什么」，而不是让 DisallowUnknownFields
+	// 报一句 unknown field。后者既不说这个字段曾经存在，也不说替代写法，
+	// 运维只能靠猜——上一版把 public_key_path 改成 public_key 时，
+	// 线上就是这么挂起来的：日志里只有一行 unknown field，服务在
+	// restart 循环里，没有任何线索。
+	if errs := checkRemovedFields([]byte(expanded)); len(errs) > 0 {
+		return Config{}, path, fmt.Errorf("%s: %w", path, joinErrs(errs))
+	}
+
 	cfg := Default()
 	dec := json.NewDecoder(bytes.NewReader([]byte(expanded)))
 	dec.DisallowUnknownFields()
@@ -133,4 +142,35 @@ func joinErrs(errs []error) error {
 		b.WriteString(e.Error())
 	}
 	return errors.New(b.String())
+}
+
+// legacyConfig 只含已删除的字段，用来在正式解码之前发现旧配置。
+//
+// 单独一个结构而不是去搜字符串：字段名可能出现在别处的字符串值里，
+// 而这里要判断的是「配置里真的有这个键」。
+type legacyConfig struct {
+	Auth struct {
+		Hub struct {
+			PublicKeyPath *string `json:"public_key_path"`
+		} `json:"hub"`
+	} `json:"auth"`
+}
+
+// checkRemovedFields 把已删除的字段翻译成迁移指引。
+//
+// 保留它的成本很低，但它把一次线上事故——服务卡在 restart 循环里、
+// 日志只有一行 unknown field——变成一句能照着做的事。
+func checkRemovedFields(raw []byte) []error {
+	var legacy legacyConfig
+	if err := json.Unmarshal(raw, &legacy); err != nil {
+		// 结构本身坏了时交给主解码器，那里会给出更准确的语法错误。
+		return nil
+	}
+	if legacy.Auth.Hub.PublicKeyPath == nil {
+		return nil
+	}
+	return []error{errors.New(
+		"auth.hub.public_key_path 已删除（它存的是文件路径）。" +
+			"改用 auth.hub.public_key，值填公钥内容而不是路径。" +
+			"自动转换：sudo hhe repair；或 sudo hhe key import --file <公钥文件>")}
 }

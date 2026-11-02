@@ -253,3 +253,29 @@ func TestLoadAcceptsHubComment(t *testing.T) {
 		t.Fatalf("Load: %v", err)
 	}
 }
+
+// 已删除字段必须给出迁移指引，而不是一句 unknown field。
+//
+// 这一条来自真实事故：升级后旧配置里还留着 public_key_path，服务在
+// systemd 的 restart 循环里，日志只有 "json: unknown field"。
+func TestLoadExplainsRemovedField(t *testing.T) {
+	dir := t.TempDir()
+	body := `{
+	  "version": 1,
+	  "server": {"addr": "127.0.0.1:8080"},
+	  "auth": {"hub": {"enabled": true, "public_key_path": "/etc/hhe/homehub.pub"}},
+	  "database": {"path": "` + filepath.Join(dir, "db") + `"},
+	  "storage": {"blob_dir": "` + filepath.Join(dir, "blobs") + `"}
+	}`
+	_, _, err := Load(writeConfig(t, body))
+	if err == nil {
+		t.Fatal("a removed field must still be rejected")
+	}
+	msg := err.Error()
+	if strings.Contains(msg, "unknown field") {
+		t.Errorf("error should explain the migration, not just say unknown field: %v", err)
+	}
+	if !strings.Contains(msg, "auth.hub.public_key") || !strings.Contains(msg, "public_key_path") {
+		t.Errorf("error should name both the old and the new field: %v", err)
+	}
+}
