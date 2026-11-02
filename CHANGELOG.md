@@ -105,6 +105,11 @@
 
 ### 修复
 
+- **升级后旧配置导致服务起不来**：`auth.hub.public_key_path` 已删除，但旧配置
+  里残留该字段时，`DisallowUnknownFields` 只报一句 `json: unknown field`，
+  服务停在 systemd 的 restart 循环里。现在加载配置时会识别这个字段并给出
+  迁移指引；`hhe repair` 会读取旧路径指向的公钥、写入 `public_key`、删掉旧
+  字段、备份原配置后重启。`update` 也会在替换二进制之前自动做这一步。
 - **签名校验未规范化 HTTP 方法**：`RequestMessage` 直接签 `r.Method`，而宿主侧
   是 `strings.ToUpper(method)`。Go 的 `http` 包总发大写所以现在不会触发，
   但换一个客户端库就会让两侧算出不同的待签消息，表现为极难定位的 401。

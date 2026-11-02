@@ -17,6 +17,7 @@
 #   sudo ./hhe.sh key show             查看已配置公钥的指纹
 #        ./hhe.sh key normalize        只校验并规范化一段公钥，不改系统
 #   sudo ./hhe.sh doctor               一次自检：版本、服务、配置、公钥、健康
+#   sudo ./hhe.sh repair               迁移已删除的配置字段并重启
 #        ./hhe.sh version              打印已安装版本
 #
 # 安装后脚本自身会装到 /usr/bin/hhe，之后上面的维护命令都可以直接写
@@ -284,6 +285,39 @@ PY
   mv -f "$tmp" "$file"
 }
 
+json_del_key() { # FILE KEY_PATH —— 删掉一个键；不存在时算成功
+  local file=$1 path=$2 tmp
+  tmp=$(mktemp "$(dirname "$file")/.config.XXXXXX")
+  if have python3; then
+    python3 - "$file" "$path" "$tmp" <<'PYDEL'
+import json,sys
+src, path, dst = sys.argv[1:4]
+with open(src, encoding='utf-8') as f:
+    cfg = json.load(f)
+parts = path.split('.')
+cur = cfg
+for part in parts[:-1]:
+    nxt = cur.get(part)
+    if not isinstance(nxt, dict):
+        nxt = {}
+        cur[part] = nxt
+    cur = nxt
+cur.pop(parts[-1], None)
+with open(dst, 'w', encoding='utf-8') as f:
+    json.dump(cfg, f, ensure_ascii=False, indent=2)
+    f.write('\n')
+PYDEL
+  elif have jq; then
+    jq --arg p "$path" 'delpath($p|split("."))' "$file" > "$tmp"
+  else
+    rm -f "$tmp"
+    return 1
+  fi
+  chmod 0640 "$tmp"
+  chown root:"$(svc_group)" "$tmp" 2>/dev/null || true
+  mv -f "$tmp" "$file"
+}
+
 # ---- 公钥规范化 ----
 
 key_error() {
@@ -418,14 +452,65 @@ print_failure() {
   note "排查：journalctl -u $SVC_NAME -n 50 --no-pager"
 }
 
+have_legacy_key_field() {
+  [ -f "$CONF_FILE" ] || return 1
+  grep -q '"public_key_path"' "$CONF_FILE" 2>/dev/null
+}
+
 check_legacy_key_field() {
-  [ -f "$CONF_FILE" ] || return 0
-  if grep -q '"public_key_path"' "$CONF_FILE" 2>/dev/null; then
+  if have_legacy_key_field; then
     warn "配置里还有已删除的 public_key_path 字段，服务会拒绝启动"
-    note "改用：sudo hhe key import --file <公钥文件>"
+    note "自动转换：sudo hhe repair"
     return 1
   fi
   return 0
+}
+
+# 把旧字段迁到新字段。在替换二进制之前调用。
+#
+# 这一步必须在 restart 之前：带着 public_key_path 的配置会让新版直接
+# 起不来，而 update 的健康检查届时只能看到「启动失败」，然后把二进制
+# 回滚——旧二进制能吃这个字段，于是回滚后一切正常，问题被掩盖到下一次
+# 升级。提前迁移就不会走到那一步。
+#
+# 只迁移这一个已知字段，不做通用兼容层：字段语义变了（路径 → 内容），
+# 保留运行时的隐式兼容等于把错误配置变成一种可用形态。
+migrate_legacy_config() {
+  have_legacy_key_field || return 0
+
+  step "迁移旧配置字段"
+  local old_path bak b64
+  old_path=$(json_get_str "$CONF_FILE" auth.hub.public_key_path 2>/dev/null || true)
+
+  if [ "$OPT_DRY" -eq 1 ]; then
+    ok "将删除 auth.hub.public_key_path，改为 auth.hub.public_key"
+    return 0
+  fi
+  have_json_tool || die "需要 python3 或 jq 来改写 config.json
+    手动改：删掉 auth.hub.public_key_path，加上 auth.hub.public_key（公钥内容）"
+
+  bak="$CONF_FILE.bak-$(date +%Y%m%d-%H%M%S)"
+  run install -m 0640 -o root -g "$(svc_group)" "$CONF_FILE" "$bak"
+  ok "配置备份 $bak"
+
+  b64=""
+  if [ -n "$old_path" ] && [ -f "$old_path" ]; then
+    b64=$(normalize_public_key < "$old_path") || b64=""
+  fi
+
+  if [ -n "$b64" ]; then
+    json_set_str "$CONF_FILE" auth.hub.public_key "$b64"
+    ok "公钥已从 $old_path 读入（指纹 $(key_fingerprint "$b64")）"
+  else
+    if [ -n "$old_path" ]; then
+      warn "旧字段指向的 $old_path 不存在或读不出来"
+    fi
+    warn "没能读出公钥内容，auth.hub.public_key 保持为空"
+    note "补上：sudo hhe key import --file <公钥文件>"
+  fi
+
+  json_del_key "$CONF_FILE" auth.hub.public_key_path
+  ok "已删除 auth.hub.public_key_path"
 }
 
 # ---- 安装 ----
@@ -560,6 +645,17 @@ check_permissions() {
   fi
 }
 
+# 重启服务。
+#
+# 先清 start-limit：Restart=on-failure 连续失败 5 次后单元进入
+# start-limit-hit，此后 systemctl restart 会直接失败，日志只说
+# "start request repeated too quickly"——正好是修配置的人会遇到的状态。
+# reset-failed 对未失败的单元是空操作。
+restart_service() {
+  run systemctl reset-failed "$SVC_NAME" 2>/dev/null || true
+  run systemctl restart "$SVC_NAME"
+}
+
 install_units() {
   run install -m 0644 "$SRC_DIR/$SVC_NAME.service" "$UNIT_DIR/$SVC_NAME.service"
   ok "$UNIT_DIR/$SVC_NAME.service"
@@ -639,7 +735,7 @@ cmd_install() {
   fi
 
   if [ "$start_now" -eq 1 ]; then
-    run systemctl restart "$SVC_NAME"
+    restart_service
     [ "$OPT_DRY" -eq 1 ] && ok "将启动 $SVC_NAME" || ok "已启动 $SVC_NAME"
   else
     warn "未启动（之后可执行 systemctl start $SVC_NAME）"
@@ -726,7 +822,7 @@ cmd_update() {
     step "回滚主程序"
     run install -m 0755 "$prev" "$BIN_DIR/$BIN_NAME"
     ok "已恢复上一个二进制"
-    run systemctl restart "$SVC_NAME"
+    restart_service
     if [ "$OPT_DRY" -eq 0 ]; then
       wait_healthy 30 || { print_failure; die "回滚后健康检查仍失败"; }
       ok "服务就绪"
@@ -763,6 +859,10 @@ cmd_update() {
     warn "版本相同，可能只是在重装"
   fi
 
+  # 必须早于替换二进制。带着旧字段重启只会得到一次失败的启动，
+  # 而健康检查会把新版本回滚掉——旧二进制读得懂旧字段，问题被掩盖。
+  migrate_legacy_config
+
   step "备份"
   run install -m 0755 "$BIN_DIR/$BIN_NAME" "$prev"
   ok "二进制备份到 $prev"
@@ -780,7 +880,7 @@ cmd_update() {
   install_units
 
   step "重启并验证"
-  run systemctl restart "$SVC_NAME"
+  restart_service
   if [ "$OPT_DRY" -eq 1 ]; then
     ok "将重启 $SVC_NAME"
     return 0
@@ -913,6 +1013,10 @@ key_import() {
   have_json_tool || die "需要 python3 或 jq 来安全地修改 config.json
     两者都没有时请手动编辑：把下面这行写进 auth.hub.public_key（值用单行 base64）"
 
+  # 旧字段留着的话，写进来的公钥会在后面的加载校验里被 unknown field
+  # 挡掉，回滚之后用户看到的是「公钥写入失败」——原因却根本不是公钥。
+  migrate_legacy_config
+
   local b64 fp backup stamp
   b64=$(read_key_input | normalize_public_key) || die "公钥校验失败，配置未改动"
   fp=$(key_fingerprint "$b64")
@@ -950,9 +1054,12 @@ key_import() {
     ok "配置加载校验通过"
   fi
 
-  if systemctl is-active --quiet "$SVC_NAME" 2>/dev/null; then
+  # 服务处于 failed（比如刚被旧字段卡住）时也要重启，否则导入了公钥
+  # 却还得再手动 start 一次。
+  if systemctl is-active --quiet "$SVC_NAME" 2>/dev/null \
+     || systemctl is-failed --quiet "$SVC_NAME" 2>/dev/null; then
     if ask "重启 $SVC_NAME 让公钥生效？" y; then
-      run systemctl restart "$SVC_NAME"
+      restart_service
       if [ "$OPT_DRY" -eq 0 ]; then
         if wait_healthy 30; then
           ok "服务就绪，签名通道应已启用"
@@ -1026,6 +1133,53 @@ cmd_service() {
       fi
       ;;
   esac
+}
+
+# ---- 修复 ----
+
+# 修「配置里有已删除字段，服务起不来」这一类问题。
+#
+# 独立成一个子命令的理由：服务已经 failed 时，跑 update 会先进健康检查
+# 的失败路径，把刚装上去的新二进制回滚掉；用户真正需要的只是改配置。
+cmd_repair() {
+  need_root
+  need_systemd
+  [ -f "$CONF_FILE" ] || die "找不到配置：$CONF_FILE"
+  is_installed || die "还没安装：先执行 install"
+
+  if ! have_legacy_key_field; then
+    ok "配置里没有已删除的字段，不需要修复"
+  else
+    migrate_legacy_config
+  fi
+
+  step "校验配置"
+  local out
+  if out=$(as_user "$SVC_USER" "$BIN_DIR/$BIN_NAME" migrate -config "$CONF_FILE" 2>&1); then
+    ok "配置可加载"
+  else
+    printf '    %s\n' "$(printf '%s\n' "$out" | tail -n 5)"
+    die "配置仍然无法加载，按上面的提示处理"
+  fi
+
+  step "重启服务"
+  restart_service
+  if [ "$OPT_DRY" -eq 0 ]; then
+    if wait_healthy 30; then
+      ok "服务就绪（$(health_addr)/healthz）"
+    else
+      print_failure
+      die "重启后健康检查失败"
+    fi
+  fi
+
+  step "完成"
+  if [ -z "$(json_get_str "$CONF_FILE" auth.hub.public_key 2>/dev/null || true)" ]; then
+    warn "auth.hub.public_key 仍为空：/hub/*、/fetch、/avatar 会返回 503"
+    note "补上：sudo hhe key import --file <公钥文件>"
+  else
+    note "公钥指纹：sudo hhe key show"
+  fi
 }
 
 # ---- 自检 ----
@@ -1204,6 +1358,7 @@ case "$CMD" in
   restart|start|stop|status|logs|enable|disable)
                      cmd_service "$CMD" ;;
   doctor)            cmd_doctor ;;
+  repair|fix)        cmd_repair ;;
   version)           cmd_version ;;
   help)              usage ;;
   *) die "未知子命令：$CMD（用 --help 查看用法）" ;;

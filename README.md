@@ -309,6 +309,7 @@ make build     # dist/ 目录形式：二进制 + 单元 + 配置模板 + 脚本
 | `sudo hhe restart` / `start` / `stop` | 服务操作，启动后自动做健康检查 |
 | `sudo hhe status` / `logs -f` | 状态与日志 |
 | `sudo hhe doctor` | 版本、权限、公钥、健康一次查完 |
+| `sudo hhe repair` | 迁移已删除的配置字段（如 `public_key_path`）并重启 |
 | `sudo hhe key import --file homehub.pub` | 导入宿主公钥 |
 | `sudo hhe key show` | 查看已配置公钥的指纹 |
 
