@@ -306,7 +306,14 @@ func (s *Store) checkSpace(used, incoming int64) error {
 }
 
 // Path 返回内容寻址路径。ext 为空时返回不带扩展名的路径。
+//
+// ext 在这里再过一次 normalizeExt，而不是信任调用方。Path 是导出的，
+// 当前唯一能传外部值的调用点是 /media 路由，那里已经先做了长度与
+// 十六进制校验；但只要有一个新调用点漏了校验，含 `/` 的 ext 就能
+// 把路径拽出 root（filepath.Join 会把 `<sha>.../etc/passwd` 清理成
+// 上一级目录）。代价是一次字符串送选，换的是不依赖调用方纪律。
 func (s *Store) Path(sha, ext string) string {
+	ext = normalizeExt(ext)
 	if len(sha) < 2 {
 		return filepath.Join(s.root, sha)
 	}

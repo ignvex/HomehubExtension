@@ -251,3 +251,47 @@ func TestNormalizeExt(t *testing.T) {
 		}
 	}
 }
+
+// Path 的 ext 必须自己消毒，不依赖调用方。
+//
+// filepath.Join 会清理 `..`：ext 含 `/` 时，`<sha>.../etc/passwd`
+// 会被解析成上一级目录，把路径拽出 root。当前 HTTP 层无法传入 `/`
+// （gin 的 :name 不含斜杠，%2F 也不被解码），但 Path 是导出的，
+// 这个不变式不该由「记得校验」来维持。
+func TestPathRejectsTraversalExt(t *testing.T) {
+	s := newStore(t, Options{})
+	sha := "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+
+	cases := []string{
+		"../../etc/passwd",
+		"a/../../../../etc/passwd",
+		"..",
+		".",
+		"foo/bar",
+		"/abs",
+		"a\x00b",
+	}
+
+	for _, ext := range cases {
+		t.Run(ext, func(t *testing.T) {
+			p := s.Path(sha, ext)
+			// 必须仍然落在 root 之内。
+			rel, err := filepath.Rel(s.root, p)
+			if err != nil {
+				t.Fatalf("Rel: %v", err)
+			}
+			if strings.HasPrefix(rel, "..") || filepath.IsAbs(rel) {
+				t.Errorf("ext=%q 让路径逃出 root: %s", ext, p)
+			}
+		})
+	}
+
+	// 正常扩展名不能被误伤。
+	if got := s.Path(sha, "webp"); !strings.HasSuffix(got, sha+".webp") {
+		t.Errorf("正常扩展名被破坏: %s", got)
+	}
+	// 带点、带大写也要能规整。
+	if got := s.Path(sha, ".PNG"); !strings.HasSuffix(got, sha+".png") {
+		t.Errorf("大写/带点扩展名未规整: %s", got)
+	}
+}
