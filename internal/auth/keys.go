@@ -45,7 +45,9 @@ func LoadOrCreateSigner(path string) (*Signer, error) {
 	if path == "" {
 		return nil, errors.New("server key path is empty")
 	}
-	if raw, err := os.ReadFile(path); err == nil {
+	// 路径来自 config.auth.server_key_path（root 拥有、0640），
+	// 不是网络可达的输入。
+	if raw, err := os.ReadFile(path); err == nil { // #nosec G304 -- 配置路径
 		return parsePrivateKey(raw)
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return nil, fmt.Errorf("read server key: %w", err)

@@ -32,7 +32,9 @@ func Load(explicit string) (Config, string, error) {
 	if err != nil {
 		return Config{}, "", err
 	}
-	raw, err := os.ReadFile(path)
+	// path 由 resolve() 决定：显式 -config / 环境变量 / 固定搜索路径，
+	// 来源是运维的命令行与文件系统布局，不是请求输入。
+	raw, err := os.ReadFile(path) // #nosec G304 -- 配置路径
 	if err != nil {
 		return Config{}, path, fmt.Errorf("read %s: %w", path, err)
 	}

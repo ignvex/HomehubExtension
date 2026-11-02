@@ -1,4 +1,4 @@
-.PHONY: help dev-api dev-web build test race vet fmt web clean lint units
+.PHONY: help dev-api dev-web build test race vet fmt web clean lint units sec
 
 BINARY := dist/homehub-extension
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
@@ -77,6 +77,15 @@ lint: ## 规范检查（Golang Specification skill）
 	@python3 scripts/check-gofunc.py
 	@echo "== import 分组 =="
 	@python3 scripts/check-goimports.py
+
+sec: ## 安全扫描（gosec）
+	@# G104 = 未处理错误。仓库里 24 处全是 os.Remove / db.Close
+	@# 这类清理操作，失败不影响主流程，逐个判分支只会把代码变吵。
+	@# 其余 medium 及以上的告警必须清零：真告警都走过审查，
+	@# 在对应行用 `#nosec Gxxx -- 理由` 标出，不需要另维护白名单文件。
+	@command -v gosec >/dev/null || { \
+	  echo "  未安装 gosec: go install github.com/securego/gosec/v2/cmd/gosec@latest"; exit 1; }
+	@gosec -quiet -severity=medium -exclude=G104 -fmt=text ./...
 
 units: ## 校验 systemd 单元（语法 + 加固评分）
 	@command -v systemd-analyze >/dev/null || { echo "  未安装 systemd-analyze，跳过"; exit 0; }

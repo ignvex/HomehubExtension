@@ -35,7 +35,8 @@ var (
 // LoadHubPublicKey 读取 PEM（PKIX 或 raw Ed25519 字节）。
 // 也接受裸 base64，方便部署时直接从别处复制。
 func LoadHubPublicKey(path string) (ed25519.PublicKey, error) {
-	raw, err := os.ReadFile(path)
+	// 路径来自 config.auth.hub.public_key_path，root 拥有的配置文件。
+	raw, err := os.ReadFile(path) // #nosec G304 -- 配置路径
 	if err != nil {
 		return nil, fmt.Errorf("read hub public key: %w", err)
 	}
@@ -61,7 +62,8 @@ func ParseHubPublicKey(raw []byte) (ed25519.PublicKey, error) {
 	if decoded, err := base64.StdEncoding.DecodeString(trimmed); err == nil && len(decoded) == ed25519.PublicKeySize {
 		return ed25519.PublicKey(decoded), nil
 	}
-	if b, err := os.ReadFile(strings.TrimSpace(string(raw))); err == nil {
+	// 同上：raw 只来自配置文件的内容，不是请求体。
+	if b, err := os.ReadFile(strings.TrimSpace(string(raw))); err == nil { // #nosec G304 G703 -- 配置内容
 		return ParseHubPublicKey(b)
 	}
 	return nil, errors.New("hub public key: not PEM, base64, or a readable path")

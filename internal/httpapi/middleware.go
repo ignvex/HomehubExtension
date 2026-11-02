@@ -24,11 +24,13 @@ const (
 	ctxLogger    = "logger"
 	ctxHubBody   = "hub_body"
 
-	cookieSession    = "hh_session"
-	cookieCSRF       = "hh_csrf"
-	headerCSRF       = "X-CSRF-Token"
-	headerRequestID  = "X-Request-ID"
-	headerOwnerToken = "X-Owner-Token"
+	cookieSession   = "hh_session"
+	cookieCSRF      = "hh_csrf"
+	headerCSRF      = "X-CSRF-Token"
+	headerRequestID = "X-Request-ID"
+	// 这些是头名，不是凭据值：gosec 的 G101 按「含 token 字样 +
+	// 字符串字面量」匹配，这里是误报。
+	headerOwnerToken = "X-Owner-Token" // #nosec G101 -- header 名，非凭据
 )
 
 func requestID(c *gin.Context) string {

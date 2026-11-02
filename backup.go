@@ -24,7 +24,8 @@ func runBackup(ctx context.Context, cfg config.Config, log *slog.Logger, outDir 
 	if outDir == "" {
 		return fmt.Errorf("缺少 -out：指定备份输出目录")
 	}
-	if err := os.MkdirAll(outDir, 0o750); err != nil {
+	// outDir 来自 `backup -out` 命令行参数，只有本机运维能传。
+	if err := os.MkdirAll(outDir, 0o750); err != nil { // #nosec G703 -- CLI 参数
 		return fmt.Errorf("创建备份目录: %w", err)
 	}
 
@@ -44,7 +45,7 @@ func runBackup(ctx context.Context, cfg config.Config, log *slog.Logger, outDir 
 		return err
 	}
 
-	info, err := os.Stat(dest)
+	info, err := os.Stat(dest) // #nosec G703 -- 同 outDir，来自 CLI
 	if err != nil {
 		return err
 	}

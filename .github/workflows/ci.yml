@@ -16,6 +16,9 @@ concurrency:
 env:
   GO_VERSION: "1.27"
   NODE_VERSION: "22"
+  # 固定 gosec 版本：工具自身的规则集变化不应让旧代码突然变红。
+  # 升级时单独一个提交，好回滚也好对照新增的告警。
+  GOSEC_VERSION: "v2.30.0"
 
 jobs:
   go:
@@ -38,6 +41,16 @@ jobs:
       # 才暴露。这里用离线模式校验，不依赖 unit 真的被加载过。
       - name: systemd 单元检查
         run: make units
+
+      # gosec 单独装而不是放进 make 的默认依赖：本地开发机上没装
+      # 也能跑 lint，CI 里必须有。
+      - name: 安全扫描
+        run: |
+          go install github.com/securego/gosec/v2/cmd/gosec@${{ env.GOSEC_VERSION }}
+          # GITHUB_PATH 只对后续 step 生效，本 step 里要自己 export。
+          export PATH="$(go env GOPATH)/bin:$PATH"
+          gosec -version
+          make sec
 
       - name: 静态检查
         run: go vet ./...

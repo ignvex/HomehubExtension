@@ -182,8 +182,11 @@ func (s entryStore) BulkSetRead(ctx context.Context, ids []int64, read bool) err
 	for _, id := range ids {
 		args = append(args, id)
 	}
-	_, err := s.d.rw.ExecContext(ctx,
-		`UPDATE entry SET read_at = ? WHERE id IN (`+placeholders+`)`, args...)
+	// placeholders 由 len(ids) 生成（"?,?,…"），不含任何用户输入；
+	// 每个 id 都走 args 占位符。G202 按「字符串拼接出现在 SQL 调用附近」
+	// 匹配，这里是固定形状的占位符展开。
+	query := `UPDATE entry SET read_at = ? WHERE id IN (` + placeholders + `)` // #nosec G202 -- 占位符拼接，非用户输入
+	_, err := s.d.rw.ExecContext(ctx, query, args...)
 	return err
 }
 
