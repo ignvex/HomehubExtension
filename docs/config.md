@@ -87,7 +87,7 @@ Homehub 宿主推送订阅时使用的入站签名通道。
 | 字段 | 类型 | 默认 | 说明 |
 | --- | --- | --- | --- |
 | `hub.enabled` | bool | `false` | 是否启用。关掉后 `/api/v1/hub/*`、`/api/v1/fetch`、`/api/v1/avatar/{hash}` 全部返回 503。 |
-| `hub.public_key` | string | 空 | 宿主公钥**内容**，接受 PKIX PEM 或裸 base64，不是文件路径。多行 PEM 粘进 JSON 字符串时必须把换行写成 `\n`，否则文件本身就不合法；用单行 base64 最省事。为空时签名通道不启用（`/hub/*`、`/fetch`、`/avatar` 全部 503），但**不会拒绝启动**——很多部署一开始只用浏览器。 |
+| `hub.public_key` | string | 空 | 宿主公钥**内容**，接受 PKIX PEM 或裸 base64，不是文件路径。裸 base64 指的是 **32 字节 raw 公钥**的 base64，不是 PEM body 那段 DER（44 字节）——填错会报解码长度不符。多行 PEM 粘进 JSON 字符串时必须把换行写成 `\n`，否则文件本身就不合法；用单行 base64 最省事。为空时签名通道不启用（`/hub/*`、`/fetch`、`/avatar` 全部 503），但**不会拒绝启动**——很多部署一开始只用浏览器。 |
 | `hub.clock_skew` | duration | `60s` | 允许的时间戳偏差。放宽意味着重放窗口变长，不要超过 5 分钟。 |
 | `hub.nonce_ttl` | duration | `2m` | nonce 去重表的 TTL，需大于 `clock_skew`。 |
 

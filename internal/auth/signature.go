@@ -53,13 +53,29 @@ func ParseHubPublicKey(raw []byte) (ed25519.PublicKey, error) {
 	// base64 经常被粘贴成多行，先去掉所有空白再解码。
 	compact := strings.Join(strings.Fields(string(raw)), "")
 	if compact != "" {
+		decodedLen := -1
 		for _, enc := range []*base64.Encoding{
 			base64.StdEncoding, base64.RawStdEncoding,
 			base64.URLEncoding, base64.RawURLEncoding,
 		} {
-			if decoded, err := enc.DecodeString(compact); err == nil && len(decoded) == ed25519.PublicKeySize {
+			decoded, err := enc.DecodeString(compact)
+			if err != nil {
+				continue
+			}
+			if len(decoded) == ed25519.PublicKeySize {
 				return ed25519.PublicKey(decoded), nil
 			}
+			if decodedLen < 0 {
+				decodedLen = len(decoded)
+			}
+		}
+		// 这里是最容易踩的坑：PKIX DER 的 base64（44 字节）看上去也是一串
+		// base64，但 Ed25519 公钥本体只有 32 字节。不区分这两种情况的话，
+		// 错误信息会把「长度不对」说成「不是 base64」，把人引向错误的排查方向。
+		if decodedLen >= 0 {
+			return nil, fmt.Errorf(
+				"hub public key: base64 decodes to %d bytes, want %d; use the raw Ed25519 key, not the PEM body's DER",
+				decodedLen, ed25519.PublicKeySize)
 		}
 	}
 	return nil, errors.New("hub public key: expected PEM or base64; this field holds the key itself, not a path")
