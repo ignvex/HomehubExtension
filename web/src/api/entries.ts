@@ -4,6 +4,8 @@ import type { EntryDetail, EntryListResponse, EntryPatch } from "./types";
 export interface ListEntriesOptions {
   feedId?: number | null;
   unread?: boolean;
+  starred?: boolean;
+  search?: string;
   limit?: number;
   cursor?: string | null;
   signal?: AbortSignal;
@@ -15,6 +17,11 @@ export function listEntries(options: ListEntriesOptions = {}): Promise<EntryList
     params.set("feed_id", String(options.feedId));
   }
   if (options.unread) params.set("unread", "true");
+  if (options.starred) params.set("starred", "true");
+  // 关键词原样交给服务端：它负责 LIKE 转义与 ESCAPE 子句。
+  // 前端不要自己拼 % —— 那样会绕过转义，搜 _ 会变成通配符。
+  const q = options.search?.trim();
+  if (q) params.set("q", q);
   if (options.limit !== undefined) params.set("limit", String(options.limit));
   if (options.cursor) params.set("cursor", options.cursor);
   const query = params.toString();

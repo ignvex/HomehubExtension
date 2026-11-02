@@ -16,10 +16,20 @@ import { refreshUnreadCount } from "../state/app-state";
 
 const PAGE_SIZE = 50;
 
-function buildPath(feedId: number | null, unread: boolean): string {
+type EntryFilter = {
+  feedId: number | null;
+  unread: boolean;
+  starred: boolean;
+  search: string;
+};
+
+function buildPath(filter: EntryFilter): string {
   const params = new URLSearchParams();
-  if (feedId !== null) params.set("feed_id", String(feedId));
-  if (unread) params.set("unread", "true");
+  if (filter.feedId !== null) params.set("feed_id", String(filter.feedId));
+  if (filter.unread) params.set("unread", "true");
+  if (filter.starred) params.set("starred", "true");
+  const q = filter.search.trim();
+  if (q !== "") params.set("q", q);
   const query = params.toString();
   return `/entries${query ? `?${query}` : ""}`;
 }
@@ -104,6 +114,8 @@ export const entriesView: ViewFactory = (ctx: ViewContext) => {
   const parsedFeedId = feedIdRaw ? Number.parseInt(feedIdRaw, 10) : Number.NaN;
   let feedFilter: number | null = Number.isSafeInteger(parsedFeedId) ? parsedFeedId : null;
   let unreadOnly = ctx.query.get("unread") === "true" || ctx.query.get("unread") === "1";
+  let starredOnly = ctx.query.get("starred") === "true" || ctx.query.get("starred") === "1";
+  let searchTerm = ctx.query.get("q") ?? "";
 
   const feedSelect = h("select", {
     class: "input input--compact",
@@ -111,6 +123,20 @@ export const entriesView: ViewFactory = (ctx: ViewContext) => {
   });
   const unreadCheckbox = h("input", {
     attrs: { id: "entry-unread-filter", type: "checkbox", ...(unreadOnly ? { checked: true } : {}) },
+  });
+  const starredCheckbox = h("input", {
+    attrs: { id: "entry-starred-filter", type: "checkbox", ...(starredOnly ? { checked: true } : {}) },
+  });
+  const searchInput = h("input", {
+    class: "input input--compact",
+    attrs: {
+      id: "entry-search",
+      type: "search",
+      placeholder: "搜索标题与正文",
+      "aria-label": "搜索条目",
+      autocomplete: "off",
+      value: searchTerm,
+    },
   });
   const summary = h("p", { class: "toolbar-summary" });
   const list = h("div", { class: "entry-list" });
@@ -128,6 +154,12 @@ export const entriesView: ViewFactory = (ctx: ViewContext) => {
     h(
       "div",
       { class: "toolbar-field" },
+      h("label", { class: "toolbar-label", attrs: { for: "entry-search" } }, icon("search"), "搜索"),
+      searchInput,
+    ),
+    h(
+      "div",
+      { class: "toolbar-field" },
       h("label", { class: "toolbar-label", attrs: { for: "entry-feed-filter" } }, icon("filter"), "订阅源"),
       feedSelect,
     ),
@@ -136,6 +168,12 @@ export const entriesView: ViewFactory = (ctx: ViewContext) => {
       { class: "checkbox-row checkbox-row--inline", attrs: { for: "entry-unread-filter" } },
       unreadCheckbox,
       h("span", {}, "只看未读"),
+    ),
+    h(
+      "label",
+      { class: "checkbox-row checkbox-row--inline", attrs: { for: "entry-starred-filter" } },
+      starredCheckbox,
+      h("span", {}, "只看标星"),
     ),
     summary,
   );
@@ -196,15 +234,28 @@ export const entriesView: ViewFactory = (ctx: ViewContext) => {
   };
 
   const showEmpty = (): void => {
-    const filtered = feedFilter !== null || unreadOnly;
+    const filtered = feedFilter !== null || unreadOnly || starredOnly || searchTerm.trim() !== "";
+    // 搜索/标星为空时的文案与「没有未读」不同：前者是筛选条件太窄，
+    // 后者是正经地全读完了。引导语给错会让人以为功能坏了。
+    let title = "还没有条目";
+    let description = "订阅由 Homehub 推送，抓取完成后会出现在这里。";
+    if (searchTerm.trim() !== "") {
+      title = "没有匹配的条目";
+      description = `没有标题或正文包含「${searchTerm.trim()}」的条目。`;
+    } else if (starredOnly) {
+      title = "还没有标星的条目";
+      description = "在列表里点星标图标，条目会出现在这里。";
+    } else if (unreadOnly) {
+      title = "没有未读条目";
+      description = "所有条目都已读完，或者这个筛选条件暂时没有匹配项。";
+    } else if (filtered) {
+      description = "这个订阅源还没有抓取到条目。";
+    }
+
     list.replaceChildren(
       emptyState({
-        title: unreadOnly ? "没有未读条目" : "还没有条目",
-        description: unreadOnly
-          ? "所有条目都已读完，或者这个筛选条件暂时没有匹配项。"
-          : filtered
-            ? "这个订阅源还没有抓取到条目。"
-            : "订阅由 Homehub 推送，抓取完成后会出现在这里。",
+        title,
+        description,
         icon: "inbox",
         action: filtered
           ? h("a", { class: "btn", attrs: { href: "/entries" } }, "查看全部条目")
@@ -228,6 +279,18 @@ export const entriesView: ViewFactory = (ctx: ViewContext) => {
     button.setAttribute("aria-label", read ? "标为未读" : "标为已读");
   };
 
+  const removeRow = (entry: EntrySummary, row: HTMLElement): void => {
+    seen.delete(entry.id);
+    row.remove();
+    count = Math.max(0, count - 1);
+    if (count === 0) {
+      showEmpty();
+      footer.replaceChildren();
+    } else {
+      updateFooter();
+    }
+  };
+
   const handlers: EntryRowHandlers = {
     onStar(entry, button) {
       if (button.disabled) return;
@@ -237,6 +300,12 @@ export const entriesView: ViewFactory = (ctx: ViewContext) => {
         .then(() => {
           entry.starred_at = next ? nowSeconds() : null;
           renderStars(button, next);
+          // 在「只看标星」列表里取消标星，该条已不满足筛选条件。
+          // 不移除的话列表会显示一条与筛选条件矛盾的内容。
+          if (starredOnly && !next) {
+            const row = button.closest<HTMLElement>(".entry-row");
+            if (row) removeRow(entry, row);
+          }
         })
         .catch((error: unknown) => {
           if (!ctx.signal.aborted) ctx.toast.show(describeError(error), "error");
@@ -254,17 +323,7 @@ export const entriesView: ViewFactory = (ctx: ViewContext) => {
           entry.read_at = next ? nowSeconds() : null;
           updateReadButton(button, next);
           row.classList.toggle("is-unread", !next);
-          if (unreadOnly && next) {
-            seen.delete(entry.id);
-            row.remove();
-            count = Math.max(0, count - 1);
-            if (count === 0) {
-              showEmpty();
-              footer.replaceChildren();
-            } else {
-              updateFooter();
-            }
-          }
+          if (unreadOnly && next) removeRow(entry, row);
           void refreshUnreadCount();
         })
         .catch((error: unknown) => {
@@ -295,6 +354,8 @@ export const entriesView: ViewFactory = (ctx: ViewContext) => {
     const entriesPromise = listEntries({
       feedId: feedFilter,
       unread: unreadOnly,
+      starred: starredOnly,
+      search: searchTerm,
       limit: PAGE_SIZE,
       ...(reset || !cursor ? {} : { cursor }),
       signal: ctx.signal,
@@ -321,7 +382,8 @@ export const entriesView: ViewFactory = (ctx: ViewContext) => {
       list.append(fragment);
 
       cursor = entryResponse.next_cursor ?? null;
-      summary.textContent = `${count} 条${unreadOnly ? "未读" : ""}`;
+      const suffix = searchTerm.trim() !== "" ? "（搜索）" : unreadOnly ? "未读" : starredOnly ? "标星" : "";
+      summary.textContent = `${count} 条${suffix}`;
       if (count === 0) showEmpty();
       updateFooter();
     } catch (error) {
@@ -344,12 +406,53 @@ export const entriesView: ViewFactory = (ctx: ViewContext) => {
 
   feedSelect.addEventListener("change", () => {
     feedFilter = feedSelect.value === "" ? null : Number(feedSelect.value);
-    ctx.router.navigate(buildPath(feedFilter, unreadOnly));
+    ctx.router.navigate(buildPath({ feedId: feedFilter, unread: unreadOnly, starred: starredOnly, search: searchTerm }));
   });
   unreadCheckbox.addEventListener("change", () => {
     unreadOnly = unreadCheckbox.checked;
-    ctx.router.navigate(buildPath(feedFilter, unreadOnly));
+    ctx.router.navigate(buildPath({ feedId: feedFilter, unread: unreadOnly, starred: starredOnly, search: searchTerm }));
   });
+  starredCheckbox.addEventListener("change", () => {
+    starredOnly = starredCheckbox.checked;
+    ctx.router.navigate(buildPath({ feedId: feedFilter, unread: unreadOnly, starred: starredOnly, search: searchTerm }));
+  });
+
+  // 搜索不能走 router.navigate：那会重新挂载整个视图，输入框丢焦点、
+  // 光标跳回开头——边打字边被重置。这里改成「原地重载 + replaceState」，
+  // 既能刷新列表又能保持输入。用 replace 而不是 push，
+  // 否则每敲一个字都会往历史里压一条，返回键要按十几下。
+  let searchTimer: number | null = null;
+  const applySearch = (): void => {
+    const next = searchInput.value;
+    if (next === searchTerm) return;
+    searchTerm = next;
+    const target = buildPath({ feedId: feedFilter, unread: unreadOnly, starred: starredOnly, search: searchTerm });
+    history.replaceState({ scrollY: 0 }, "", target);
+    void load(true);
+  };
+
+  searchInput.addEventListener("input", () => {
+    if (searchTimer !== null) window.clearTimeout(searchTimer);
+    // 300ms：中文输入法组字期间不该发请求，输入法上屏后手也差不多停了。
+    searchTimer = window.setTimeout(() => {
+      searchTimer = null;
+      applySearch();
+    }, 300);
+  });
+  // 回车立即搜，不等 debounce。
+  searchInput.addEventListener("keydown", (event) => {
+    if (event.key !== "Enter") return;
+    event.preventDefault();
+    if (searchTimer !== null) {
+      window.clearTimeout(searchTimer);
+      searchTimer = null;
+    }
+    applySearch();
+  });
+  // 搜索框的清除按钮（type=search 自带）也会触发 input，
+  // 但某些浏览器只发 search 事件。两个都接，靠 applySearch 去重。
+  searchInput.addEventListener("search", applySearch);
+
   refresh.addEventListener("click", () => {
     void load(true);
   });
@@ -369,5 +472,11 @@ export const entriesView: ViewFactory = (ctx: ViewContext) => {
     void load(true);
   });
 
-  return { element, unmount: unsubscribe };
+  return {
+    element,
+    unmount: () => {
+      if (searchTimer !== null) window.clearTimeout(searchTimer);
+      unsubscribe();
+    },
+  };
 };

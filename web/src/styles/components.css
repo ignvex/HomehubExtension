@@ -1293,6 +1293,13 @@
     height: 14px;
   }
 
+  /* 搜索框在工具栏里需要一个可用宽度：默认的 input 宽度由内容决定，
+     placeholder 一长就挤。min-width 用 ch 而不是固定 px，
+     中文字体下也能拿到合理宽度。 */
+  .toolbar-field input[type="search"] {
+    min-width: 16ch;
+  }
+
   .toolbar-summary {
     margin: 0 0 0 auto;
     color: var(--text-muted);
