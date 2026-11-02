@@ -22,7 +22,8 @@
     "failed_attempt_window": "5m",
     "hub": {
       "enabled": true,
-      "public_key_path": "/etc/hhe/homehub.pub",
+      "_comment": "粘贴宿主设置页「复制公钥」给出的 PKIX PEM，或它的裸 base64。这里存的是公钥内容，不是文件路径。",
+      "public_key": "",
       "clock_skew": "60s",
       "nonce_ttl": "2m"
     }

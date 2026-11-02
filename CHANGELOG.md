@@ -7,6 +7,10 @@
 
 ### 变更
 
+- **宿主公钥改为内联内容（破坏性变更）**：`auth.hub.public_key_path` 替换为
+  `auth.hub.public_key`，值直接是 PKIX PEM 或裸 base64，不再读取文件。
+  旧配置里的路径字段会让启动失败，需要把公钥内容粘贴进来；填一个路径
+  也会明确报错，而不是被当成路径再读一次。
 - **宿主协议文档降为指针**：`docs/hub-integration.md` 不再维护全文副本。
   `/api/v1/hub/*` 的契约由 Homehub 仓库的 `docs/hub-integration.md` 唯一定义；
   两侧各存一份已经漂移过——批量推送端点只写在了 Extension 侧。

@@ -1,6 +1,7 @@
 package config
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -179,15 +180,36 @@ func TestDurationRejectsGarbage(t *testing.T) {
 	}
 }
 
-func TestRedactedHidesKeyPaths(t *testing.T) {
+func TestRedactedHidesSecrets(t *testing.T) {
 	cfg := validBase(t)
 	cfg.Auth.ServerKeyPath = "/etc/secret/server.key"
+	cfg.Auth.Hub.PublicKey = "-----BEGIN PUBLIC KEY-----\nkeep-me-private\n-----END PUBLIC KEY-----"
 	out := cfg.Redacted()
-	authSection, ok := out["auth"].(Auth)
+
+	authSection, ok := out["auth"].(redactedAuth)
 	if !ok {
 		t.Fatalf("auth section type %T", out["auth"])
 	}
 	if authSection.ServerKeyPath != "(configured)" {
 		t.Errorf("key path leaked: %q", authSection.ServerKeyPath)
+	}
+	if !authSection.Hub.PublicKeySet {
+		t.Error("public_key_set should be true when a key is configured")
+	}
+
+	blob, err := json.Marshal(out)
+	if err != nil {
+		t.Fatalf("marshal redacted config: %v", err)
+	}
+	if strings.Contains(string(blob), "keep-me-private") || strings.Contains(string(blob), "/etc/secret") {
+		t.Fatalf("redacted view leaked a secret: %s", blob)
+	}
+}
+
+func TestRedactedPublicKeySetFalse(t *testing.T) {
+	out := validBase(t).Redacted()
+	authSection := out["auth"].(redactedAuth)
+	if authSection.Hub.PublicKeySet {
+		t.Error("public_key_set should be false when no key is configured")
 	}
 }

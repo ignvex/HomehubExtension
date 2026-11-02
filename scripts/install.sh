@@ -306,7 +306,7 @@ step "完成"
 
 if [ "$NEW_CONFIG" -eq 1 ]; then
   warn "配置来自模板，**必须修改**：$CONF_DIR/config.json"
-  printf '       %s至少设置 server.public_url 与 auth.hub.public_key_path（宿主对接用）%s\n' \
+  printf '       %s至少设置 server.public_url 与 auth.hub.public_key（宿主对接用）%s\n' \
     "$C_DIM" "$C_END"
 fi
 

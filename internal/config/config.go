@@ -42,10 +42,18 @@ type Auth struct {
 // HubAuth 定义 Homehub → Extension 的入站鉴权。
 // 这是"双向"里的第二个方向：Extension 不信任任何未经签名的推送。
 type HubAuth struct {
-	Enabled       bool     `json:"enabled"`
-	PublicKeyPath string   `json:"public_key_path"`
-	ClockSkew     Duration `json:"clock_skew"`
-	NonceTTL      Duration `json:"nonce_ttl"`
+	Enabled bool `json:"enabled"`
+	// PublicKey 是公钥内容本身（PKIX PEM 或裸 base64），不是文件路径。
+	PublicKey string   `json:"public_key"`
+	ClockSkew Duration `json:"clock_skew"`
+	NonceTTL  Duration `json:"nonce_ttl"`
+
+	// Comment 只为示例配置里的人话说明保留。
+	//
+	// 解析配置时启用了 DisallowUnknownFields，未声明的字段会被当成拼写
+	// 错误；没有这一行，config.example.json 里的 _comment 会让服务直接
+	// 起不来。它不参与任何运行时逻辑。
+	Comment string `json:"_comment,omitempty"`
 }
 
 // Database 是 SQLite 路径与连接池配置。

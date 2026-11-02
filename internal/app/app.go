@@ -167,14 +167,15 @@ func (a *App) buildServices() error {
 		EnrollmentTTL: cfg.Auth.EnrollmentTTL.Duration,
 	})
 
-	if cfg.Auth.Hub.Enabled && cfg.Auth.Hub.PublicKeyPath != "" {
-		pub, err := auth.LoadHubPublicKey(cfg.Auth.Hub.PublicKeyPath)
+	if cfg.Auth.Hub.Enabled && cfg.Auth.Hub.PublicKey != "" {
+		pub, err := auth.ParseHubPublicKey([]byte(cfg.Auth.Hub.PublicKey))
 		if err != nil {
 			a.log.Warn("hub signature channel disabled", "err", err)
 		} else {
 			a.hub = auth.NewHubVerifier(pub,
 				cfg.Auth.Hub.ClockSkew.Duration, cfg.Auth.Hub.NonceTTL.Duration)
-			a.log.Info("hub signature channel ready", "key", cfg.Auth.Hub.PublicKeyPath)
+			a.log.Info("hub signature channel ready",
+				"fingerprint", auth.HubKeyFingerprint(pub))
 		}
 	}
 

@@ -10,7 +10,6 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"os"
 	"strings"
 	"sync"
 	"time"
@@ -32,18 +31,11 @@ var (
 	ErrNoHubKey  = errors.New("hub public key not configured")
 )
 
-// LoadHubPublicKey 读取 PEM（PKIX 或 raw Ed25519 字节）。
-// 也接受裸 base64，方便部署时直接从别处复制。
-func LoadHubPublicKey(path string) (ed25519.PublicKey, error) {
-	// 路径来自 config.auth.hub.public_key_path，root 拥有的配置文件。
-	raw, err := os.ReadFile(path) // #nosec G304 -- 配置路径
-	if err != nil {
-		return nil, fmt.Errorf("read hub public key: %w", err)
-	}
-	return ParseHubPublicKey(raw)
-}
-
-// ParseHubPublicKey 解析宿主公钥，接受 PEM、裸 base64 或指向文件的路径。
+// ParseHubPublicKey 解析内联在配置里的宿主公钥，接受 PEM 或裸 base64。
+//
+// 这个字段的语义是「公钥内容」，不是路径。之前这里会把解析失败的输入
+// 当路径再读一次文件，结果是填错时错误信息指向错误的排查方向，也让
+// 「路径」成了一种没有写进契约的隐式用法。现在明确拒绝。
 func ParseHubPublicKey(raw []byte) (ed25519.PublicKey, error) {
 	if block, _ := pem.Decode(raw); block != nil {
 		if key, err := x509.ParsePKIXPublicKey(block.Bytes); err == nil {
@@ -58,15 +50,26 @@ func ParseHubPublicKey(raw []byte) (ed25519.PublicKey, error) {
 		return nil, errors.New("hub public key: unsupported PEM block")
 	}
 
-	trimmed := strings.TrimSpace(string(raw))
-	if decoded, err := base64.StdEncoding.DecodeString(trimmed); err == nil && len(decoded) == ed25519.PublicKeySize {
-		return ed25519.PublicKey(decoded), nil
+	// base64 经常被粘贴成多行，先去掉所有空白再解码。
+	compact := strings.Join(strings.Fields(string(raw)), "")
+	if compact != "" {
+		for _, enc := range []*base64.Encoding{
+			base64.StdEncoding, base64.RawStdEncoding,
+			base64.URLEncoding, base64.RawURLEncoding,
+		} {
+			if decoded, err := enc.DecodeString(compact); err == nil && len(decoded) == ed25519.PublicKeySize {
+				return ed25519.PublicKey(decoded), nil
+			}
+		}
 	}
-	// 同上：raw 只来自配置文件的内容，不是请求体。
-	if b, err := os.ReadFile(strings.TrimSpace(string(raw))); err == nil { // #nosec G304 G703 -- 配置内容
-		return ParseHubPublicKey(b)
-	}
-	return nil, errors.New("hub public key: not PEM, base64, or a readable path")
+	return nil, errors.New("hub public key: expected PEM or base64; this field holds the key itself, not a path")
+}
+
+// HubKeyFingerprint 返回公钥的短指纹：SHA-256 前 8 字节的 hex。
+// 与 Homehub 侧的 fingerprintKey 对齐；日志只打指纹，不打公钥内容。
+func HubKeyFingerprint(pub ed25519.PublicKey) string {
+	sum := sha256.Sum256(pub)
+	return hex.EncodeToString(sum[:8])
 }
 
 // NewHubVerifier 构造入站签名校验器。skew 与 nonceTTL 为 0 时使用默认值。

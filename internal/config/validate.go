@@ -253,16 +253,54 @@ func (c *Config) validateCleanup() []error {
 	return errs
 }
 
+// RedactedHubAuth 是 auth.hub 的脱敏视图。
+//
+// 公钥本身不敏感（泄露只能用来验证，不能签名），但也没有回显全文的
+// 必要：配置页只需要知道「有没有配」，回显全文反而多一份会漂移的副本。
+// public_key_set 与 Homehub 侧的 private_key_set 对称。
+type RedactedHubAuth struct {
+	Enabled      bool     `json:"enabled"`
+	PublicKeySet bool     `json:"public_key_set"`
+	ClockSkew    Duration `json:"clock_skew"`
+	NonceTTL     Duration `json:"nonce_ttl"`
+}
+
+// redactedAuth 显式列出可以下发的 auth 字段。
+// 新增字段时同步这里，避免无意间把密钥带进响应。
+type redactedAuth struct {
+	Enabled             bool            `json:"enabled"`
+	ServerKeyPath       string          `json:"server_key_path"`
+	SessionTTL          Duration        `json:"session_ttl"`
+	ChallengeTTL        Duration        `json:"challenge_ttl"`
+	EnrollmentTTL       Duration        `json:"enrollment_ttl"`
+	FailedAttemptLimit  int             `json:"failed_attempt_limit"`
+	FailedAttemptWindow Duration        `json:"failed_attempt_window"`
+	Hub                 RedactedHubAuth `json:"hub"`
+}
+
 // Redacted 返回用于 /api/v1/system/config 的脱敏视图。
 // 密钥类字段一律不出现在响应里，也不返回"已设置"之外的任何信息。
 func (c Config) Redacted() map[string]any {
 	cp := c
-	cp.Auth.ServerKeyPath = redactPath(cp.Auth.ServerKeyPath)
-	cp.Auth.Hub.PublicKeyPath = redactPath(cp.Auth.Hub.PublicKeyPath)
+	authView := redactedAuth{
+		Enabled:             cp.Auth.Enabled,
+		ServerKeyPath:       redactPath(cp.Auth.ServerKeyPath),
+		SessionTTL:          cp.Auth.SessionTTL,
+		ChallengeTTL:        cp.Auth.ChallengeTTL,
+		EnrollmentTTL:       cp.Auth.EnrollmentTTL,
+		FailedAttemptLimit:  cp.Auth.FailedAttemptLimit,
+		FailedAttemptWindow: cp.Auth.FailedAttemptWindow,
+		Hub: RedactedHubAuth{
+			Enabled:      cp.Auth.Hub.Enabled,
+			PublicKeySet: cp.Auth.Hub.PublicKey != "",
+			ClockSkew:    cp.Auth.Hub.ClockSkew,
+			NonceTTL:     cp.Auth.Hub.NonceTTL,
+		},
+	}
 	return map[string]any{
 		"version":  cp.Version,
 		"server":   cp.Server,
-		"auth":     cp.Auth,
+		"auth":     authView,
 		"database": map[string]any{"path": cp.Database.Path, "read_conns": cp.Database.ReadConns},
 		"storage":  cp.Storage,
 		"pastebin": cp.Pastebin,

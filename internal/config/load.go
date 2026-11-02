@@ -90,7 +90,6 @@ func (c *Config) resolvePaths(base string) {
 	c.Database.Path = abs(c.Database.Path)
 	c.Storage.BlobDir = abs(c.Storage.BlobDir)
 	c.Auth.ServerKeyPath = abs(c.Auth.ServerKeyPath)
-	c.Auth.Hub.PublicKeyPath = abs(c.Auth.Hub.PublicKeyPath)
 	c.Storage.TmpDir = abs(c.Storage.TmpDir)
 
 	if c.Storage.TmpDir == "" && c.Storage.BlobDir != "" {

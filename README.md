@@ -287,7 +287,6 @@ cd /tmp/hhe && sudo ./install.sh
 /usr/bin/homehub-backup.sh                备份脚本（deploy/backup.sh）
 /etc/hhe/config.json                      配置（0640 root:homehub）
 /etc/hhe/env                              密钥（0600 root:homehub）
-/etc/hhe/homehub.pub                      Homehub 宿主公钥（0644）
 /var/lib/hhe/homehub.db                   SQLite（由 StateDirectory 创建）
 /var/lib/hhe/blobs/                       媒体文件
 /var/backups/hhe/                         每日备份，保留 7 份

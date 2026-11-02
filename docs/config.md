@@ -87,7 +87,7 @@ Homehub 宿主推送订阅时使用的入站签名通道。
 | 字段 | 类型 | 默认 | 说明 |
 | --- | --- | --- | --- |
 | `hub.enabled` | bool | `false` | 是否启用。关掉后 `/api/v1/hub/*` 全部返回 401。 |
-| `hub.public_key_path` | string | 空 | 宿主公钥。接受 PEM（PKIX）、裸 base64 或指向文件的路径。为空时该通道不注册，但**不会拒绝启动**——很多部署一开始只用浏览器。 |
+| `hub.public_key` | string | 空 | 宿主公钥**内容**，接受 PKIX PEM 或裸 base64。把宿主设置页「复制公钥」给出的文本原样粘贴进来；它不是文件路径。为空时该通道不注册，但**不会拒绝启动**——很多部署一开始只用浏览器。 |
 | `hub.clock_skew` | duration | `60s` | 允许的时间戳偏差。放宽意味着重放窗口变长，不要超过 5 分钟。 |
 | `hub.nonce_ttl` | duration | `2m` | nonce 去重表的 TTL，需大于 `clock_skew`。 |
 
