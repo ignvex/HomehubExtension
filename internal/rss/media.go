@@ -94,7 +94,14 @@ type MediaResult struct {
 	SHA256 string
 	Ext    string
 	MIME   string
+	Kind   string
 	Size   int64
+	// Deduped 表示内容已在库里，本次没有新占磁盘。
+	//
+	// 配额累加必须看它：已存在的 blob 早在 SUM(size) 里算过一次，
+	// 重试路径若不加区分地再累一次，用量会随重试次数单调上漂，
+	// 最终把本还有余量的存储判成超配额。
+	Deduped bool
 	// Status 取值与 media_fetch.status 一致。
 	Status string
 	Error  string
@@ -329,7 +336,7 @@ func (d *Downloader) sniffAndStore(
 	head = head[:n]
 
 	sniffed := http.DetectContentType(head)
-	ext, _, ok := extForMIME(sniffed)
+	ext, kind, ok := extForMIME(sniffed)
 	if !ok {
 		res.Status, res.Error = "unsupported", sniffed
 		return res
@@ -347,7 +354,9 @@ func (d *Downloader) sniffAndStore(
 	res.Status = "ok"
 	res.SHA256 = put.SHA256
 	res.Ext = ext
+	res.Kind = kind
 	res.Size = put.Size
+	res.Deduped = put.Existed
 	return res
 }
 
@@ -388,7 +397,7 @@ func (d *Downloader) storeInline(
 
 	// 与 HTTP 路径一致：先嗅探，再查白名单。
 	sniffed := detectInline(raw)
-	ext, _, ok := extForMIME(sniffed)
+	ext, kind, ok := extForMIME(sniffed)
 	if !ok {
 		res.Status, res.Error = "unsupported", sniffed
 		return res
@@ -411,7 +420,9 @@ func (d *Downloader) storeInline(
 	res.SHA256 = put.SHA256
 	res.Ext = ext
 	res.MIME = sniffed
+	res.Kind = kind
 	res.Size = put.Size
+	res.Deduped = put.Existed
 	return res
 }
 

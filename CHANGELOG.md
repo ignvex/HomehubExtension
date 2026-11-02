@@ -33,6 +33,11 @@
 
 ### 修复
 
+- **媒体重试的记账与类型**：重试下载命中去重时不再累加配额用量
+  （否则用量会随重试次数单调上漂，最终把还有余量的存储判成超配额）；
+  重试成功的资源按真实 MIME 记 `kind`，不再一律写成 `image`；
+  `TotalSize` 查询失败不再被静默当成 0（那等于关掉配额）。
+
 - **RSS 抓取把压缩字节当成正文**：请求头声明了 `gzip, br, zstd`，但只注册了 gzip 解码器；
   且手写 `Accept-Encoding` 会让 `net/http` 认为压缩由调用方处理、跳过透明解压。
   CDN 返回 Brotli 时（如 dmhy），`gofeed` 拿到二进制并报 `failed to detect feed type`。

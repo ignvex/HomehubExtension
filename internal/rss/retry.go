@@ -53,7 +53,12 @@ func (s *Service) RetryMedia(
 		byEntry[r.EntryID] = append(byEntry[r.EntryID], r)
 	}
 
-	used, _ := s.st.Blob().TotalSize(ctx)
+	used, err := s.st.Blob().TotalSize(ctx)
+	if err != nil {
+		// 同 fetcher：查询失败不能当成 0，那等于关掉配额。
+		// 磁盘余量检查仍在兜底，但要在日志里留一条。
+		s.log.Warn("blob total size unavailable, retry quota degraded", "err", err)
+	}
 
 	for entryID, items := range byEntry {
 		if ctx.Err() != nil {
@@ -95,7 +100,11 @@ func (s *Service) retryEntry(
 
 		if res.Status == "ok" {
 			ok++
-			*used += res.Size
+			// 去重命中时没有新占磁盘，不能再累加——那块空间早就在
+			// TotalSize 里算过一次。无差别累加会让用量随重试单调上漂。
+			if !res.Deduped {
+				*used += res.Size
+			}
 			s.storeRetried(ctx, entry.ID, res)
 			fixed[MediaRef(rec.SourceURL)] = res
 		} else {
@@ -123,9 +132,18 @@ func (s *Service) retryEntry(
 // storeRetried 记录重试成功后的 blob 元数据与引用。
 func (s *Service) storeRetried(ctx context.Context, entryID int64, res MediaResult) {
 	now := time.Now().Unix()
+	// kind 从 MIME 推导，不写死成 image：重试路径覆盖图/音/视/字体/附件，
+	// 写死会让重试成功的视频在 blob 表里被记成图片，进而影响
+	// /media 的类型相关分支。
+	kind := res.Kind
+	if kind == "" {
+		if _, k, ok := extForMIME(res.MIME); ok {
+			kind = k
+		}
+	}
 	if err := s.st.Blob().Upsert(ctx, &store.Blob{
 		SHA256: res.SHA256, Size: res.Size, MIME: res.MIME,
-		Ext: res.Ext, Kind: "image",
+		Ext: res.Ext, Kind: kind,
 		CreatedAt: now, LastSeenAt: now,
 	}); err != nil {
 		s.log.Warn("upsert blob on retry", "sha", res.SHA256, "err", err)
