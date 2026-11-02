@@ -532,3 +532,87 @@ func openTestBlobs(t *testing.T, dir string) (*blob.Store, error) {
 		MaxSize: 1 << 20,
 	})
 }
+
+// GO-2026-6866：html.Render 在渲染 raw text 元素时，必须检查所有祖先
+// 的命名空间转换。修复前，SVG/MathML 里的 raw text 可能被当成 HTML
+// raw text 输出，从而绕过清洗「读到就是安全 HTML」的契约。
+//
+// 本项目的清洗器直接丢弃 svg/math 整棵子树，所以这条路径本就走不通；
+// 这个测试固定住那个前提——如果将来有人把 svg 从 dropElements 里挪走
+// （比如为了支持内联图标），这里会立刻红。
+func TestNamespaceConfusionDoesNotLeakExecutableContent(t *testing.T) {
+	inputs := []string{
+		// SVG 里的 script（合法 SVG 内容，但在我们的输出里不该存在）
+		`<svg><script>alert(1)</script></svg>`,
+		// foreignObject 是 SVG 到 HTML 的命名空间转换点
+		`<svg><foreignObject><script>alert(1)</script></foreignObject></svg>`,
+		`<svg><foreignObject><p>keep-text</p></foreignObject></svg>`,
+		// MathML 的 annotation-xml 也是转换点
+		`<math><annotation-xml encoding="text/html"><script>alert(1)</script></annotation-xml></math>`,
+		// 嵌套多层模拟解析器的命名空间栈
+		`<svg><g><svg><script>alert(1)</script></svg></g></svg>`,
+		// 大小写与属性伪装
+		`<SVG><SCRIPT>alert(1)</SCRIPT></SVG>`,
+		`<svg xmlns="http://www.w3.org/2000/svg"><script xmlns="http://www.w3.org/2000/svg">alert(1)</script></svg>`,
+		// raw text 元素：内容不该被当成标记解释
+		`<xmp><script>alert(1)</script></xmp>`,
+		`<noembed><script>alert(1)</script></noembed>`,
+		`<noframes><script>alert(1)</script></noframes>`,
+		`<plaintext><script>alert(1)</script>`,
+		// template 内容在 HTML 解析里是惰性的，容易被清洗器漏掉
+		`<template><script>alert(1)</script></template>`,
+		// 注释里藏标记
+		`<!--<script>alert(1)</script>-->`,
+		`<!--[if IE]><script>alert(1)</script><![endif]-->`,
+	}
+
+	for _, in := range inputs {
+		t.Run(in, func(t *testing.T) {
+			out := render(t, sanitize(t, in, "https://example.com/"))
+
+			// 输出的任何位置都不能出现可执行内容的痕迹。
+			// 容忍 `alert(1)` 作为纯文本出现（会被转义成 &lt;script&gt;），
+			// 但绝不能有真的标签。
+			for _, bad := range []string{"<script", "<SCRIPT", "<foreignObject", "<annotation-xml", "<template", "<!--"} {
+				if strings.Contains(out, bad) {
+					t.Errorf("输出仍含 %q:\n  in:  %s\n  out: %s", bad, in, out)
+				}
+			}
+		})
+	}
+}
+
+// 脱壳保留下来的文本必须被转义：`<xmp><b>x</b></xmp>` 的内容
+// 要么整个消失，要么以纯文本形式出现，不能变成真的 <b> 标签。
+func TestRawTextContentStaysText(t *testing.T) {
+	out := render(t, sanitize(t, `<xmp><img src=x onerror=alert(1)></xmp>`, "https://example.com/"))
+
+	// 关键：没有真的 img 标签。
+	if strings.Contains(out, "<img") {
+		t.Errorf("raw text 里的标记被当成标签重新构造了:\n%s", out)
+	}
+	// 内容若被保留，必须是转义后的纯文本。`onerror` 作为文字出现
+	// 无害；有害的是它作为属性出现。用「标签是否成形」判断，
+	// 而不是搜关键词——搜 `onerror` 会把安全的转义输出误报成泄漏。
+	if strings.Contains(out, "onerror") && !strings.Contains(out, "&lt;img") {
+		t.Errorf("事件处理器以未转义形式泄漏到输出:\n%s", out)
+	}
+}
+
+// 属性位置上的 on* 必须被删干净——与上面「文本里的 on*」区分开。
+func TestEventAttributesDroppedFromRealElements(t *testing.T) {
+	out := render(t, sanitize(t,
+		`<img src="https://example.com/a.png" onerror="alert(1)" onload="alert(2)">`+
+			`<p onclick="alert(3)">text</p><a href="https://example.com" onmouseover="alert(4)">l</a>`,
+		"https://example.com/"))
+
+	for _, bad := range []string{"onerror", "onload", "onclick", "onmouseover", "alert("} {
+		if strings.Contains(out, bad) {
+			t.Errorf("事件处理器残留 %q:\n%s", bad, out)
+		}
+	}
+	// 正常属性不能被连带删掉。
+	if !strings.Contains(out, `src="https://example.com/a.png"`) {
+		t.Errorf("合法 src 被误删:\n%s", out)
+	}
+}
