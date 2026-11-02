@@ -426,3 +426,111 @@ func TestVerifyPasswordAcceptsCurrentParams(t *testing.T) {
 		t.Error("当前参数生成的 hash 被误判为非法")
 	}
 }
+
+// legacyPaste 直接写库造一条 owner_hash 为空的历史片段。
+// 0002 迁移之前的记录就是这个形态：没有任何归属凭证。
+func legacyPaste(t *testing.T, s *Service, vis string) string {
+	t.Helper()
+	ctx := context.Background()
+	now := time.Now().Unix()
+	slug, err := randomSlug(6)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const body = "历史片段内容"
+	p := &store.Paste{
+		ID: "legacy-" + slug, Title: "历史", Body: body, Language: "text",
+		Visibility: vis, SizeBytes: int64(len(body)),
+		OwnerHash: "", // 关键：迁移前的记录没有归属
+		CreatedAt: now, UpdatedAt: now,
+	}
+	p.Slug = slug
+	if err := s.st.Paste().Create(ctx, p); err != nil {
+		t.Fatal(err)
+	}
+	return slug
+}
+
+// 迁移前的私有片段没有归属凭证。旧实现在「片段归属为空 + 调用方归属为空」
+// 时把两个空字符串当成匹配，于是任何匿名访问者知道 slug 就能读。
+// 这是 fail-open：归属信息缺失应当收紧，而不是放开。
+func TestLegacyPrivatePasteNotReadableAnonymously(t *testing.T) {
+	s := newService(t)
+	slug := legacyPaste(t, s, VisPrivate)
+
+	if _, err := s.Read(context.Background(), slug, "", ""); err == nil {
+		t.Fatal("历史私有片段被匿名读取了：owner_hash 为空时「两边都空」被当成匹配")
+	}
+
+	// 元信息路径（公开页要先读标题）同样要挡住。
+	if _, err := s.Meta(context.Background(), slug, ""); err == nil {
+		t.Fatal("历史私有片段的元信息被匿名读取了")
+	}
+
+	// 带上任意一个非空归属仍然读不到：没有凭证能证明它属于谁。
+	if _, err := s.Read(context.Background(), slug, "", "some-other-owner-hash"); err == nil {
+		t.Fatal("历史私有片段被陌生归属读取了")
+	}
+}
+
+// 历史片段的改写与删除必须 fail-closed。
+// 旧实现是 `p.OwnerHash != "" && ...`：归属为空时整条检查跳过，
+// 任何人知道 slug 就能改、能删——比「读不到」严重得多。
+func TestLegacyPasteNotMutableByStranger(t *testing.T) {
+	s := newService(t)
+	slug := legacyPaste(t, s, VisUnlisted)
+
+	newTitle := "被别人改了"
+	if _, err := s.Update(context.Background(), slug, UpdateRequest{Title: &newTitle}, ""); err == nil {
+		t.Fatal("历史片段被匿名修改了：归属检查在 owner_hash 为空时被跳过")
+	}
+
+	if err := s.Delete(context.Background(), slug, ""); err == nil {
+		t.Fatal("历史片段被匿名删除了")
+	}
+
+	// 确认真的没被改动/删除。
+	p, err := s.st.Paste().GetBySlug(context.Background(), slug)
+	if err != nil {
+		t.Fatalf("片段被删掉了: %v", err)
+	}
+	if p.Title != "历史" {
+		t.Errorf("标题被改了: %q", p.Title)
+	}
+	if p.DeletedAt != nil {
+		t.Error("片段被软删了")
+	}
+}
+
+// 新建的片段有归属，行为不能被上面的收紧影响。
+func TestOwnedPasteStillWorks(t *testing.T) {
+	s := newService(t)
+	ctx := context.Background()
+
+	p, token, err := s.Create(ctx, CreateRequest{
+		Body: "mine", Visibility: VisPrivate,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if token == "" {
+		t.Fatal("匿名创建应返回 owner token")
+	}
+	ownerHash := store.OwnerHashForToken(token)
+
+	got, err := s.Read(ctx, p.Slug, "", ownerHash)
+	if err != nil {
+		t.Fatalf("本人读自己的私有片段失败: %v", err)
+	}
+	if got.Body != "mine" {
+		t.Errorf("body = %q", got.Body)
+	}
+
+	newTitle := "改个名"
+	if _, err := s.Update(ctx, p.Slug, UpdateRequest{Title: &newTitle}, ownerHash); err != nil {
+		t.Fatalf("本人改自己的片段失败: %v", err)
+	}
+	if err := s.Delete(ctx, p.Slug, ownerHash); err != nil {
+		t.Fatalf("本人删自己的片段失败: %v", err)
+	}
+}

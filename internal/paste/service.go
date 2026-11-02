@@ -232,6 +232,32 @@ func (s *Service) resolveExpiry(in *time.Duration, now time.Time) (*int64, error
 	}
 }
 
+// readableBy 判断某个归属能否读该片段。
+//
+// private 的语义是「只有创建者能读」。这里必须 fail-closed：
+// 迁移前的历史数据 owner_hash 为空，当 ownerHash 也为空（完全匿名）时，
+// 裸的 `p.OwnerHash != ownerHash` 会把两个空字符串当成匹配——
+// 一个迁移前建的私有片段就对所有匿名访问者开放了。
+//
+// 历史片段没有记录任何归属凭证，无法证明谁是主人；宁可不读，
+// 也不能让「两边都是空」变成放行条件。
+func readableBy(p *store.Paste, ownerHash string) bool {
+	if p.Visibility != VisPrivate {
+		return true
+	}
+	return p.OwnerHash != "" && p.OwnerHash == ownerHash
+}
+
+// ownedBy 判断某个归属能否修改或删除该片段。
+//
+// 旧实现写的是 `p.OwnerHash != "" && p.OwnerHash != ownerHash`：
+// owner_hash 为空时整条检查被跳过，历史片段变成任何人知道 slug
+// 就能改、能删。slug 只有 6 位（62^6），但对一个「私有」片段而言，
+// 「谁都能删」比「谁都读不到」严重得多。
+func ownedBy(p *store.Paste, ownerHash string) bool {
+	return p.OwnerHash != "" && p.OwnerHash == ownerHash
+}
+
 // Read 返回片段。带密码的片段必须提供正确口令。
 func (s *Service) Read(ctx context.Context, slug, password, ownerHash string) (*store.Paste, error) {
 	p, err := s.st.Paste().GetBySlug(ctx, slug)
@@ -244,7 +270,7 @@ func (s *Service) Read(ctx context.Context, slug, password, ownerHash string) (*
 	}
 	// private 的语义是"只有创建者能读"。归属不匹配时返回 ErrNotFound
 	// 而不是 ErrForbidden：告诉对方"存在但你没权限"本身就是信息泄露。
-	if p.Visibility == VisPrivate && p.OwnerHash != ownerHash {
+	if !readableBy(p, ownerHash) {
 		return nil, store.ErrNotFound
 	}
 	if p.PasswordHash != "" {
@@ -277,7 +303,7 @@ func (s *Service) Meta(ctx context.Context, slug, ownerHash string) (*store.Past
 		return nil, ErrExpired
 	}
 	// 元信息也会泄露标题，private 片段同样要挡住。
-	if p.Visibility == VisPrivate && p.OwnerHash != ownerHash {
+	if !readableBy(p, ownerHash) {
 		return nil, store.ErrNotFound
 	}
 	p.Body = ""
@@ -306,7 +332,7 @@ func (s *Service) Update(ctx context.Context, slug string, req UpdateRequest, ow
 	}
 	// 只有创建者能改。匿名创建者也一样——凭 owner token 证明身份。
 	// 返回 ErrNotFound 而非 ErrForbidden，理由同 Read。
-	if p.OwnerHash != "" && p.OwnerHash != ownerHash {
+	if !ownedBy(p, ownerHash) {
 		return nil, store.ErrNotFound
 	}
 
@@ -372,7 +398,7 @@ func (s *Service) Delete(ctx context.Context, slug, ownerHash string) error {
 	if !p.Live(s.now().Unix()) {
 		return ErrExpired
 	}
-	if p.OwnerHash != "" && p.OwnerHash != ownerHash {
+	if !ownedBy(p, ownerHash) {
 		return store.ErrNotFound
 	}
 	return s.st.Paste().SoftDelete(ctx, slug)
