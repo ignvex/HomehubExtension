@@ -209,6 +209,7 @@ func (a *App) newRSSService() *rss.Service {
 		AllowPrivateHosts: cfg.RSS.AllowPrivateHosts,
 		RefererMode:       cfg.RSS.Referer,
 		MediaConcurrency:  cfg.RSS.MediaConcurrency,
+		FetchConcurrency:  cfg.RSS.FetchConcurrency,
 		DefaultInterval:   cfg.RSS.DefaultInterval.Duration,
 		MinInterval:       cfg.RSS.MinInterval.Duration,
 		MaxInterval:       cfg.RSS.MaxInterval.Duration,

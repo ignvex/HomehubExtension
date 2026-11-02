@@ -132,7 +132,7 @@ Homehub 宿主推送订阅时使用的入站签名通道。
 | `default_interval` | duration | `30m` | 新建订阅源的默认抓取间隔。 |
 | `min_interval` | duration | `10m` | 间隔下限，防止用户把源打爆。 |
 | `max_interval` | duration | `6h` | 失败退避的上限。 |
-| `fetch_concurrency` | int | `2` | 同时抓取的 feed 数，1–8。 |
+| `fetch_concurrency` | int | `2` | 全局同时抓取的 feed 数，1–8。约束所有触发路径：定时轮询、宿主推送后的首抓、手动刷新。 |
 | `media_concurrency` | int | `3` | 同时下载的媒体数，1–8。 |
 | `fetch_timeout` | duration | `90s` | 单个 feed 一轮抓取（含媒体下载）的总预算。 |
 | `request_timeout` | duration | `20s` | 单次 HTTP 请求超时。 |

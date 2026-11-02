@@ -28,9 +28,12 @@ type Config struct {
 	AllowPrivateHosts bool
 	RefererMode       string
 	MediaConcurrency  int
-	DefaultInterval   time.Duration
-	MinInterval       time.Duration
-	MaxInterval       time.Duration
+	// FetchConcurrency 限制同时进行的 feed 抓取数，对所有触发路径生效：
+	// 定时轮询、宿主推送后的首抓、以及手动刷新。
+	FetchConcurrency int
+	DefaultInterval  time.Duration
+	MinInterval      time.Duration
+	MaxInterval      time.Duration
 
 	// OnEntryCreated 在新条目落库后触发，用于 SSE 实时推送。
 	// 用回调而不是直接依赖 events 包：rss 是领域包，不该知道推送机制。
@@ -47,12 +50,31 @@ type Service struct {
 	cfg   Config
 	log   *slog.Logger
 	fp    *gofeed.Parser
+
+	// client 是整个进程共用的出站客户端。
+	//
+	// 之前每个 feed 抓取都 newSafeTransport() 新建一个 Transport，
+	// 等于每次抓取都要重新做 TCP + TLS 握手，连接一条也复用不了。
+	// 实测抓 10 次建 10 条连接。宿主批量补推订阅时，
+	// 这就是 N 次完整握手，在 1 vCPU 上是真实开销。
+	client *http.Client
+
+	// fetchSem 限制同时在跑的 feed 抓取数。
+	//
+	// rss.fetch_concurrency 之前只传给 poller，HTTP 层触发的抓取
+	// （宿主 upsert 的异步首抓、宿主/网页的手动刷新）完全不受约束。
+	// 宿主对账补推 N 个订阅就能瞬间拉起 N 个 goroutine：实测 20 个
+	// 订阅并发抓取时，对目标站就是 20 个并发连接。
+	fetchSem chan struct{}
 }
 
 // NewService 构造抓取服务。log 为 nil 时用 slog.Default。
 func NewService(st store.Store, blobs *blob.Store, cfg Config, log *slog.Logger) *Service {
 	if log == nil {
 		log = slog.Default()
+	}
+	if cfg.FetchConcurrency <= 0 {
+		cfg.FetchConcurrency = 2
 	}
 	return &Service{
 		st:    st,
@@ -68,6 +90,17 @@ func NewService(st store.Store, blobs *blob.Store, cfg Config, log *slog.Logger)
 		cfg: cfg,
 		log: log,
 		fp:  gofeed.NewParser(),
+		client: &http.Client{
+			Timeout:   cfg.RequestTimeout,
+			Transport: newSafeTransport(cfg.AllowPrivateHosts, cfg.FetchConcurrency),
+			CheckRedirect: func(r *http.Request, via []*http.Request) error {
+				if len(via) >= 5 {
+					return fmt.Errorf("too many redirects")
+				}
+				return checkHost(r.URL, cfg.AllowPrivateHosts)
+			},
+		},
+		fetchSem: make(chan struct{}, cfg.FetchConcurrency),
 	}
 }
 
@@ -121,6 +154,16 @@ func (s *Service) Fetch(ctx context.Context, feedID int64) (*Result, error) {
 // FetchFeed 抓取一个订阅源并入库新条目。
 // 单轮的媒体下载在写库之前完成，落库的 content_html 就是最终形态。
 func (s *Service) FetchFeed(ctx context.Context, feed *store.Feed) (*Result, error) {
+	// 全局抓取闸门。放在最外层而不是各调用点：定时轮询、宿主推送后
+	// 的首抓、手动刷新最终都走到这里，一处限制就能覆盖三条路径。
+	// 排队受 ctx 约束，调用方自己的超时仍然有效。
+	select {
+	case s.fetchSem <- struct{}{}:
+		defer func() { <-s.fetchSem }()
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+
 	ctx, cancel := context.WithTimeout(ctx, s.cfg.FetchTimeout)
 	defer cancel()
 
@@ -215,18 +258,9 @@ func (s *Service) fetchDocument(ctx context.Context, feed *store.Feed) (fetchedD
 		req.Header.Set("If-Modified-Since", feed.LastModified)
 	}
 
-	client := &http.Client{
-		Timeout:   s.cfg.RequestTimeout,
-		Transport: newSafeTransport(s.cfg.AllowPrivateHosts, 2),
-		CheckRedirect: func(r *http.Request, via []*http.Request) error {
-			if len(via) >= 5 {
-				return fmt.Errorf("too many redirects")
-			}
-			return checkHost(r.URL, s.cfg.AllowPrivateHosts)
-		},
-	}
-
-	resp, err := client.Do(req)
+	// 复用 Service 级别的 client：每次抓取新建 Transport 会让
+	// 每次请求都重新做 TCP + TLS 握手，连接池永远只有一条连接。
+	resp, err := s.client.Do(req)
 	if err != nil {
 		return fetchedDoc{}, err
 	}

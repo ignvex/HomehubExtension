@@ -16,6 +16,15 @@
   `homehub-extension --help` 与 `config.example.json` 同步。
 - Dockerfile 镜像内路径同步为 `/usr/bin`、`/etc/hhe`、`/var/lib/hhe`。
 
+### 性能与宿主通道
+
+- **出站客户端改为进程级复用**：之前每次 feed 抓取都新建 `Transport`，
+  连接池永远只有一条连接，每次抓取都要重做 TCP+TLS 握手。
+  实测连续抓 10 次建 10 条连接，现在 1 条。
+- **`rss.fetch_concurrency` 现在是全局上限**：之前只约束定时轮询，
+  宿主批量补推订阅时 HTTP 层触发的抓取完全不受限。实测 20 个订阅
+  并发推送会产生 20 个并发对外请求；现在受 `fetch_concurrency` 约束。
+
 ### 修复
 
 - **RSS 抓取把压缩字节当成正文**：请求头声明了 `gzip, br, zstd`，但只注册了 gzip 解码器；
