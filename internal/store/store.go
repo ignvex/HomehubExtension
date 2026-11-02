@@ -152,6 +152,13 @@ type EntryQuery struct {
 	Search  string
 	Limit   int
 	Cursor  string
+	// WithContent 决定返回的条目里是否保留 content_html / content_text。
+	//
+	// 默认 false：一页 50 条的正文可能有几十 MB，列表接口不需要。
+	// 宿主读内容（GET /hub/entries）传 true——它就是要渲染正文。
+	// 注意 SQL 始终会读这两列，这个开关只控制是否在返回前清空；
+	// 它是带宽开关，不是查询优化开关。
+	WithContent bool
 }
 
 // BlobStore 是媒体元数据的持久化契约。文件本身在 blob.Store 里。

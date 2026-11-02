@@ -147,6 +147,15 @@ func (s *server) registerHub(r *gin.Engine) {
 	subs.DELETE("/subscriptions/:id", s.handleHubDelete)
 	subs.POST("/subscriptions/:id/refresh", s.handleHubRefresh)
 
+	// 批量对账：宿主启动时一次推送几百条订阅，逐个 POST 就是几百个
+	// 签名验算与往返。注册在 :id 之前，避免 batch 被当成 id。
+	subs.POST("/subscriptions/batch", s.handleHubBatch)
+
+	// 宿主读内容：没有这组，Homehub 只能推订阅、看状态，
+	// 无法自己渲染阅读界面。
+	subs.GET("/entries", s.handleHubEntries)
+	subs.GET("/stats", s.handleHubStats)
+
 	// 密钥签发只依赖签名，与 RSS 是否启用无关：
 	// 它是一个纯粹的凭证管理操作，跟订阅通道没有业务关系。
 	signed.POST("/keys", s.handleHubCreateKey)

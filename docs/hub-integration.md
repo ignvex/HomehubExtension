@@ -11,9 +11,12 @@
 | 能力 | 方法与路径 | 成功状态 |
 | --- | --- | --- |
 | 推送/更新订阅 | `POST /api/v1/hub/subscriptions` | 201 新建 / 200 更新 |
+| 批量推送订阅 | `POST /api/v1/hub/subscriptions/batch` | 200 |
 | 对账订阅列表 | `GET /api/v1/hub/subscriptions` | 200 |
 | 移除订阅 | `DELETE /api/v1/hub/subscriptions/{id}` | 204 |
 | 立即抓取 | `POST /api/v1/hub/subscriptions/{id}/refresh` | 200 |
+| 读取条目 | `GET /api/v1/hub/entries` | 200 |
+| 聚合统计 | `GET /api/v1/hub/stats` | 200 |
 | 签发访问密钥 | `POST /api/v1/hub/keys` | 201 |
 | 列出访问密钥 | `GET /api/v1/hub/keys` | 200 |
 | 撤销访问密钥 | `DELETE /api/v1/hub/keys/{id}` | 204 |
@@ -368,6 +371,43 @@ DELETE /api/v1/hub/subscriptions/7
 
 返回 204，条目与 blob 引用级联清理。订阅不存在返回 404。重复删除不是幂等的 204——第二次会是 404，宿主按「已删除」处理即可。
 
+### 4.3a 批量推送
+
+```http
+POST /api/v1/hub/subscriptions/batch
+```
+
+```json
+{
+  "items": [
+    { "url": "https://a.example.com/feed.xml", "title": "A" },
+    { "url": "https://b.example.com/feed.xml", "interval": "1h", "enabled": false }
+  ]
+}
+```
+
+启动对账补推几百条订阅时用这个，而不是逐个 `POST /subscriptions`：
+每次请求都要验签、读 body、建连接，200 条就是 200 个往返。
+
+字段语义与单条推送完全一致（省略表示保留原值、`interval` 夹紧、
+`url` 过同一套地址校验）。单条失败不中断整批：
+
+```json
+{
+  "created": 2,
+  "updated": 1,
+  "unchanged": 1,
+  "failed": [
+    { "url": "http://127.0.0.1/feed.xml", "reason": "blocked host: 127.0.0.1" }
+  ],
+  "total": 5
+}
+```
+
+`unchanged` 是推了但什么字段都没变的那部分。上限 500 条，
+超过返回 413。**批量推送不会触发立即抓取**——抓取由轮询器按
+`next_fetch_at` 调度，并受 `rss.fetch_concurrency` 约束。
+
 ### 4.4 立即抓取
 
 ```http
@@ -390,6 +430,69 @@ POST /api/v1/hub/subscriptions/7/refresh
 ```
 
 目标站点失败返回 502 `upstream_error`，订阅不存在返回 404。抓取失败也会更新 `error_count` 与 `next_fetch_at`。
+
+### 4.4a 读取条目
+
+```http
+GET /api/v1/hub/entries?feed_id=7&unread=true&limit=20&cursor=1234
+```
+
+这是宿主自己渲染阅读界面的数据源。过滤参数与网页端
+`GET /api/v1/entries` 一致：`feed_id`、`unread`、`starred`、`q`、
+`cursor`、`limit`（默认 20，上限 50）。
+
+```json
+{
+  "items": [
+    {
+      "id": 1234,
+      "feed_id": 7,
+      "title": "文章标题",
+      "url": "https://example.com/p/1",
+      "author": "",
+      "summary": "…",
+      "published_at": 1793288400,
+      "fetched_at": 1793288500,
+      "read_at": null,
+      "starred_at": null,
+      "content_html": "<p><img src=\"https://hh.example.com/media/3f9a….webp\"></p>"
+    }
+  ],
+  "next_cursor": "1200",
+  "media_base": "https://hh.example.com"
+}
+```
+
+两个关键点：
+
+- `content_html` 里的媒体地址**已改写为绝对 URL**。宿主不在本实例的
+  域名下，相对路径 `/media/...` 会指向宿主自己的站点。直接渲染即可。
+- **读列表不会标记已读**。宿主预取、缓存、重试都不会影响用户的未读
+  状态；标已读需要用户点击后调 `PATCH /api/v1/entries/{id}`（走登录
+  通道，不是宿主通道）。
+
+`next_cursor` 为 `null` 表示没有更多。翻页时把上一页的值原样传回。
+
+### 4.4b 聚合统计
+
+```http
+GET /api/v1/hub/stats
+```
+
+```json
+{
+  "feeds": 12,
+  "entries": 3401,
+  "unread": 87,
+  "blobs": 512,
+  "blob_bytes": 734003200,
+  "pending_media": 3,
+  "schema_version": 5
+}
+```
+
+宿主仪表盘不用先拉全量订阅再本地聚合。不含 `pastes`：片段属于
+另一个模块，与订阅通道无关。
 
 ### 4.5 签发访问密钥
 

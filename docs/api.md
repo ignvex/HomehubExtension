@@ -641,7 +641,6 @@ curl -s "https://homehub.example.com/api/v1/entries?unread=true&limit=20" \
 
 ## 9. 待定
 
-- OPML 导入导出：`POST /api/v1/feeds/import`、`GET /api/v1/feeds/export`，取决于是否需要批量迁移。
 - 服务端密钥轮换（多 `kid` 并存）首版不做。密钥文件持久化在 `auth.server_key_path`，重启复用，不会换新；只有运维主动替换文件才会让已签发的 access token 立即失效（校验时签名对不上）。
 
 ## 10. 相关文档

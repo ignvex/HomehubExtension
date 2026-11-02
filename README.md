@@ -9,7 +9,7 @@ Homehub 的扩展服务：一个 Go 单二进制后端 + TypeScript 前端，为
 - **RSS 阅读器（资源本地化）** —— 订阅可由 **Homehub 宿主主动推送**，也可在网页端手动添加（需登录）。抓取后把正文涉及的所有媒体下载到本地，无法本地化、但会让浏览器对外发起请求的元素一律抹除。验收标准是可执行的：**读完一篇文章，浏览器没有向第三方发出任何请求**。
 - **开发工具台（15 个）** —— 全部在浏览器里算，不上传、不联网、不追踪。按路由懒加载，首屏只下载元数据，单个工具的实现不进主 bundle。分五类：文本与校验（JSON、正则、程序员计算器）、编码与哈希（Base64、URL、哈希）、配置格式（YAML / JSON / INI 互转）、图片处理（格式转换、压缩、Base64）、时间与随机（时间戳、UUID、二维码、颜色、字体）。
 
-> 状态：M0–M9 已落地，仅剩 OPML 导入导出（M10）。当前版本 `1.0.0-alpha`，变更见 [CHANGELOG.md](CHANGELOG.md)。`make test`、`make lint`、`make units`、`pnpm --dir web check` 全绿，`go build` 与 `pnpm --dir web build` 都能产出可部署产物。
+> 状态：M0–M10 已全部落地。当前版本 `1.0.0-alpha`，变更见 [CHANGELOG.md](CHANGELOG.md)。`make test`、`make lint`、`make units`、`pnpm --dir web check` 全绿，`go build` 与 `pnpm --dir web build` 都能产出可部署产物。
 
 ## 设计约束
 
@@ -360,7 +360,7 @@ systemctl list-timers hhe-backup.timer
 - [x] **M7** 清理调度 + 运维接口 + 测试
 - [x] **M8** 首发硬化：GitHub Actions CI、Dockerfile、备份子命令
 - [x] **M9** 开发工具台：15 个纯前端工具，按路由懒加载，首屏只下载元数据
-- [ ] **M10** OPML 导入导出（影响 feed 批量创建接口）
+- [x] **M10** OPML 导入导出：`POST /api/v1/feeds/import`、`GET /api/v1/feeds/export`，分组嵌套按递归收集
 
 ## 许可
 
