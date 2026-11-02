@@ -7,6 +7,9 @@
 
 ### 变更
 
+- **宿主协议文档降为指针**：`docs/hub-integration.md` 不再维护全文副本。
+  `/api/v1/hub/*` 的契约由 Homehub 仓库的 `docs/hub-integration.md` 唯一定义；
+  两侧各存一份已经漂移过——批量推送端点只写在了 Extension 侧。
 - **部署布局改为 `hhe`**：守护单元改名 `hhe.service`，二进制装到 `/usr/bin/homehub-extension`，
   配置与宿主公钥放到 `/etc/hhe/`，数据目录 `StateDirectory=hhe` 展开为 `/var/lib/hhe`。
   备份单元同步改名为 `hhe-backup.service` / `hhe-backup.timer`，备份输出 `/var/backups/hhe`。
