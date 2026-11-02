@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -261,6 +262,30 @@ func copyLimited(ctx context.Context, dst io.Writer, src io.Reader, limit int64)
 	}
 }
 
+// fsBytes 把 statfs 的「块数 × 块大小」安全地转成 int64。
+//
+// 直接用 int64(blocks) * int64(bsize) 在极端值下会溢出成负数：
+// 结果是 checkSpace 误判「空间不足」而拒绝写入——方向上是安全的
+// （不会写爆磁盘），但会把一个大容量的卷变成不可写，且日志只有
+// 一句 not enough free disk space，完全看不出是溢出。
+//
+// 这里做饱和处理：超过 MaxInt64 一律取 MaxInt64，负数取 0。
+// 真实文件系统到不了这个量级，但防御性代码的代价只有两行。
+func fsBytes(blocks uint64, bsize int64) int64 {
+	if blocks == 0 || bsize <= 0 {
+		return 0
+	}
+	// 先检查乘法是否会溢出，再转换，避免先溢出再判断。
+	// bsize > 0 已在上面保证，所以除法结果非负，转 uint64 安全。
+	// nosec G115：这里的 int64→uint64 是「已验证为非负」，不是任意转换。
+	limit := uint64(math.MaxInt64) / uint64(bsize) // #nosec G115 -- bsize > 0 已保证
+	if blocks > limit {
+		return math.MaxInt64
+	}
+	// nosec G115：blocks <= MaxInt64/bsize，乘积必然落在 int64 内。
+	return int64(blocks) * bsize // #nosec G115 -- 上方已做溢出检查
+}
+
 func (s *Store) checkSpace(used, incoming int64) error {
 	if s.quota > 0 && used+incoming > s.quota {
 		return ErrQuotaExceeded
@@ -273,7 +298,7 @@ func (s *Store) checkSpace(used, incoming int64) error {
 		// 拿不到磁盘信息时放行：宁可多写一次，也不要因为平台差异停掉功能。
 		return nil
 	}
-	free := int64(st.Bavail) * int64(st.Bsize)
+	free := fsBytes(st.Bavail, int64(st.Bsize))
 	if free-incoming < s.minFree {
 		return ErrNoSpace
 	}
@@ -323,8 +348,8 @@ func (s *Store) Space() (Space, error) {
 		return Space{}, err
 	}
 	return Space{
-		Total: int64(st.Blocks) * int64(st.Bsize),
-		Free:  int64(st.Bavail) * int64(st.Bsize),
+		Total: fsBytes(st.Blocks, int64(st.Bsize)),
+		Free:  fsBytes(st.Bavail, int64(st.Bsize)),
 	}, nil
 }
 

@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"sync"
 	"testing"
 )
@@ -177,5 +178,39 @@ func TestPutNewContentStillRespectsQuota(t *testing.T) {
 		PutOptions{Ext: "bin", Used: size})
 	if !errors.Is(err, ErrQuotaExceeded) {
 		t.Fatalf("err = %v, want ErrQuotaExceeded", err)
+	}
+}
+
+// statfs 的「块数 × 块大小」在极端值下会溢出成负数，
+// 让 checkSpace 把一个大容量卷误判成「空间不足」。
+// 这类卷不可写，日志里却只有一句 not enough free disk space。
+func TestFSBytesSaturates(t *testing.T) {
+	cases := []struct {
+		name   string
+		blocks uint64
+		bsize  int64
+		want   int64
+	}{
+		{"普通值", 1000, 4096, 4_096_000},
+		{"零块", 0, 4096, 0},
+		{"块大小为 0", 100, 0, 0},
+		{"块大小为负", 100, -4096, 0},
+		// 2^63 块 × 4096 = 远超 MaxInt64，必须饱和而不是回绕。
+		{"乘法会溢出", 1 << 63, 4096, math.MaxInt64},
+		{"刚好不溢出", uint64(math.MaxInt64 / 4096), 4096, math.MaxInt64 / 4096 * 4096},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := fsBytes(tc.blocks, tc.bsize)
+			if got != tc.want {
+				t.Errorf("fsBytes(%d, %d) = %d, want %d", tc.blocks, tc.bsize, got, tc.want)
+			}
+			// 关键性质：永远不为负。负值会让 free-incoming < minFree
+			// 恒为真，等于把卷锁死。
+			if got < 0 {
+				t.Errorf("fsBytes 返回负数 %d", got)
+			}
+		})
 	}
 }
