@@ -190,6 +190,13 @@ func (s *server) registerRSS(r *gin.Engine) {
 	g := r.Group("/api/v1", authn, csrf)
 	g.POST("/feeds", s.handleFeedCreate)
 	g.GET("/feeds", s.handleFeedList)
+
+	// OPML 迁移端点。注册在 /feeds/:id 之前：gin 的路由树里静态段
+	// 优先于参数，顺序不影响匹配，但放前面读起来更清楚——
+	// 否则容易以为 /feeds/export 会被 :id 吃掉。
+	g.GET("/feeds/export", s.handleFeedExport)
+	g.POST("/feeds/import", s.handleFeedImport)
+
 	g.GET("/feeds/:id", s.handleFeedGet)
 	g.PATCH("/feeds/:id", s.handleFeedUpdate)
 	g.POST("/feeds/:id/refresh", s.handleFeedRefresh)

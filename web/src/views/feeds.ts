@@ -1,4 +1,5 @@
 import { createFeed, deleteFeed, listFeeds, refreshFeed, updateFeed } from "../api/feeds";
+import { exportOPML, importOPML } from "../api/opml";
 import type { Feed } from "../api/types";
 import { pageHeader, section } from "../components/page";
 import { emptyState, errorState } from "../components/states";
@@ -173,6 +174,75 @@ export const feedsView: ViewFactory = (ctx) => {
     "刷新",
   );
 
+  // OPML 导入用隐藏的 file input：<input type=file> 无法自定义样式，
+  // 而浏览器会拒绝用脚本设置它的 value。按钮只负责触发 click()。
+  const opmlFile = h("input", {
+    attrs: { type: "file", accept: ".opml,.xml,text/x-opml,application/xml,text/xml", hidden: true },
+  });
+  opmlFile.addEventListener("change", () => {
+    const file = opmlFile.files?.[0];
+    // 清空 value，让同一个文件连续选两次也能触发 change。
+    opmlFile.value = "";
+    if (!file) return;
+    void file
+      .text()
+      .then((text) => importOPML(text, ctx.signal))
+      .then((result) => {
+        const skipped = result.failed.length;
+        const parts = [`新增 ${result.created} 条`, `更新 ${result.updated} 条`];
+        if (skipped > 0) parts.push(`失败 ${skipped} 条`);
+        ctx.toast.show(parts.join("，"), skipped > 0 ? "error" : "success");
+        if (skipped > 0) {
+          // 失败原因逐条给出来：常见的是失效域名与内网地址，
+          // 只报一个总数用户无法处理。
+          const detail = result.failed
+            .slice(0, 5)
+            .map((f) => `${f.url}：${f.reason}`)
+            .join("\n");
+          window.alert(`以下订阅未导入：\n\n${detail}${skipped > 5 ? `\n…以及另外 ${skipped - 5} 条` : ""}`);
+        }
+        void load();
+      })
+      .catch((reason: unknown) => {
+        if (!ctx.signal.aborted) ctx.toast.show(describeError(reason), "error");
+      });
+  });
+
+  const opmlImport = h(
+    "button",
+    { class: "btn", attrs: { type: "button" } },
+    icon("upload"),
+    "导入 OPML",
+  );
+  opmlImport.addEventListener("click", () => opmlFile.click());
+
+  const opmlExport = h(
+    "button",
+    { class: "btn", attrs: { type: "button" } },
+    icon("download"),
+    "导出 OPML",
+  );
+  opmlExport.addEventListener("click", () => {
+    if (opmlExport.disabled) return;
+    opmlExport.disabled = true;
+    void exportOPML(ctx.signal)
+      .then((text) => {
+        const blob = new Blob([text], { type: "text/x-opml;charset=utf-8" });
+        const url = URL.createObjectURL(blob);
+        const link = h("a", { attrs: { href: url, download: "homehub-subscriptions.opml" } });
+        link.click();
+        // 立刻 revoke 会让 Safari 来不及开始下载，推迟一拍。
+        window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+        ctx.toast.show("已导出", "success");
+      })
+      .catch((reason: unknown) => {
+        if (!ctx.signal.aborted) ctx.toast.show(describeError(reason), "error");
+      })
+      .finally(() => {
+        opmlExport.disabled = false;
+      });
+  });
+
   // ---- 新建表单 ----
   const urlInput = h("input", {
     class: "input",
@@ -318,7 +388,10 @@ export const feedsView: ViewFactory = (ctx) => {
   const element = h(
     "div",
     { class: "page" },
-    pageHeader("订阅源", "在这里添加与管理订阅；RSS 阅读需要登录，抓取会访问外部地址。", [refresh]),
+    pageHeader("订阅源", "在这里添加与管理订阅；RSS 阅读需要登录，抓取会访问外部地址。", [opmlImport, opmlExport, refresh]),
+    // 隐藏的 file input 必须挂在文档里：游离元素的 click() 在部分
+    // 浏览器上不会弹出文件选择器。
+    opmlFile,
     section("添加订阅", undefined, createForm),
     host,
   );

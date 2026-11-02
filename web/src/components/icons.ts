@@ -46,7 +46,9 @@ export type IconName =
   | "qr"
   | "palette"
   | "type"
-  | "search";
+  | "search"
+  | "upload"
+  | "download";
 
 interface IconDefinition {
   paths: readonly string[];
@@ -138,6 +140,8 @@ const ICONS: Record<IconName, IconDefinition> = {
   palette: { paths: ["M12 3a9 9 0 1 0 0 18h2a2 2 0 0 0 0-4 2 2 0 0 1 2-2h1a4 4 0 0 0 4-4 9 9 0 0 0-9-8z", "M8 9v.01", "M12 7v.01", "M16 9v.01"] },
   type: { paths: ["M4 6V4h16v2", "M12 4v16", "M9 20h6"] },
   search: { paths: ["M11 4a7 7 0 1 0 0 14 7 7 0 0 0 0-14z", "M16 16l4 4"] },
+  upload: { paths: ["M4 15v3a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-3", "M8 8l4-4 4 4", "M12 4v12"] },
+  download: { paths: ["M4 15v3a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-3", "M8 11l4 4 4-4", "M12 3v12"] },
 };
 
 export function icon(name: IconName, className = "icon"): SVGSVGElement {
