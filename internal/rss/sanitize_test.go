@@ -616,3 +616,66 @@ func TestEventAttributesDroppedFromRealElements(t *testing.T) {
 		t.Errorf("合法 src 被误删:\n%s", out)
 	}
 }
+
+// IPv6 里能内嵌 IPv4 的地址形式，必须在判断前拆开。
+//
+// 这些地址在真实网络里是可路由的：NAT64 是标准化、很多云与 ISP 在用的
+// IPv4/IPv6 互通机制，6to4 有公开中继。IPv6 表面的 IsPrivate 与
+// IsLoopback 对它们全为 false——不拆就是一个直通内网的后门：
+//
+//	http://[64:ff9b::a9fe:a9fe]/latest/meta-data/  →  169.254.169.254
+func TestAllowedIPUnwrapsEmbeddedIPv4(t *testing.T) {
+	blocked := []struct{ name, addr string }{
+		{"NAT64 → 云元数据", "64:ff9b::a9fe:a9fe"},
+		{"NAT64 → 回环", "64:ff9b::7f00:1"},
+		{"NAT64 → RFC1918", "64:ff9b::c0a8:101"},
+		{"NAT64 → 10/8", "64:ff9b::a00:5"},
+		{"本地 NAT64 → RFC1918", "64:ff9b:1::c0a8:101"},
+		{"6to4 → 云元数据", "2002:a9fe:a9fe::1"},
+		{"6to4 → RFC1918", "2002:c0a8:101::1"},
+		{"6to4 → 回环", "2002:7f00:1::1"},
+		{"Teredo（整段封禁）", "2001:0000:4136:e378:8000:63bf:3fff:fdd2"},
+		{"IPv4-compatible → 回环", "::127.0.0.1"},
+		{"IPv4-compatible → RFC1918", "::192.168.1.1"},
+		{"IPv4-compatible → 元数据", "::169.254.169.254"},
+	}
+	for _, tc := range blocked {
+		t.Run("拒绝 "+tc.name, func(t *testing.T) {
+			if allowedIP(mustAddr(t, tc.addr), false) {
+				t.Errorf("%s (%s) 被放行，SSRF 防护可绕过", tc.name, tc.addr)
+			}
+		})
+	}
+
+	// 不能误杀：这些形式指向公网时是合法的。
+	allowed := []struct{ name, addr string }{
+		{"NAT64 → 公网 DNS", "64:ff9b::808:808"},
+		{"6to4 → 公网", "2002:808:808::1"},
+		{"IPv4-compatible → 公网", "::8.8.8.8"},
+		{"普通公网 IPv6", "2606:4700:4700::1111"},
+	}
+	for _, tc := range allowed {
+		t.Run("放行 "+tc.name, func(t *testing.T) {
+			if !allowedIP(mustAddr(t, tc.addr), false) {
+				t.Errorf("%s (%s) 被误杀", tc.name, tc.addr)
+			}
+		})
+	}
+}
+
+// allowPrivate=true 的语义已经覆盖「订阅自家 NAS」，
+// 内嵌形式必须继承同一个开关，而不是变成无条件拒绝。
+func TestEmbeddedIPv4FollowsAllowPrivate(t *testing.T) {
+	for _, addr := range []string{"64:ff9b::c0a8:101", "2002:c0a8:101::1", "::192.168.1.1"} {
+		if !allowedIP(mustAddr(t, addr), true) {
+			t.Errorf("allowPrivate=true 时 %s 应放行", addr)
+		}
+	}
+	// 即便 allowPrivate=true，云元数据也必须继续拒绝：
+	// 它是凭据端点，不是「自家服务」。
+	for _, addr := range []string{"64:ff9b::a9fe:a9fe", "2002:a9fe:a9fe::1", "::169.254.169.254"} {
+		if allowedIP(mustAddr(t, addr), true) {
+			t.Errorf("allowPrivate=true 也不能放行云元数据 %s", addr)
+		}
+	}
+}

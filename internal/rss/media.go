@@ -33,6 +33,54 @@ var blockedPrefixes = []netip.Prefix{
 	netip.MustParsePrefix("203.0.113.0/24"),
 	netip.MustParsePrefix("192.88.99.0/24"),
 	netip.MustParsePrefix("255.255.255.255/32"),
+	// Teredo：包着 IPv4 的 IPv6 隧道。正常 RSS 抓取用不到它，
+	// 而解析它的客户端地址要做一次按位取反，绕道不如直接封。
+	netip.MustParsePrefix("2001::/32"),
+}
+
+// embeddedIPv4 从 IPv6 地址里拆出内嵌的 IPv4。
+//
+// 这几类地址在网络上是可路由的：NAT64 是标准化、很多云与 ISP 在用的
+// IPv4/IPv6 互通机制，6to4 有公开中继。防火墙与 SSRF 检查如果只看
+// IPv6 表面（IsPrivate/IsLoopback 对它们全为 false），
+// 那么 `http://[64:ff9b::a9fe:a9fe]/` 就是一个直通 169.254.169.254 的后门。
+//
+// 不在这里处理的两个：
+//   - 4in6（::ffff:a.b.c.d）由 netip 的 Unmap 在前面已经拆开；
+//   - Teredo 由 blockedPrefixes 整体封禁。
+func embeddedIPv4(ip netip.Addr) (netip.Addr, bool) {
+	if !ip.Is6() || ip.Is4In6() {
+		return netip.Addr{}, false
+	}
+	b := ip.As16()
+	v4 := func(o []byte) netip.Addr {
+		return netip.AddrFrom4([4]byte{o[0], o[1], o[2], o[3]})
+	}
+
+	// NAT64 知名前缀 64:ff9b::/96（RFC 6052）：后 32 位是 IPv4。
+	if b[0] == 0 && b[1] == 0x64 && b[2] == 0xff && b[3] == 0x9b &&
+		b[4] == 0 && b[5] == 0 && b[6] == 0 && b[7] == 0 &&
+		b[8] == 0 && b[9] == 0 && b[10] == 0 && b[11] == 0 {
+		return v4(b[12:16]), true
+	}
+	// 本地 NAT64 64:ff9b:1::/48（RFC 8215）：后 32 位同样是 IPv4。
+	if b[0] == 0 && b[1] == 0x64 && b[2] == 0xff && b[3] == 0x9b &&
+		b[4] == 0 && b[5] == 0x01 {
+		return v4(b[12:16]), true
+	}
+	// 6to4 2002::/16（RFC 3056）：第 2–5 字节是 IPv4。
+	if b[0] == 0x20 && b[1] == 0x02 {
+		return v4(b[2:6]), true
+	}
+	// IPv4-compatible ::/96（已废弃，但部分栈仍解析）。
+	// :: 与 ::1 已被 IsUnspecified / IsLoopback 先拦住，
+	// 走到这里且前 12 字节全 0 的都带着一个 IPv4。
+	if b[0] == 0 && b[1] == 0 && b[2] == 0 && b[3] == 0 &&
+		b[4] == 0 && b[5] == 0 && b[6] == 0 && b[7] == 0 &&
+		b[8] == 0 && b[9] == 0 && b[10] == 0 && b[11] == 0 {
+		return v4(b[12:16]), true
+	}
+	return netip.Addr{}, false
 }
 
 // allowedIP 判断一个解析结果能否作为出站目标。
@@ -42,6 +90,14 @@ func allowedIP(ip netip.Addr, allowPrivate bool) bool {
 	}
 	// 4in6（::ffff:127.0.0.1）必须先 Unmap，否则是一个现成的绕过。
 	ip = ip.Unmap()
+
+	// 内嵌 IPv4 的 IPv6 形式（NAT64、6to4、IPv4-compatible）必须拆开再判。
+	// IPv6 表面的 IsPrivate / IsLoopback 对这些形式全为 false，
+	// 而它们在网络上真的可路由——不拆就是一个直通内网的后门。
+	// 递归一层就终止：embeddedIPv4 返回的是 IPv4。
+	if v4, ok := embeddedIPv4(ip); ok {
+		return allowedIP(v4, allowPrivate)
+	}
 
 	// 这四类永远拒绝，与开关无关：
 	//   - 未指定地址（0.0.0.0 / ::）没有合法的连接语义；
