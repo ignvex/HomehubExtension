@@ -312,6 +312,20 @@ POST /api/v1/hub/subscriptions
 
 `interval` 会被夹到 `[rss.min_interval, rss.max_interval]`（默认 10 分钟到 6 小时）。超出范围不报错，直接取边界值——响应里的 `fetch_interval` 是实际生效值。
 
+`url` 会经过与网页端新建订阅相同的校验，不通过时返回 400 `invalid_request`：
+
+- scheme 必须是 `http` / `https`；
+- 不能带 `user:pass@`；
+- 字面 IP 不能是回环、私网、链路本地（含 `169.254.169.254`）、CGNAT 等；
+- 路径里显式写的端口只能是 `80` / `443` / `8080` / `8443`。
+
+域名形式的地址在这里**不做 DNS 解析**，检查发生在真正建连时。所以
+`http://localhost/feed` 能通过入库，但首次抓取会因解析到回环被拒——
+`last_error` 会写 `blocked host`。宿主应当在推送前就过滤掉这类地址。
+
+`rss.allow_private_hosts=true` 时上述地址限制全部放开（端口限制也一并取消），
+用于订阅自家 NAS 上的源。
+
 `next_fetch_at` 只在间隔真的变化时重排。重复推送同一间隔不会把抓取时间往后推。
 
 响应里的 `fetch_interval` 是紧凑写法（`"30m"`、`"1h30m"`、`"6h"`），可以直接作为下一次推送的 `interval` 原样传回。
@@ -461,7 +475,7 @@ DELETE /api/v1/hub/keys/01JC8Z…
 
 | HTTP | code | 含义 | 宿主该怎么做 |
 | --- | --- | --- | --- |
-| 400 | `invalid_request` | 字段格式错误 | 修正后重试，不要原样重发 |
+| 400 | `invalid_request` | 字段格式错误；`url` 指向内网地址或端口不在白名单 | 修正后重试，不要原样重发 |
 | 401 | `unauthenticated` | 签名/时间戳/nonce 问题 | **不要重试**。检查时钟、nonce 唯一性、PATH/QUERY 编码 |
 | 404 | `not_found` | 订阅或密钥不存在；RSS 模块未启用 | 从本地状态里移除；模块关闭时停止展示 RSS |
 | 413 | `payload_too_large` | 超过 `server.max_body_bytes` | 缩小请求体 |

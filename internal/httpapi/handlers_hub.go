@@ -75,6 +75,19 @@ func (s *server) handleHubUpsert(c *gin.Context) {
 
 	ctx := c.Request.Context()
 
+	// 入库前校验地址，与网页端新建订阅保持同一条规则。
+	//
+	// 宿主通道有签名保护，不是未授权的 SSRF 入口；但宿主推来的 URL
+	// 往往来自用户输入（用户在宿主里粘什么就推什么），而抓取时
+	// 连接会被 Transport 拦住——于是内网地址会入库、每次抓取都失败、
+	// error_count 累积到被自动停用。在入口就拒绝比让它入库后
+	// 反复失败更早、也更好排查。
+	if err := s.RSS.ValidateURL(req.URL); err != nil {
+		failWith(c, http.StatusBadRequest, "invalid_request", "订阅地址不可用",
+			FieldError{Field: "url", Reason: err.Error()})
+		return
+	}
+
 	existing, err := s.Store.Feed().GetByURL(ctx, req.URL)
 	if err != nil && !errors.Is(err, store.ErrNotFound) {
 		fail(c, err)
@@ -86,37 +99,7 @@ func (s *server) handleHubUpsert(c *gin.Context) {
 		return
 	}
 
-	enabled := true
-	if existing != nil {
-		enabled = existing.Enabled
-	}
-	if req.Enabled != nil {
-		enabled = *req.Enabled
-	}
-
-	now := time.Now()
-
-	// 间隔没变就保留原定抓取时刻——只改标题不该把下一次抓取整段推迟。
-	// 间隔变了必须重排，否则宿主调小间隔后要等一个旧周期（最长
-	// max_interval）才生效。
-	var next *int64
-	if existing != nil {
-		next = existing.NextFetchAt
-	}
-	if existing == nil || existing.FetchInterval != int64(interval/time.Second) {
-		v := now.Add(interval).Unix()
-		next = &v
-	}
-
-	feed := &store.Feed{
-		URL:           req.URL,
-		Title:         req.Title,
-		Source:        "hub",
-		Enabled:       enabled,
-		FetchInterval: int64(interval / time.Second),
-		NextFetchAt:   next,
-		CreatedAt:     now.Unix(),
-	}
+	feed := planUpsert(req, existing, interval, time.Now())
 
 	saved, created, err := s.Store.Feed().Upsert(ctx, feed)
 	if err != nil {
@@ -144,6 +127,45 @@ func (s *server) handleHubUpsert(c *gin.Context) {
 	}
 
 	c.JSON(status, toHubSubscription(&saved))
+}
+
+// planUpsert 根据推送内容与已存状态算出要写入的 feed。
+//
+// 三个字段的省略语义必须分清：
+//   - title / site_url 为空表示「没说」，由 SQL 里的 CASE 保留原值；
+//   - enabled 省略沿用已存状态，新建时默认 true；
+//   - next_fetch_at 只在间隔真变时才重排。
+//
+// 最后一条容易漏：只改标题的推送如果也重排，会把下一次抓取整段
+// 推迟一个周期；反过来，间隔变了却不重排，宿主调小间隔后要等
+// 旧周期（最长 max_interval）才生效。
+func planUpsert(req hubUpsertRequest, existing *store.Feed, interval time.Duration, now time.Time) *store.Feed {
+	enabled := true
+	if existing != nil {
+		enabled = existing.Enabled
+	}
+	if req.Enabled != nil {
+		enabled = *req.Enabled
+	}
+
+	var next *int64
+	if existing != nil {
+		next = existing.NextFetchAt
+	}
+	if existing == nil || existing.FetchInterval != int64(interval/time.Second) {
+		v := now.Add(interval).Unix()
+		next = &v
+	}
+
+	return &store.Feed{
+		URL:           req.URL,
+		Title:         req.Title,
+		Source:        "hub",
+		Enabled:       enabled,
+		FetchInterval: int64(interval / time.Second),
+		NextFetchAt:   next,
+		CreatedAt:     now.Unix(),
+	}
 }
 
 // reviveFeed 在宿主显式重新启用一条被自动停用的订阅时清零失败计数。

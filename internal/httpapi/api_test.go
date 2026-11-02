@@ -1555,3 +1555,64 @@ func TestAccessKeyRotationKeepsData(t *testing.T) {
 		t.Errorf("旧密钥仍可兑换 = %d, want 401", code)
 	}
 }
+
+// 宿主推送的 URL 与网页端新建订阅必须走同一条校验规则。
+//
+// 宿主通道有签名保护，不是未授权的 SSRF 入口；但宿主推的地址往往
+// 来自用户在宿主里的输入。不校验的话，内网地址会入库、每次抓取
+// 都失败、error_count 累积到被自动停用——一个可以避免的坏状态。
+func TestHubUpsertRejectsPrivateAddressLiteral(t *testing.T) {
+	h := newHarness(t)
+
+	cases := []struct {
+		name string
+		url  string
+	}{
+		{"云元数据", "http://169.254.169.254/latest/meta-data/"},
+		{"回环", "http://127.0.0.1:8080/feed.xml"},
+		{"RFC1918", "http://192.168.1.10/feed.xml"},
+		{"私网 10/8", "http://10.0.0.5/feed.xml"},
+		{"非白名单端口", "http://example.com:22/feed.xml"},
+		{"非 http scheme", "file:///etc/passwd"},
+	}
+
+	for i, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			body := []byte(`{"url":"` + tc.url + `"}`)
+			req := httptest.NewRequest(http.MethodPost, "/api/v1/hub/subscriptions", bytes.NewReader(body))
+			req.Header.Set("Content-Type", "application/json")
+			signHubRequest(t, req, h.hubPriv, body, "nonce-priv-"+fmt.Sprint(i))
+
+			w := h.do(t, req)
+			if w.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400: %s", w.Code, w.Body.String())
+			}
+
+			// 关键：不能只是报错，必须真的没入库。
+			feeds, err := h.db.Feed().List(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, f := range feeds {
+				if f.URL == tc.url {
+					t.Errorf("%s 仍被写进了 feed 表", tc.url)
+				}
+			}
+		})
+	}
+}
+
+// 合法公网地址仍然要能推。校验不能误伤到正常用法。
+func TestHubUpsertAcceptsPublicAddress(t *testing.T) {
+	h := newHarness(t)
+
+	body := []byte(`{"url":"https://blog.example.org/feed.xml"}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/hub/subscriptions", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	signHubRequest(t, req, h.hubPriv, body, "nonce-public")
+
+	w := h.do(t, req)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201: %s", w.Code, w.Body.String())
+	}
+}
