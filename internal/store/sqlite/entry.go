@@ -85,7 +85,11 @@ func (s entryStore) List(ctx context.Context, q store.EntryQuery) ([]store.Entry
 		b.WriteString(` AND starred_at IS NOT NULL`)
 	}
 	if s := strings.TrimSpace(q.Search); s != "" {
-		b.WriteString(` AND (title LIKE ? OR content_text LIKE ?)`)
+		// ESCAPE '\\' 不能省。escapeLike 会把 % 和 _ 转成 \% 与 \_，
+		// 但 SQLite 的 LIKE 默认不把反斜杠当转义符：没有这个子句时
+		// 模式里的 \ 只是一个普通字符，搜 "50%" 会变成「含反斜杠」
+		// 这种永远匹配不到的形状。
+		b.WriteString(` AND (title LIKE ? ESCAPE '\' OR content_text LIKE ? ESCAPE '\')`)
 		pat := "%" + escapeLike(s) + "%"
 		args = append(args, pat, pat)
 	}
