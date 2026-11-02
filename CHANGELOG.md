@@ -22,15 +22,20 @@
   `POST /api/v1/feeds/import` 批量导入。导入按递归收集分组嵌套的
   `<outline>`（多数阅读器导出会套两层文件夹），单条失败不中断整批并
   逐条回报原因。前端在「订阅源」页加入导入/导出按钮。
-- **宿主读取条目**：`GET /api/v1/hub/entries`。此前宿主只能推订阅、
-  看状态，一条正文都读不到，无法自己渲染阅读界面。响应里的
-  `content_html` 已把媒体地址改写为绝对 URL；拉列表不标记已读。
 - **宿主批量推送**：`POST /api/v1/hub/subscriptions/batch`。启动对账
   补推几百条订阅时不必逐条签名往返，上限 500 条。
-- **宿主聚合统计**：`GET /api/v1/hub/stats`，返回订阅数、条目数、
-  未读数、blob 数量与字节数、待重试媒体数。
 - **前端条目搜索与标星筛选**：`/entries` 增加搜索框（300 ms 防抖、
   回车立即搜）与「只看标星」。两个参数后端本就支持，此前前端没有入口。
+
+### 移除
+
+- **`GET /api/v1/hub/entries` 与 `GET /api/v1/hub/stats`**。
+  这两个端点是为「宿主自己渲染阅读界面」设计的，但宿主侧的
+  `hubclient` 与前端 `extensionHubApi` 从未调用过——它的
+  `fetch_by=extension` 语义是「对端抓取，去 Extension 阅读」，
+  阅读界面本来就在本服务这边。保留无人使用的接口只会让契约
+  面变宽、增加维护与攻击面，因此移除。
+  `POST /api/v1/hub/subscriptions/batch` 保留。
 
 ### 性能与宿主通道
 

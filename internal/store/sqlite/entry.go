@@ -114,7 +114,6 @@ func (s entryStore) List(ctx context.Context, q store.EntryQuery) ([]store.Entry
 		}
 		// 查询本身始终带正文列（entryCols 固定），这里按需裁掉：
 		// 一页 50 条的 content_html 可能有几十 MB，网页列表用不到。
-		// 宿主读内容时传 WithContent=true 保留正文。
 		if !q.WithContent {
 			e.ContentHTML = ""
 			e.ContentText = ""

@@ -155,7 +155,9 @@ type EntryQuery struct {
 	// WithContent 决定返回的条目里是否保留 content_html / content_text。
 	//
 	// 默认 false：一页 50 条的正文可能有几十 MB，列表接口不需要。
-	// 宿主读内容（GET /hub/entries）传 true——它就是要渲染正文。
+	// 目前没有调用方传 true（原先传 true 的宿主读内容端点已移除），
+	// 保留字段是为了不改 List 的签名——将来若有「列表带正文」的
+	// 调用点，打开开关即可。
 	// 注意 SQL 始终会读这两列，这个开关只控制是否在返回前清空；
 	// 它是带宽开关，不是查询优化开关。
 	WithContent bool
