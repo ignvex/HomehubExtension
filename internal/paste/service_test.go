@@ -2,6 +2,7 @@ package paste
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"path/filepath"
 	"strings"
@@ -343,5 +344,85 @@ func TestPublicDisabled(t *testing.T) {
 	_, _, err = s.Create(context.Background(), CreateRequest{Body: "x", Visibility: VisPublic})
 	if !errors.Is(err, ErrForbidden) {
 		t.Errorf("err = %v, want ErrForbidden", err)
+	}
+}
+
+// VerifyPassword 从数据库里的 PHC 字符串解析 argon2 参数后直接使用。
+// argon2.IDKey 按 m（单位 KiB）分配内存，不设上限时一个被篡改的 hash
+// 就是一次可以从读请求触发的 OOM：m=4294967295 相当于 4 TiB。
+//
+// 这些用例全部要求「返回 false」而不是 panic/alloc——验证失败与
+// 参数异常在外部必须不可区分，否则响应差异本身就是信息泄露。
+func TestVerifyPasswordRejectsHostileParams(t *testing.T) {
+	salt := base64.RawStdEncoding.EncodeToString([]byte("0123456789abcdef"))
+	key := base64.RawStdEncoding.EncodeToString(make([]byte, 32))
+
+	cases := []struct {
+		name string
+		hash string
+	}{
+		{
+			name: "内存超上限（会 OOM）",
+			hash: "$argon2id$v=19$m=4294967295,t=3,p=2$" + salt + "$" + key,
+		},
+		{
+			name: "内存低于下限",
+			hash: "$argon2id$v=19$m=1,t=3,p=2$" + salt + "$" + key,
+		},
+		{
+			name: "轮数过大（CPU 卡死）",
+			hash: "$argon2id$v=19$m=65536,t=4294967295,p=2$" + salt + "$" + key,
+		},
+		{
+			name: "轮数为 0",
+			hash: "$argon2id$v=19$m=65536,t=0,p=2$" + salt + "$" + key,
+		},
+		{
+			name: "并行度过大",
+			hash: "$argon2id$v=19$m=65536,t=3,p=255$" + salt + "$" + key,
+		},
+		{
+			name: "并行度为 0",
+			hash: "$argon2id$v=19$m=65536,t=3,p=0$" + salt + "$" + key,
+		},
+		{
+			name: "盐为空",
+			hash: "$argon2id$v=19$m=65536,t=3,p=2$$" + key,
+		},
+		{
+			name: "盐超长",
+			hash: "$argon2id$v=19$m=65536,t=3,p=2$" +
+				base64.RawStdEncoding.EncodeToString(make([]byte, 1024)) + "$" + key,
+		},
+		{
+			name: "摘要为空",
+			hash: "$argon2id$v=19$m=65536,t=3,p=2$" + salt + "$",
+		},
+		{
+			name: "摘要超长",
+			hash: "$argon2id$v=19$m=65536,t=3,p=2$" + salt + "$" +
+				base64.RawStdEncoding.EncodeToString(make([]byte, 4096)),
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			// 只要返回 false 就算通过：关键是不能分配 4 TiB、
+			// 不能跑几十亿轮、不能 panic。
+			if VerifyPassword(tc.hash, "anything") {
+				t.Error("恶意参数应当验证失败")
+			}
+		})
+	}
+}
+
+// 正常参数必须仍然能通过：加范围校验不能误伤合法 hash。
+func TestVerifyPasswordAcceptsCurrentParams(t *testing.T) {
+	hash, err := HashPassword("still works")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !VerifyPassword(hash, "still works") {
+		t.Error("当前参数生成的 hash 被误判为非法")
 	}
 }

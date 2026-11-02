@@ -435,6 +435,27 @@ const (
 	argonSaltLen = 16
 )
 
+// 校验时可接受的 argon2 参数区间。
+//
+// 这些数字必须存在：VerifyPassword 从数据库里的 PHC 字符串解析
+// m= / t= / p= 后直接交给 argon2.IDKey，而 IDKey 会按 m 分配内存
+// （单位 KiB）。没有上限时，一个被篡改或导入的 hash 写成
+// m=4294967295 就是 4 TiB 分配——在 MemoryMax=512M 的容器里
+// 直接 OOM kill，而触发它只需要一次带口令的读请求。
+//
+// 区间取宽是为了以后调参不失效：当前 64 MiB / 3 轮落在中间。
+var (
+	argonMinMemory  uint32 = 8 * 1024    // 8 MiB
+	argonMaxMemory  uint32 = 1024 * 1024 // 1 GiB
+	argonMaxTime    uint32 = 10
+	argonMaxThreads uint8  = 16
+)
+
+const (
+	argonMaxSaltLen = 64
+	argonMaxKeyLen  = 64
+)
+
 // HashPassword 产出 PHC 格式字符串，自描述参数，将来调参不会让旧口令失效。
 func HashPassword(pw string) (string, error) {
 	salt := make([]byte, argonSaltLen)
@@ -463,15 +484,26 @@ func VerifyPassword(encoded, pw string) bool {
 	if _, err := fmt.Sscanf(parts[3], "m=%d,t=%d,p=%d", &memory, &timeCost, &threads); err != nil {
 		return false
 	}
+	// 参数必须落在合理区间。argon2.IDKey 按 m 分配内存（KiB），
+	// 不校验就是一个可以从 hash 字符串触发的 OOM：
+	// m=4294967295 相当于 4 TiB。这类 hash 一律当作验证失败，
+	// 不报错——攻击者不应从响应差异里得知我们拒绝了什么。
+	if memory < argonMinMemory || memory > argonMaxMemory ||
+		timeCost == 0 || timeCost > argonMaxTime ||
+		threads == 0 || threads > argonMaxThreads {
+		return false
+	}
 	salt, err := base64.RawStdEncoding.DecodeString(parts[4])
-	if err != nil {
+	if err != nil || len(salt) == 0 || len(salt) > argonMaxSaltLen {
 		return false
 	}
 	want, err := base64.RawStdEncoding.DecodeString(parts[5])
-	if err != nil {
+	if err != nil || len(want) < 16 || len(want) > argonMaxKeyLen {
 		return false
 	}
-	got := argon2.IDKey([]byte(pw), salt, timeCost, memory, threads, uint32(len(want)))
+	// len(want) 已在上面限定在 [16, argonMaxKeyLen]，
+	// 转 uint32 不会截断。
+	got := argon2.IDKey([]byte(pw), salt, timeCost, memory, threads, uint32(len(want))) // #nosec G115 -- 上方已限定长度
 	return subtle.ConstantTimeCompare(got, want) == 1
 }
 
