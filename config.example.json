@@ -22,7 +22,7 @@
     "failed_attempt_window": "5m",
     "hub": {
       "enabled": true,
-      "_comment": "粘贴宿主设置页「复制公钥」给出的 PKIX PEM，或它的裸 base64。这里存的是公钥内容，不是文件路径。",
+      "_comment": "粘贴宿主公钥内容：PKIX PEM 或它的裸 base64。多行 PEM 需把换行写成 \\n，否则 JSON 非法；最省事的是用单行 base64。这里存的是内容，不是路径。",
       "public_key": "",
       "clock_skew": "60s",
       "nonce_ttl": "2m"

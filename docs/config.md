@@ -86,12 +86,14 @@ Homehub 宿主推送订阅时使用的入站签名通道。
 
 | 字段 | 类型 | 默认 | 说明 |
 | --- | --- | --- | --- |
-| `hub.enabled` | bool | `false` | 是否启用。关掉后 `/api/v1/hub/*` 全部返回 401。 |
-| `hub.public_key` | string | 空 | 宿主公钥**内容**，接受 PKIX PEM 或裸 base64。把宿主设置页「复制公钥」给出的文本原样粘贴进来；它不是文件路径。为空时该通道不注册，但**不会拒绝启动**——很多部署一开始只用浏览器。 |
+| `hub.enabled` | bool | `false` | 是否启用。关掉后 `/api/v1/hub/*`、`/api/v1/fetch`、`/api/v1/avatar/{hash}` 全部返回 503。 |
+| `hub.public_key` | string | 空 | 宿主公钥**内容**，接受 PKIX PEM 或裸 base64，不是文件路径。多行 PEM 粘进 JSON 字符串时必须把换行写成 `\n`，否则文件本身就不合法；用单行 base64 最省事。为空时签名通道不启用（`/hub/*`、`/fetch`、`/avatar` 全部 503），但**不会拒绝启动**——很多部署一开始只用浏览器。 |
 | `hub.clock_skew` | duration | `60s` | 允许的时间戳偏差。放宽意味着重放窗口变长，不要超过 5 分钟。 |
 | `hub.nonce_ttl` | duration | `2m` | nonce 去重表的 TTL，需大于 `clock_skew`。 |
 
 私钥留在 Homehub 那一侧，Extension 只存公钥。已通过签名的请求不会因为公钥泄露而被伪造——泄露公钥只能用来**验证**，不能用来签名。
+
+同一把公钥同时护着 `/api/v1/fetch` 与 `/api/v1/avatar/{hash}`：这两条资源代理与 `/hub/*` 共用签名校验，不引入第三种凭据。`/hub/subscriptions*` 还额外要求 `rss.enabled`，资源代理不需要。
 
 ### 3.4 `database`
 

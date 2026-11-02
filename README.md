@@ -342,7 +342,7 @@ systemctl list-timers hhe-backup.timer
 | [docs/architecture.md](docs/architecture.md) | 运行拓扑、组件职责、数据流、存储布局、资源预算、技术选型理由 |
 | [docs/config.md](docs/config.md) | 配置加载、全字段说明、cleanup cron 设计、systemd 集成 |
 | [docs/api.md](docs/api.md) | REST 约定、Ed25519 双向鉴权协议、端点清单、错误与分页 |
-| [docs/hub-integration.md](docs/hub-integration.md) | **面向 Homehub 宿主的对接指南**：部署准备、请求签名（含 Go/TS 参考实现与测试向量）、端点、重试与对账 |
+| [docs/hub-integration.md](docs/hub-integration.md) | **指向 Homehub 仓库的指针**：`/api/v1/hub/*` 的协议唯一事实源在宿主侧 |
 | [CHANGELOG.md](CHANGELOG.md) | 版本变更记录；本版发布说明见 [docs/release-notes/v1.0.0-alpha.md](docs/release-notes/v1.0.0-alpha.md) |
 | [docs/rss.md](docs/rss.md) | 抓取与条件请求、HTML 白名单清洗、媒体下载与重写、SSRF 防护、CSP |
 | [docs/frontend.md](docs/frontend.md) | pnpm 工程、路由与视图、CSS 分层、阅读器排版、构建与 embed |

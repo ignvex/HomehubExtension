@@ -553,7 +553,7 @@ X-HH-Signature: <base64>
 | `GET` | `/api/v1/system/stats` | 计数：paste、feed、entry、blob 占用、待重试媒体 |
 | `GET` | `/api/v1/system/jobs` | 最近 50 条 `job_run` |
 | `POST` | `/api/v1/system/jobs/{name}/run` | 手动触发一次清理，同步返回结果摘要 |
-| `GET` | `/api/v1/system/config` | 当前生效配置的**脱敏**视图（密钥、token 显示为 `***`） |
+| `GET` | `/api/v1/system/config` | 当前生效配置的**脱敏**视图：密钥路径显示为 `(configured)`，`auth.hub.public_key` 只给 `public_key_set` 布尔值 |
 
 `/healthz` 与 `/readyz` 不进鉴权，也不记访问日志（避免探针刷日志）。`/readyz` 的失败原因放在响应体里，便于 curl 排查。
 
@@ -659,4 +659,4 @@ curl -s "https://homehub.example.com/api/v1/entries?unread=true&limit=20" \
 
 ## 10. 相关文档
 
-- 面向 Homehub 宿主的对接指南：[hub-integration.md](hub-integration.md)——部署准备、签名实现、端点清单、重试与对账语义。
+- 面向 Homehub 宿主的协议：[Homehub 仓库的 docs/hub-integration.md](https://github.com/ignvex/Homehub/blob/main/docs/hub-integration.md)、[docs/extension.md](https://github.com/ignvex/Homehub/blob/main/docs/extension.md)。本仓库的 `hub-integration.md` 只是指针，不维护契约副本。

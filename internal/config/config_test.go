@@ -1,6 +1,7 @@
 package config
 
 import (
+	"bytes"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -211,5 +212,44 @@ func TestRedactedPublicKeySetFalse(t *testing.T) {
 	authSection := out["auth"].(redactedAuth)
 	if authSection.Hub.PublicKeySet {
 		t.Error("public_key_set should be false when no key is configured")
+	}
+}
+
+// 仓库根的 config.example.json 必须能被真实解析器接受。
+//
+// 它是运维照着改的第一份文件，带 _comment 这类字段；解析器开着
+// DisallowUnknownFields，模板里多一个未声明字段就会让新部署直接起不来。
+func TestExampleConfigParses(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join("..", "..", "config.example.json"))
+	if err != nil {
+		t.Fatalf("read example config: %v", err)
+	}
+	var cfg Config
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&cfg); err != nil {
+		t.Fatalf("config.example.json is not loadable: %v", err)
+	}
+	if cfg.Auth.Hub.Comment == "" {
+		t.Error("auth.hub._comment should survive parsing as documentation")
+	}
+	if cfg.Auth.Hub.PublicKey != "" {
+		t.Errorf("example must not ship a key, got %q", cfg.Auth.Hub.PublicKey)
+	}
+}
+
+// _comment 是模板里的人话说明。没声明它时 DisallowUnknownFields
+// 会把它当成拼写错误，示例配置直接无法启动。
+func TestLoadAcceptsHubComment(t *testing.T) {
+	dir := t.TempDir()
+	body := `{
+	  "version": 1,
+	  "server": {"addr": "127.0.0.1:8080"},
+	  "auth": {"hub": {"_comment": "粘贴公钥内容，不是路径", "public_key": ""}},
+	  "database": {"path": "` + filepath.Join(dir, "db") + `"},
+	  "storage": {"blob_dir": "` + filepath.Join(dir, "blobs") + `"}
+	}`
+	if _, _, err := Load(writeConfig(t, body)); err != nil {
+		t.Fatalf("Load: %v", err)
 	}
 }
