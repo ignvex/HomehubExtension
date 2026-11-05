@@ -40,6 +40,10 @@ var blockedPrefixes = []netip.Prefix{
 
 // embeddedIPv4 从 IPv6 地址里拆出内嵌的 IPv4。
 //
+// 调用前提：:: 与 ::1 已由调用方（allowedIP）先判掉。它们的前 12 字节
+// 同样全 0，若先进这里会被当成 IPv4-compatible 拆成 0.0.0.0 / 0.0.0.1，
+// ::1 就不再按回环处理——allowPrivate=true 时这个差别是可观察的。
+//
 // 这几类地址在网络上是可路由的：NAT64 是标准化、很多云与 ISP 在用的
 // IPv4/IPv6 互通机制，6to4 有公开中继。防火墙与 SSRF 检查如果只看
 // IPv6 表面（IsPrivate/IsLoopback 对它们全为 false），
@@ -73,8 +77,8 @@ func embeddedIPv4(ip netip.Addr) (netip.Addr, bool) {
 		return v4(b[2:6]), true
 	}
 	// IPv4-compatible ::/96（已废弃，但部分栈仍解析）。
-	// :: 与 ::1 已被 IsUnspecified / IsLoopback 先拦住，
-	// 走到这里且前 12 字节全 0 的都带着一个 IPv4。
+	// :: 与 ::1 由 allowedIP 在调用本函数之前用 IsUnspecified / IsLoopback
+	// 判掉，走到这里且前 12 字节全 0 的都带着一个 IPv4。
 	if b[0] == 0 && b[1] == 0 && b[2] == 0 && b[3] == 0 &&
 		b[4] == 0 && b[5] == 0 && b[6] == 0 && b[7] == 0 &&
 		b[8] == 0 && b[9] == 0 && b[10] == 0 && b[11] == 0 {
@@ -91,6 +95,18 @@ func allowedIP(ip netip.Addr, allowPrivate bool) bool {
 	// 4in6（::ffff:127.0.0.1）必须先 Unmap，否则是一个现成的绕过。
 	ip = ip.Unmap()
 
+	// 未指定地址（0.0.0.0 / ::）没有合法的连接语义，永远拒绝。
+	// 必须排在拆内嵌 IPv4 之前：:: 的前 12 字节全 0，会被
+	// embeddedIPv4 当成 IPv4-compatible 拆成 0.0.0.0。
+	if ip.IsUnspecified() {
+		return false
+	}
+	// ::1 同理必须先按回环判：否则会被拆成 0.0.0.1，结论变成
+	// 「0.0.0.0/8 拒绝」而不是「回环，随 allowPrivate 放行」。
+	if ip.IsLoopback() {
+		return allowPrivate
+	}
+
 	// 内嵌 IPv4 的 IPv6 形式（NAT64、6to4、IPv4-compatible）必须拆开再判。
 	// IPv6 表面的 IsPrivate / IsLoopback 对这些形式全为 false，
 	// 而它们在网络上真的可路由——不拆就是一个直通内网的后门。
@@ -99,11 +115,10 @@ func allowedIP(ip netip.Addr, allowPrivate bool) bool {
 		return allowedIP(v4, allowPrivate)
 	}
 
-	// 这四类永远拒绝，与开关无关：
-	//   - 未指定地址（0.0.0.0 / ::）没有合法的连接语义；
+	// 这几类永远拒绝，与开关无关：
 	//   - 组播不是主机目标；
 	//   - 链路本地含云元数据 169.254.169.254，放开等于把凭据交给任意 feed。
-	if ip.IsUnspecified() || ip.IsMulticast() ||
+	if ip.IsMulticast() ||
 		ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() ||
 		ip.IsInterfaceLocalMulticast() {
 		return false
