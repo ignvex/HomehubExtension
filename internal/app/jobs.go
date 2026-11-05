@@ -154,7 +154,12 @@ func (j *Jobs) BlobGC(ctx context.Context, p map[string]any) (string, error) {
 		return "", err
 	}
 	if dryRun {
-		return fmt.Sprintf("dry_run: %d blobs would be purged", len(unref)), nil
+		orphans, orphanBytes, err := j.sweepOrphans(ctx, j.now().Add(-grace), true)
+		if err != nil {
+			return "", err
+		}
+		return fmt.Sprintf("dry_run: %d blobs would be purged, %d orphan files (%.1f MB) would be removed",
+			len(unref), orphans, float64(orphanBytes)/(1<<20)), nil
 	}
 
 	var purged int
@@ -173,11 +178,85 @@ func (j *Jobs) BlobGC(ctx context.Context, p map[string]any) (string, error) {
 		freed += b.Size
 	}
 
-	msg := fmt.Sprintf("purged %d blobs, freed %.1f MB", purged, float64(freed)/(1<<20))
+	// 孤儿文件放在行级 GC 之后：上面刚删掉行、但文件删除失败的那些，
+	// 这里会作为孤儿再被捞一次。
+	orphans, orphanBytes, err := j.sweepOrphans(ctx, j.now().Add(-grace), false)
+	if err != nil {
+		return "", err
+	}
+
+	msg := fmt.Sprintf("purged %d blobs, freed %.1f MB, removed %d orphan files (%.1f MB)",
+		purged, float64(freed)/(1<<20), orphans, float64(orphanBytes)/(1<<20))
 	if recalibrated > 0 {
 		msg += fmt.Sprintf(", recalibrated %d counters", recalibrated)
 	}
 	return msg, nil
+}
+
+// orphanBatch 是孤儿判定时一次查询的 sha 数，与 BlobStore.Known 的上限一致。
+const orphanBatch = 500
+
+// sweepOrphans 删除磁盘上存在、blob 表里没有行的文件。
+//
+// 来源：下载落盘后、blob 行入库前进程崩溃；或 blob 行被删但文件删除失败。
+// 这些文件占着配额却永远不会被行级 GC 看到。
+//
+// 宽限保护：只删 mtime 早于 cutoff 的文件。抓取管线是「先落盘、后入库」，
+// 刚写入的文件在入库前的几秒里看起来就是孤儿；去重命中会刷新 mtime，
+// 所以被复用的旧文件同样受保护。最终的 mtime 判定与删除在
+// blob.Store 的锁内完成（RemoveIfOlder），不会与并发落位交叠。
+func (j *Jobs) sweepOrphans(ctx context.Context, cutoff time.Time, dryRun bool) (count int, bytes int64, err error) {
+	if j.Blobs == nil {
+		return 0, 0, nil
+	}
+	var batch []blob.FileInfo
+	flush := func() error {
+		if len(batch) == 0 {
+			return nil
+		}
+		shas := make([]string, len(batch))
+		for i, f := range batch {
+			shas[i] = f.SHA256
+		}
+		known, err := j.Store.Blob().Known(ctx, shas)
+		if err != nil {
+			return err
+		}
+		for _, f := range batch {
+			if known[f.SHA256] {
+				continue
+			}
+			if dryRun {
+				count++
+				bytes += f.Size
+				continue
+			}
+			removed, size, err := j.Blobs.RemoveIfOlder(f.SHA256, f.Ext, cutoff)
+			if err != nil || !removed {
+				continue // 删不掉就留到下一轮
+			}
+			count++
+			bytes += size
+		}
+		batch = batch[:0]
+		return nil
+	}
+
+	err = j.Blobs.WalkFiles(ctx, func(f blob.FileInfo) error {
+		// 宽限期内的文件不进候选：省一次查询，也让 dry_run 计数准确。
+		if !f.ModTime.Before(cutoff) {
+			return nil
+		}
+		batch = append(batch, f)
+		if len(batch) >= orphanBatch {
+			return flush()
+		}
+		return nil
+	})
+	if err != nil {
+		return count, bytes, err
+	}
+	return count, bytes, flush()
 }
 
 // DBVacuum 回收空闲页。full 模式会阻塞写入，默认只做 incremental。

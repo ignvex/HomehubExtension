@@ -576,20 +576,24 @@ func truncErr(err error) string {
 // DownloadAll 并发下载一组资源，返回 URL → 结果。
 // 同一 URL 只下载一次。
 //
-// 所有并发写入共享一个 QuotaTracker：否则每个 goroutine 都拿调用方
-// 传入的同一份旧快照去检查配额，各自都能通过，合计可写入 N 倍配额。
+// quota 由调用方按「一轮抓取」创建并在多个条目之间复用，基线只查一次库。
+// 为 nil 时新建一个基线为 0 的 tracker。跨 tracker（多轮并发抓取）的
+// 合计约束由 blob.Store 的全局已用视图保证，见 blob.Store.place。
 func (d *Downloader) DownloadAll(
 	ctx context.Context,
 	targets []Target,
 	referer string,
-	used int64,
+	quota *blob.QuotaTracker,
 ) map[string]MediaResult {
 	out := make(map[string]MediaResult)
 	var mu sync.Mutex
 	seen := make(map[string]struct{})
 	var wg sync.WaitGroup
 
-	quota := blob.NewQuotaTracker(used)
+	if quota == nil {
+		quota = blob.NewQuotaTracker(0)
+	}
+	used := quota.Used()
 
 	for _, t := range targets {
 		url := t.Resolved

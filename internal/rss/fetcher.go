@@ -1,6 +1,7 @@
 package rss
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -104,6 +105,42 @@ func NewService(st store.Store, blobs *blob.Store, cfg Config, log *slog.Logger)
 	}
 }
 
+// stateWriteTimeout 是抓取结束后回写状态的独立时限。
+//
+// 回写不能用抓取的 ctx：FetchTimeout 到期后它已经取消，Update 必然失败，
+// next_fetch_at 不前移、error_count 不累加——一个总是超时的源会被
+// 调度器每轮重新捞起来，而且永远不会因连续失败被停用。
+const stateWriteTimeout = 5 * time.Second
+
+// writeContext 派生一个不随抓取 ctx 取消、但自带时限的写库 ctx。
+func writeContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(ctx), stateWriteTimeout)
+}
+
+// SafeHTTPURL 只接受 http/https 绝对 URL，其他一律返回空串。
+//
+// 用于会被渲染成链接或当作 Referer 的外部字段（条目链接、站点首页、
+// OPML 的 htmlUrl）：javascript:、data:、相对地址都不该进库。
+func SafeHTTPURL(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" || u.Opaque != "" {
+		return ""
+	}
+	switch strings.ToLower(u.Scheme) {
+	case "http", "https":
+	default:
+		return ""
+	}
+	if u.Hostname() == "" {
+		return ""
+	}
+	return u.String()
+}
+
 // ingestOutcome 汇报单个条目的处理结果。
 //
 // 用 struct 而不是 (bool, int, int, error)：三个裸返回值里有两个都是 int，
@@ -191,7 +228,9 @@ func (s *Service) FetchFeed(ctx context.Context, feed *store.Feed) (*Result, err
 		return res, err
 	}
 
-	parsed, err := s.fp.ParseString(string(doc.Body))
+	// 直接读字节：ParseString(string(body)) 会把最多 max_feed_bytes 的
+	// 正文再复制一份，512MB 的机器上这份拷贝是纯浪费。
+	parsed, err := s.fp.Parse(bytes.NewReader(doc.Body))
 	if err != nil {
 		res.Status = doc.Status
 		res.Error = "parse: " + err.Error()
@@ -203,15 +242,28 @@ func (s *Service) FetchFeed(ctx context.Context, feed *store.Feed) (*Result, err
 		feed.Title = truncateString(parsed.Title, 200)
 	}
 	if feed.SiteURL == "" {
-		feed.SiteURL = parsed.Link
+		feed.SiteURL = SafeHTTPURL(parsed.Link)
 	}
 
 	base := baseURL(parsed, feed)
+
+	// 整轮只查一次 SUM(size)：之前每个条目查一次，一个 50 条的源就是
+	// 50 次聚合查询。本轮的新增用量由 tracker 累加，跨轮、跨 tracker 的
+	// 并发由 blob.Store 的全局视图兜底。
+	used, err := s.st.Blob().TotalSize(ctx)
+	if err != nil {
+		// 不能把查询失败当成 0 而不留痕：blob.Store 的全局视图仍在兜底，
+		// 磁盘余量检查（min_free_bytes）也还在。
+		s.log.Warn("blob total size unavailable, quota check degraded",
+			"feed_id", feed.ID, "err", err)
+	}
+	quota := blob.NewQuotaTracker(used)
+
 	for _, item := range parsed.Items {
 		if ctx.Err() != nil {
 			break
 		}
-		outcome, err := s.ingestItem(ctx, feed, item, base, now)
+		outcome, err := s.ingestItem(ctx, feed, item, base, now, quota)
 		if err != nil {
 			s.log.Warn("ingest item failed", "feed_id", feed.ID, "err", err)
 			continue
@@ -319,17 +371,22 @@ func sanitizePreview(b []byte) string {
 func baseURL(parsed *gofeed.Feed, feed *store.Feed) *url.URL {
 	candidates := []string{parsed.Link, feed.SiteURL, feed.URL}
 	for _, c := range candidates {
-		if c == "" {
+		// base 决定相对地址解析成什么：javascript: 之类的 base 会把
+		// 相对 href 变成可执行链接，所以只接受 http/https。
+		if c = SafeHTTPURL(c); c == "" {
 			continue
 		}
-		if u, err := url.Parse(c); err == nil && u.Scheme != "" {
+		if u, err := url.Parse(c); err == nil {
 			return u
 		}
 	}
 	return nil
 }
 
-// ingestItem 处理单个条目：清洗 → 下载 → 重写 → 入库。
+// ingestItem 处理单个条目：查重 → 清洗 → 下载 → 重写 → 入库。
+//
+// 查重排在最前：已入库的条目不清洗、不下载。否则每轮轮询都会把
+// 源里所有旧条目的媒体重新拉一遍（内容寻址只省磁盘，不省带宽）。
 //
 // 媒体下载在写库之前完成，落库的 content_html 就是最终形态。
 // 读者打开时不会触发任何补抓，也不会看到"先原图后占位"的闪烁。
@@ -339,10 +396,19 @@ func (s *Service) ingestItem(
 	item *gofeed.Item,
 	base *url.URL,
 	now time.Time,
+	quota *blob.QuotaTracker,
 ) (ingestOutcome, error) {
 	guid := itemGUID(item)
 	if guid == "" {
 		return ingestOutcome{}, errors.New("empty guid")
+	}
+
+	exists, err := s.st.Entry().Exists(ctx, feed.ID, guid)
+	if err != nil {
+		return ingestOutcome{}, fmt.Errorf("check entry exists: %w", err)
+	}
+	if exists {
+		return ingestOutcome{}, nil
 	}
 
 	raw := item.Content
@@ -357,9 +423,10 @@ func (s *Service) ingestItem(
 	}
 
 	// 条目自己的链接优先作为 base：它通常比站点首页更精确。
+	link := SafeHTTPURL(item.Link)
 	itemBase := base
-	if item.Link != "" {
-		if u, err := url.Parse(item.Link); err == nil && u.Scheme != "" {
+	if link != "" {
+		if u, err := url.Parse(link); err == nil {
 			itemBase = u
 		}
 	}
@@ -372,19 +439,12 @@ func (s *Service) ingestItem(
 	referer := ""
 	switch s.cfg.RefererMode {
 	case "auto":
-		referer = item.Link
+		referer = link
 	case "site":
 		referer = feed.SiteURL
 	}
 
-	used, err := s.st.Blob().TotalSize(ctx)
-	if err != nil {
-		// 不能把查询失败当成 0：那等于关掉配额，让一次抓取无限写盘。
-		// 保留 0 但留下日志，磁盘余量检查（min_free_bytes）仍在兜底。
-		s.log.Warn("blob total size unavailable, quota check degraded",
-			"feed_id", feed.ID, "err", err)
-	}
-	results := s.dl.DownloadAll(ctx, doc.Targets, referer, used)
+	results := s.dl.DownloadAll(ctx, doc.Targets, referer, quota)
 
 	// 重写必须在 Render 之前：落库的 HTML 就是读者最终看到的形态。
 	doc.Rewrite(results)
@@ -395,7 +455,7 @@ func (s *Service) ingestItem(
 	}
 
 	entry := buildEntry(feed.ID, guid, item, doc.Text(), rendered, now)
-	exists, err := s.st.Entry().InsertIfNew(ctx, entry)
+	exists, err = s.st.Entry().InsertIfNew(ctx, entry)
 	if err != nil {
 		return ingestOutcome{}, err
 	}
@@ -409,7 +469,12 @@ func (s *Service) ingestItem(
 
 	// blob 与 media_fetch 的写入必须在 entry 落库之后：
 	// 两者都需要 entry.ID，而且 entry_blob 有外键约束。
-	mediaOK, mediaFail := s.persistMedia(ctx, entry.ID, doc.Targets, results)
+	//
+	// 用独立的写 ctx：条目已经落库，此时抓取超时也必须把 blob 行写完，
+	// 否则文件在盘上却没有 blob 行，孤儿 GC 过了宽限期就会删掉它。
+	wctx, cancel := writeContext(ctx)
+	defer cancel()
+	mediaOK, mediaFail := s.persistMedia(wctx, entry.ID, doc.Targets, results)
 	return ingestOutcome{Created: true, MediaOK: mediaOK, MediaFail: mediaFail}, nil
 }
 
@@ -430,7 +495,7 @@ func buildEntry(feedID int64, guid string, item *gofeed.Item, text, html string,
 	return &store.Entry{
 		FeedID:      feedID,
 		GUID:        guid,
-		URL:         item.Link,
+		URL:         SafeHTTPURL(item.Link),
 		Title:       truncateString(strings.TrimSpace(item.Title), 500),
 		Author:      authorOf(item),
 		PublishedAt: &published,
@@ -444,6 +509,8 @@ func buildEntry(feedID int64, guid string, item *gofeed.Item, text, html string,
 // persistMedia 把下载结果写入 blob 表与 media_fetch。
 //
 // 失败记录也要落库：media-retry 任务靠它找到可重试的资源。
+// 全部写入合并成一个事务：之前每个资源 3 次独立写（3 次提交），
+// 一篇 30 张图的文章就是 90 次 fsync。
 func (s *Service) persistMedia(
 	ctx context.Context,
 	entryID int64,
@@ -453,6 +520,8 @@ func (s *Service) persistMedia(
 	seen := map[string]struct{}{}
 	nowSec := time.Now().Unix()
 
+	var blobs []store.Blob
+	var records []store.MediaRecord
 	for _, t := range targets {
 		r, exists := results[t.Resolved]
 		if !exists {
@@ -465,7 +534,7 @@ func (s *Service) persistMedia(
 
 		if r.Status == "ok" {
 			ok++
-			if err := s.st.Blob().Upsert(ctx, &store.Blob{
+			blobs = append(blobs, store.Blob{
 				SHA256:     r.SHA256,
 				Size:       r.Size,
 				MIME:       r.MIME,
@@ -473,17 +542,11 @@ func (s *Service) persistMedia(
 				Kind:       t.Kind,
 				CreatedAt:  nowSec,
 				LastSeenAt: nowSec,
-			}); err != nil {
-				s.log.Warn("upsert blob failed", "sha", r.SHA256, "err", err)
-			}
-			if err := s.st.Blob().Link(ctx, entryID, r.SHA256); err != nil {
-				s.log.Warn("link blob failed", "entry", entryID, "sha", r.SHA256, "err", err)
-			}
+			})
 		} else {
 			fail++
 		}
-
-		if err := s.st.Media().Record(ctx, &store.MediaRecord{
+		records = append(records, store.MediaRecord{
 			EntryID:   entryID,
 			SourceURL: r.URL,
 			SHA256:    r.SHA256,
@@ -491,14 +554,18 @@ func (s *Service) persistMedia(
 			Error:     r.Error,
 			Attempts:  0,
 			UpdatedAt: nowSec,
-		}); err != nil {
-			s.log.Warn("record media failed", "entry", entryID, "url", r.URL, "err", err)
-		}
+		})
+	}
+
+	if err := s.st.Blob().SaveEntryMedia(ctx, entryID, blobs, records); err != nil {
+		s.log.Warn("save entry media failed", "entry", entryID, "err", err)
 	}
 	return ok, fail
 }
 
 func (s *Service) markSuccess(ctx context.Context, feed *store.Feed, now time.Time, status int, etag, lastMod string) {
+	ctx, cancel := writeContext(ctx)
+	defer cancel()
 	feed.LastStatus = status
 	feed.LastError = ""
 	feed.ErrorCount = 0
@@ -512,6 +579,8 @@ func (s *Service) markSuccess(ctx context.Context, feed *store.Feed, now time.Ti
 }
 
 func (s *Service) markFailure(ctx context.Context, feed *store.Feed, now time.Time, status int, cause error) {
+	ctx, cancel := writeContext(ctx)
+	defer cancel()
 	feed.LastStatus = status
 	feed.LastError = truncateString(cause.Error(), 500)
 	feed.ErrorCount++

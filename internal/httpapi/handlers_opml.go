@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/ignvex/HomehubExtension/internal/rss"
 	"github.com/ignvex/HomehubExtension/internal/store"
 
 	"github.com/gin-gonic/gin"
@@ -210,10 +211,12 @@ func (s *server) importOutlines(
 			title = strings.TrimSpace(item.Text)
 		}
 
+		// htmlUrl 会被渲染成站点链接：只收 http/https 绝对地址，
+		// javascript: 之类的值存成空串。
 		next := now.Unix()
 		_, isNew, err := s.Store.Feed().Upsert(ctx, &store.Feed{
 			URL:           item.XMLURL,
-			SiteURL:       strings.TrimSpace(item.HTMLURL),
+			SiteURL:       rss.SafeHTTPURL(item.HTMLURL),
 			Title:         title,
 			Source:        "manual",
 			Enabled:       true,
