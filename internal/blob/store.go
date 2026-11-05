@@ -19,6 +19,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 )
 
 var (
@@ -36,9 +37,18 @@ type Store struct {
 	quota   int64
 	minFree int64
 
-	// mu 串行化「最终配额判定 + 落位」。没有它，多个并发写入会各自
-	// 用同一份过期快照通过检查，然后一起 rename，合计超出配额。
+	// mu 串行化「最终配额判定 + 落位」与删除。所有写入——无论属于哪个
+	// QuotaTracker、还是根本没带 tracker——都在这把锁下判定配额。
+	//
+	// 之前带 tracker 的写入只持 tracker 自己的锁：两轮并发抓取各开一个
+	// tracker，彼此看不到对方刚落盘的字节，合计可以写到两倍配额。
 	mu sync.Mutex
+	// used 是本进程视角的全局已用字节，受 mu 保护。
+	//
+	// 它不是唯一真相：每次判定都与调用方传入的数据库基线（PutOptions.Used
+	// 与 tracker 的值）取 max，所以进程刚启动、还没写过任何文件时，
+	// 数据库的 SUM(size) 仍然生效。落位成功累加，Delete 删掉文件时回减。
+	used int64
 }
 
 // Options 是打开存储的参数。零值字段使用默认值。
@@ -102,7 +112,7 @@ func NewQuotaTracker(used int64) *QuotaTracker {
 	return &QuotaTracker{total: used}
 }
 
-// Used 返回当前用量：基线 + 本批次已落盘字节。
+// Used 返回当前用量：基线 + 本批次已落盘字节（不含其他批次）。
 // nil 接收者返回 0，方便调用方不写分支。
 func (q *QuotaTracker) Used() int64 {
 	if q == nil {
@@ -113,16 +123,36 @@ func (q *QuotaTracker) Used() int64 {
 	return q.total
 }
 
-// lockQuota 取得配额判定所需的锁。
-// 有 tracker 时用它的锁，让同一批次共享累加值；否则退回 Store.mu，
-// 至少保证「检查」与「落位」不交叠。
-func (s *Store) lockQuota(q *QuotaTracker) func() {
-	if q != nil {
-		q.mu.Lock()
-		return q.mu.Unlock
+func (q *QuotaTracker) add(n int64) {
+	if q == nil {
+		return
 	}
+	q.mu.Lock()
+	q.total += n
+	q.mu.Unlock()
+}
+
+// baselineLocked 返回配额判定用的已用字节：Store 全局视图、调用方的
+// 数据库快照、批次 tracker 三者取最大。调用方必须持有 s.mu。
+//
+// 取 max 而不是相加：三者描述的是同一批磁盘字节的不同视角，
+// 相加会重复计数；取 max 保证任何一个视角看到的用量都不会被忽略。
+func (s *Store) baselineLocked(opt PutOptions) int64 {
+	used := s.used
+	if opt.Used > used {
+		used = opt.Used
+	}
+	if q := opt.Quota.Used(); q > used {
+		used = q
+	}
+	return used
+}
+
+// UsedBytes 返回 Store 全局视图下的当前用量（不含调用方基线）。
+func (s *Store) UsedBytes() int64 {
 	s.mu.Lock()
-	return s.mu.Unlock
+	defer s.mu.Unlock()
+	return s.used
 }
 
 // Result 是一次写入的结果。Existed 表示内容已存在，本次没有落盘。
@@ -140,8 +170,9 @@ type Result struct {
 // 「检查 — stat — rename」必须是连续的一段；
 // rename 失败时临时文件的清理只写一次。
 func (s *Store) place(tmpName, sum string, ext string, written int64, opt PutOptions) (*Result, error) {
-	unlock := s.lockQuota(opt.Quota)
-	defer unlock()
+	// 始终持 Store 级锁：配额是全局的，判定也必须全局串行。
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
 	// 去重检查必须排在配额检查之前。
 	//
@@ -152,16 +183,16 @@ func (s *Store) place(tmpName, sum string, ext string, written int64, opt PutOpt
 	dest := s.Path(sum, ext)
 	if _, err := os.Stat(dest); err == nil {
 		os.Remove(tmpName)
+		// 刷新 mtime：这份文件可能是还没入库的孤儿，blob-gc 按 mtime
+		// 判断宽限期。复用它的调用方马上就会写 blob 行，必须让 GC
+		// 看到它「刚被用过」，否则 GC 可能在入库前把它删掉。
+		// 与 RemoveIfOlder 同在 s.mu 下，两者不会交叠。
+		now := time.Now()
+		_ = os.Chtimes(dest, now, now)
 		return &Result{SHA256: sum, Size: written, Path: dest, Existed: true}, nil
 	}
 
-	// 这里读 opt.Quota.total 而不是调 Quota.Used()：
-	// 上面的 lockQuota 已经持有 q.mu，而 sync.Mutex 不可重入，
-	// 再进 Used() 会直接死锁（测试表现为整个包超时）。
-	used := opt.Used
-	if opt.Quota != nil {
-		used = opt.Quota.total
-	}
+	used := s.baselineLocked(opt)
 
 	// 到这里才确定要新增 written 字节。
 	if s.quota > 0 && used+written > s.quota {
@@ -183,9 +214,9 @@ func (s *Store) place(tmpName, sum string, ext string, written int64, opt PutOpt
 		return nil, fmt.Errorf("move into place: %w", err)
 	}
 	// 只有新增内容才计入用量：内容寻址去重命中时没有多占空间。
-	if opt.Quota != nil {
-		opt.Quota.total += written
-	}
+	// 全局视图从本次判定用的基线往上累加，等价于「校准取 max」。
+	s.used = used + written
+	opt.Quota.add(written)
 	return &Result{SHA256: sum, Size: written, Path: dest}, nil
 }
 
@@ -194,10 +225,9 @@ func (s *Store) Put(ctx context.Context, r io.Reader, opt PutOptions) (*Result, 
 	// 先做一次便宜的检查，避免为注定被拒的下载浪费带宽。
 	// 这一步用旧快照无妨：并发窗口里可能多下载一次，但下面落位前的
 	// 检查才是有效约束，超配额的内容不会真的落盘。
-	preUsed := opt.Used
-	if opt.Quota != nil {
-		preUsed = opt.Quota.Used()
-	}
+	s.mu.Lock()
+	preUsed := s.baselineLocked(opt)
+	s.mu.Unlock()
 	if err := s.checkSpace(preUsed, 0); err != nil {
 		return nil, err
 	}
@@ -231,7 +261,7 @@ func (s *Store) Put(ctx context.Context, r io.Reader, opt PutOptions) (*Result, 
 	// 通过检查，然后一起 rename，合计超出配额。
 	//
 	// 锁只覆盖一次 stat 与一次 rename，不是整个流式写入，
-	// 所以不会把并发下载串行化。
+	// 所以不会把并发下载串行化——串行化的只是判定本身。
 	return s.place(tmpName, hex.EncodeToString(h.Sum(nil)), normalizeExt(opt.Ext), written, opt)
 }
 
@@ -334,12 +364,59 @@ func (s *Store) Open(sha, ext string) (*os.File, error) {
 }
 
 // Delete 删除文件。文件已不存在时返回 nil——GC 可能重复调用。
+// 删除成功会从全局用量里回减文件大小。
 func (s *Store) Delete(sha, ext string) error {
-	err := os.Remove(s.Path(sha, ext))
-	if errors.Is(err, os.ErrNotExist) {
-		return nil
-	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, err := s.removeLocked(s.Path(sha, ext))
 	return err
+}
+
+// RemoveIfOlder 仅当文件 mtime 早于 cutoff 时删除它，供孤儿 GC 使用。
+//
+// 判定与删除都在 s.mu 下完成，和 place 的「去重命中刷新 mtime」互斥：
+// 要么 GC 先删（随后 place 看不到文件，会把临时文件重新落位），
+// 要么 place 先刷新 mtime（GC 看到新 mtime 后跳过）。
+// 不存在「GC 删掉了一个刚被复用、即将入库的文件」的窗口。
+func (s *Store) RemoveIfOlder(sha, ext string, cutoff time.Time) (removed bool, size int64, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	path := s.Path(sha, ext)
+	info, err := os.Stat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, 0, nil
+	}
+	if err != nil {
+		return false, 0, err
+	}
+	if !info.ModTime().Before(cutoff) {
+		return false, 0, nil
+	}
+	size, err = s.removeLocked(path)
+	if err != nil {
+		return false, 0, err
+	}
+	return true, size, nil
+}
+
+// removeLocked 删除文件并回减全局用量。调用方必须持有 s.mu。
+func (s *Store) removeLocked(path string) (int64, error) {
+	var size int64
+	if info, err := os.Stat(path); err == nil {
+		size = info.Size()
+	}
+	err := os.Remove(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	s.used -= size
+	if s.used < 0 {
+		s.used = 0
+	}
+	return size, nil
 }
 
 // Stat 返回根目录所在文件系统的容量信息，供 /readyz 与系统页展示。
@@ -360,8 +437,24 @@ func (s *Store) Space() (Space, error) {
 	}, nil
 }
 
-// Walk 遍历磁盘上实际存在的文件，供 blob-gc 找出孤儿。
+// Walk 遍历磁盘上实际存在的文件。
 func (s *Store) Walk(ctx context.Context, fn func(sha string, size int64) error) error {
+	return s.WalkFiles(ctx, func(f FileInfo) error { return fn(f.SHA256, f.Size) })
+}
+
+// FileInfo 是磁盘上一个内容寻址文件的元信息，供 blob-gc 找出孤儿。
+type FileInfo struct {
+	SHA256  string
+	Ext     string
+	Size    int64
+	ModTime time.Time
+}
+
+// WalkFiles 遍历磁盘上实际存在的文件，附带扩展名与 mtime。
+//
+// 文件名不是「64 位十六进制 sha + 可选扩展名」的一律跳过：
+// GC 只该碰自己写出来的东西，形状不对的文件宁可留着。
+func (s *Store) WalkFiles(ctx context.Context, fn func(FileInfo) error) error {
 	entries, err := os.ReadDir(s.root)
 	if err != nil {
 		return err
@@ -379,17 +472,36 @@ func (s *Store) Walk(ctx context.Context, fn func(sha string, size int64) error)
 			if err := ctx.Err(); err != nil {
 				return err
 			}
+			if f.IsDir() {
+				continue
+			}
+			ext := strings.TrimPrefix(filepath.Ext(f.Name()), ".")
 			sha := strings.TrimSuffix(f.Name(), filepath.Ext(f.Name()))
+			if !isSHA256Hex(sha) || !strings.HasPrefix(sha, e.Name()) || normalizeExt(ext) != ext {
+				continue
+			}
 			info, err := f.Info()
 			if err != nil {
 				continue // 并发删除，跳过
 			}
-			if err := fn(sha, info.Size()); err != nil {
+			if err := fn(FileInfo{SHA256: sha, Ext: ext, Size: info.Size(), ModTime: info.ModTime()}); err != nil {
 				return err
 			}
 		}
 	}
 	return nil
+}
+
+func isSHA256Hex(s string) bool {
+	if len(s) != 64 {
+		return false
+	}
+	for _, r := range s {
+		if !(r >= '0' && r <= '9') && !(r >= 'a' && r <= 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 func normalizeExt(ext string) string {
