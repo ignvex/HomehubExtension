@@ -35,6 +35,13 @@ const (
 	maxAvatarSize        = 512
 	defaultFeedTimeout   = 20 * time.Second
 	defaultAvatarTimeout = 10 * time.Second
+
+	// defaultFeedConcurrency 是 /fetch 同时在途的上游请求数上限。
+	// 单次响应最多 32MB 全量读进内存，不设上限时宿主一轮批量刷新
+	// 就能把 512M 的进程撑爆。
+	defaultFeedConcurrency = 3
+	// defaultFeedQueueWait 是名额满时最多排队多久，超出返回 ErrBusy（503）。
+	defaultFeedQueueWait = 10 * time.Second
 )
 
 var (
@@ -51,6 +58,8 @@ var (
 	ErrResponseTooLarge = errors.New("upstream response too large")
 	// ErrUpstream 表示网络错误、超时或其他上游故障。
 	ErrUpstream = errors.New("upstream request failed")
+	// ErrBusy 表示并发名额已满且排队超时（或调用方 ctx 先结束）。
+	ErrBusy = errors.New("upstream proxy busy")
 )
 
 var avatarHashPattern = regexp.MustCompile(`^[0-9a-f]{32}$`)
@@ -61,6 +70,10 @@ type Config struct {
 	FeedTimeout   time.Duration
 	AvatarTimeout time.Duration
 	MaxFeedBytes  int64
+	// FeedConcurrency 为 0 时用默认值 3。
+	FeedConcurrency int
+	// FeedQueueWait 为 0 时用默认值 10s。
+	FeedQueueWait time.Duration
 
 	// avatarBaseURL 只在测试里改，生产固定官方 Gravatar。
 	avatarBaseURL string
@@ -104,6 +117,8 @@ type Client struct {
 	cfg        Config
 	feedHTTP   *http.Client
 	avatarHTTP *http.Client
+	// feedSem 是 FetchFeed 的并发信号量。
+	feedSem chan struct{}
 }
 
 // New 构造生产客户端。
@@ -145,12 +160,19 @@ func newClient(cfg Config, feedTransport, avatarTransport http.RoundTripper) *Cl
 	if cfg.MaxFeedBytes <= 0 {
 		cfg.MaxFeedBytes = FeedResponseLimit
 	}
+	if cfg.FeedConcurrency <= 0 {
+		cfg.FeedConcurrency = defaultFeedConcurrency
+	}
+	if cfg.FeedQueueWait <= 0 {
+		cfg.FeedQueueWait = defaultFeedQueueWait
+	}
 	if cfg.avatarBaseURL == "" {
 		cfg.avatarBaseURL = gravatarBaseURL
 	}
 	noRedirect := func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 	return &Client{
-		cfg: cfg,
+		cfg:     cfg,
+		feedSem: make(chan struct{}, cfg.FeedConcurrency),
 		feedHTTP: &http.Client{
 			Timeout:       cfg.FeedTimeout,
 			Transport:     feedTransport,
@@ -184,6 +206,14 @@ func (c *Client) FetchFeed(ctx context.Context, rawURL string) (FeedResponse, er
 	if err != nil {
 		return FeedResponse{}, fmt.Errorf("%w: %v", ErrInvalidURL, err)
 	}
+
+	// 校验在前、排队在后：非法地址不该占用名额，也不该等。
+	release, err := c.acquireFeed(ctx)
+	if err != nil {
+		return FeedResponse{}, err
+	}
+	defer release()
+
 	req.Header.Set("User-Agent", c.cfg.UserAgent)
 	req.Header.Set("Accept", strings.Join([]string{
 		"application/rss+xml",
@@ -227,6 +257,27 @@ func (c *Client) FetchFeed(ctx context.Context, rawURL string) (FeedResponse, er
 	}
 	out.Body = body
 	return out, nil
+}
+
+// acquireFeed 取一个 /fetch 名额。满时排队，直到拿到名额、ctx 结束
+// 或等满 FeedQueueWait；后两种返回 ErrBusy。
+func (c *Client) acquireFeed(ctx context.Context) (func(), error) {
+	release := func() { <-c.feedSem }
+	select {
+	case c.feedSem <- struct{}{}:
+		return release, nil
+	default:
+	}
+	timer := time.NewTimer(c.cfg.FeedQueueWait)
+	defer timer.Stop()
+	select {
+	case c.feedSem <- struct{}{}:
+		return release, nil
+	case <-ctx.Done():
+		return nil, fmt.Errorf("%w: %v", ErrBusy, ctx.Err())
+	case <-timer.C:
+		return nil, fmt.Errorf("%w: waited %s", ErrBusy, c.cfg.FeedQueueWait)
+	}
 }
 
 // ValidHash 判断头像 hash 是否严格为 32 位小写十六进制。

@@ -28,6 +28,11 @@ func (s *server) handleFetch(c *gin.Context) {
 		case errors.Is(err, upstream.ErrInvalidURL), errors.Is(err, upstream.ErrBlockedHost):
 			// 原因是调用方可修的（协议、凭据、内网地址），回显有助定位。
 			failWith(c, http.StatusBadRequest, "invalid_request", err.Error())
+		case errors.Is(err, upstream.ErrBusy):
+			// 并发名额已满：503 + Retry-After 让宿主稍后重试，而不是记一次上游故障。
+			logFrom(c).Warn("fetch proxy busy", "url", rawURL, "err", err)
+			c.Header("Retry-After", "5")
+			failWith(c, http.StatusServiceUnavailable, "unavailable", "代理繁忙，请稍后重试")
 		case errors.Is(err, upstream.ErrResponseTooLarge):
 			logFrom(c).Warn("fetch proxy response too large", "url", rawURL, "err", err)
 			failWith(c, http.StatusBadGateway, "upstream_error", "上游响应超过大小上限")

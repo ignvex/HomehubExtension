@@ -275,3 +275,18 @@ func TestAvatarProxyNotFoundCarriesNoValidators(t *testing.T) {
 		}
 	}
 }
+
+// 代理名额满是本端暂时过载，必须是 503 + Retry-After，而不是 502：
+// 宿主会把 502 记成该源抓取失败并累计失败次数。
+func TestFetchProxyMapsBusyTo503(t *testing.T) {
+	h := newHarness(t)
+	h.useUpstream(&fakeUpstream{feedErr: fmt.Errorf("%w: waited 10s", upstream.ErrBusy)})
+	w := signedGET(t, h, "/api/v1/fetch?url=https%3A%2F%2Fexample.com%2Ffeed.xml",
+		"fetch-busy", nil)
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503: %s", w.Code, w.Body.String())
+	}
+	if w.Header().Get("Retry-After") == "" {
+		t.Error("503 应带 Retry-After")
+	}
+}
