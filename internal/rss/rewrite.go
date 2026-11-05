@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"sort"
+	"strings"
 
 	"golang.org/x/net/html"
 )
@@ -66,8 +67,17 @@ func (d *Document) Rewrite(results map[string]MediaResult) {
 	}
 }
 
+// rewriteNode 按下载结果重写一个元素的全部资源属性。
+//
+// 规则（本地化是硬约束，任何未本地化的外链属性都不能留下）：
+//   - src 成功 → 换成本地地址；
+//   - img 的 src 失败，但 srcset 有成功候选 → 保留元素，src 用第一个成功候选；
+//   - srcset 单个候选失败只从候选集里剔除；全部失败时若 src 成功就只删 srcset；
+//   - poster 失败只移除 poster，不删除整个 video；
+//   - 音视频本体（src）失败 → 移除元素；图片无任何成功地址 → 换占位图。
+//
+// 最后统一 stripNonLocal：即便将来某条分支漏了，外链属性也不会被渲染出去。
 func rewriteNode(node *html.Node, targets []Target, results map[string]MediaResult) {
-	// srcset 候选按原顺序重建，保证浏览器仍能按 DPR 选择。
 	var srcsetTargets []Target
 	var direct []Target
 	for _, t := range targets {
@@ -78,87 +88,104 @@ func rewriteNode(node *html.Node, targets []Target, results map[string]MediaResu
 		}
 	}
 
-	for _, t := range direct {
+	// 先算 srcset：src 失败时要用它的成功候选兜底。
+	sort.Slice(srcsetTargets, func(i, j int) bool { return srcsetTargets[i].Index < srcsetTargets[j].Index })
+	parts := make([]string, 0, len(srcsetTargets))
+	firstLocal := ""
+	for _, t := range srcsetTargets {
 		r, ok := results[t.Resolved]
-		if !ok {
-			// 没有下载结果（data URI 等）——按不可本地化处理。
-			removeOrPlaceholder(node, t.Kind, t.Resolved)
-			return
+		if !ok || r.Status != "ok" {
+			continue
 		}
-		switch r.Status {
-		case "ok":
+		u := MediaURL(r.SHA256, r.Ext)
+		if firstLocal == "" {
+			firstLocal = u
+		}
+		if t.Descriptor == "" {
+			parts = append(parts, u)
+		} else {
+			parts = append(parts, u+" "+t.Descriptor)
+		}
+	}
+
+	srcOK := false
+	srcFailed := false
+	for _, t := range direct {
+		if r, ok := results[t.Resolved]; ok && r.Status == "ok" {
 			setAttr(node, t.Attr, MediaURL(r.SHA256, r.Ext))
-		case "blocked", "unsupported":
-			// 直接移除：这类资源没有本地化价值，留占位只会误导。
-			removeOrPlaceholder(node, t.Kind, t.Resolved)
-			return
+			if t.Attr == "src" {
+				srcOK = true
+			}
+			continue
+		}
+		// 没有下载结果（未知 scheme 等）与失败一样按不可本地化处理。
+		switch {
+		case t.Attr == "poster":
+			// 封面只是装饰，视频本体可能已经本地化了。
+			removeAttr(node, "poster")
+		case t.Attr == "src" && node.Data == "img" && firstLocal != "":
+			// src 由下面的 srcset 兜底补上。
+			removeAttr(node, "src")
+			srcFailed = true
 		default:
-			// failed / too_large / quota_exceeded：保留位置，换成占位。
 			removeOrPlaceholder(node, t.Kind, t.Resolved)
 			return
 		}
 	}
 
 	if len(srcsetTargets) > 0 {
-		sort.Slice(srcsetTargets, func(i, j int) bool { return srcsetTargets[i].Index < srcsetTargets[j].Index })
-		parts := make([]string, 0, len(srcsetTargets))
-		firstLocal := ""
-		for _, t := range srcsetTargets {
-			r, ok := results[t.Resolved]
-			if !ok || r.Status != "ok" {
-				// 单个候选失败只是从候选集里剔除，不影响其他候选。
-				continue
-			}
-			u := MediaURL(r.SHA256, r.Ext)
-			if firstLocal == "" {
-				firstLocal = u
-			}
-			desc := descriptorFor(t.Node, t.Index)
-			if desc == "" {
-				parts = append(parts, u)
-			} else {
-				parts = append(parts, u+" "+desc)
-			}
-		}
 		if len(parts) == 0 {
-			removeOrPlaceholder(node, "image", fallbackURL(srcsetTargets))
-			return
-		}
-		setAttr(node, "srcset", joinComma(parts))
-		// src 绝不能保留原始外链：如果它自己没下载成功，
-		// 就用第一个成功的候选补上。
-		if cur := getAttr(node, "src"); cur == "" || !isLocalMedia(cur) {
-			if directTargetFailed(node, direct, results) && firstLocal != "" {
+			removeAttr(node, "srcset")
+			removeAttr(node, "sizes")
+			if !srcOK {
+				removeOrPlaceholder(node, "image", fallbackURL(srcsetTargets))
+				return
+			}
+		} else {
+			setAttr(node, "srcset", joinComma(parts))
+			removeAttr(node, "sizes")
+			// img 没有成功的 src（失败或本来就没有）时用第一个成功候选补上，
+			// 不支持 srcset 的阅读器也能显示。
+			if node.Data == "img" && (srcFailed || !srcOK) {
 				setAttr(node, "src", firstLocal)
 			}
 		}
-		removeAttr(node, "sizes")
 	}
+
+	stripNonLocal(node)
 }
 
-func directTargetFailed(node *html.Node, direct []Target, results map[string]MediaResult) bool {
-	if len(direct) == 0 {
-		return true
-	}
-	for _, t := range direct {
-		if r, ok := results[t.Resolved]; ok && r.Status == "ok" {
-			return false
+// mediaAttrs 是可能承载资源地址的属性；重写之后它们只能指向本地。
+var mediaAttrs = []string{"src", "srcset", "poster"}
+
+// stripNonLocal 删除仍指向非本地地址的资源属性。
+//
+// 这是最后一道闸：rewriteNode 的每条分支本应已经处理干净，这里保证
+// 即便出现没有覆盖到的组合，也只会少一张图，而不会让读者的浏览器
+// 去请求第三方。
+func stripNonLocal(node *html.Node) {
+	for _, key := range mediaAttrs {
+		v := getAttr(node, key)
+		if v == "" {
+			continue
+		}
+		if key == "srcset" {
+			for _, e := range parseSrcset(v) {
+				if !isLocalMedia(e.URL) {
+					removeAttr(node, key)
+					break
+				}
+			}
+			continue
+		}
+		if !isLocalMedia(v) && v != placeholderDataURI {
+			removeAttr(node, key)
 		}
 	}
-	return true
 }
 
 func isLocalMedia(u string) bool {
-	return len(u) > 7 && u[:7] == "/media/"
-}
-
-// descriptorFor 从节点当前的 srcset 里取回第 index 个候选的描述符。
-func descriptorFor(node *html.Node, index int) string {
-	entries := parseSrcset(getAttr(node, "srcset"))
-	if index < 0 || index >= len(entries) {
-		return ""
-	}
-	return entries[index].Descriptor
+	return strings.HasPrefix(u, "/media/") && !strings.HasPrefix(u, "/media//")
 }
 
 func joinComma(parts []string) string {

@@ -18,6 +18,12 @@ type Target struct {
 	URL      string
 	Resolved string // 相对地址解析后的绝对值
 	Kind     string // image / video / audio / attachment
+	// Descriptor 是 srcset 候选的描述符（"2x"、"640w"），普通属性为空。
+	//
+	// 必须在收集时随候选一起带走：之前重写阶段按 Index 回到清洗后的
+	// srcset 里取描述符，而清洗会丢掉 javascript: 之类的候选，
+	// 原始下标与清洗后的位置就错开了，2x 的图会被标成 1x。
+	Descriptor string
 }
 
 // Document 是清洗后的文档与资源引用的集合。
@@ -192,7 +198,7 @@ func copyAttrs(dst, src *html.Node, tag string, opts SanitizeOptions, doc *Docum
 					continue
 				}
 				rebuilt = append(rebuilt, strings.TrimSpace(v+" "+e.Descriptor))
-				doc.collect(dst, "srcset", i, v, kindFor(tag))
+				doc.collectCandidate(dst, i, v, e.Descriptor, kindFor(tag))
 			}
 			if len(rebuilt) > 0 {
 				dst.Attr = append(dst.Attr, html.Attribute{Key: "srcset", Val: strings.Join(rebuilt, ", ")})
@@ -223,6 +229,17 @@ func (d *Document) collect(node *html.Node, attr string, index int, resolved, ki
 	}
 	d.Targets = append(d.Targets, Target{
 		Node: node, Attr: attr, Index: index, URL: resolved, Resolved: resolved, Kind: kind,
+	})
+}
+
+// collectCandidate 收集一个 srcset 候选，连同它自己的描述符。
+func (d *Document) collectCandidate(node *html.Node, index int, resolved, descriptor, kind string) {
+	if resolved == "" {
+		return
+	}
+	d.Targets = append(d.Targets, Target{
+		Node: node, Attr: "srcset", Index: index, URL: resolved, Resolved: resolved,
+		Kind: kind, Descriptor: descriptor,
 	})
 }
 
