@@ -43,11 +43,13 @@ type Store struct {
 	// 之前带 tracker 的写入只持 tracker 自己的锁：两轮并发抓取各开一个
 	// tracker，彼此看不到对方刚落盘的字节，合计可以写到两倍配额。
 	mu sync.Mutex
-	// used 是本进程视角的全局已用字节，受 mu 保护。
+	// used 是磁盘上内容文件的总字节，受 mu 保护。
 	//
-	// 它不是唯一真相：每次判定都与调用方传入的数据库基线（PutOptions.Used
-	// 与 tracker 的值）取 max，所以进程刚启动、还没写过任何文件时，
-	// 数据库的 SUM(size) 仍然生效。落位成功累加，Delete 删掉文件时回减。
+	// Open 时遍历磁盘初始化，之后落位累加、删除回减，始终对应磁盘实际。
+	// 判定时再与调用方的数据库基线（PutOptions.Used、tracker）取 max，
+	// 但那个 max 只用于当次判定，绝不写回这里：调用方的快照可能已经
+	// 过期（本轮开始后 GC 删过文件），写回会让用量只涨不跌，
+	// 直到重启前都在拒绝本可以写入的下载。
 	used int64
 }
 
@@ -78,13 +80,24 @@ func Open(opts Options) (*Store, error) {
 	if err := purgeDir(opts.TmpDir); err != nil {
 		return nil, fmt.Errorf("purge tmp: %w", err)
 	}
-	return &Store{
+	st := &Store{
 		root:    opts.Root,
 		tmp:     opts.TmpDir,
 		maxSize: opts.MaxSize,
 		quota:   opts.Quota,
 		minFree: opts.MinFreeBytes,
-	}, nil
+	}
+	// 全局用量从磁盘实际内容起算：磁盘才是配额真正约束的对象，
+	// 未入库的孤儿文件同样占空间。之后只随落位与删除增减。
+	var used int64
+	if err := st.WalkFiles(context.Background(), func(f FileInfo) error {
+		used += f.Size
+		return nil
+	}); err != nil {
+		return nil, fmt.Errorf("measure blob usage: %w", err)
+	}
+	st.used = used
+	return st, nil
 }
 
 // PutOptions 控制一次写入。Used 是当前已占用字节，由调用方从数据库取，
@@ -148,7 +161,7 @@ func (s *Store) baselineLocked(opt PutOptions) int64 {
 	return used
 }
 
-// UsedBytes 返回 Store 全局视图下的当前用量（不含调用方基线）。
+// UsedBytes 返回磁盘上内容文件的当前总字节（不含调用方基线）。
 func (s *Store) UsedBytes() int64 {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -214,8 +227,8 @@ func (s *Store) place(tmpName, sum string, ext string, written int64, opt PutOpt
 		return nil, fmt.Errorf("move into place: %w", err)
 	}
 	// 只有新增内容才计入用量：内容寻址去重命中时没有多占空间。
-	// 全局视图从本次判定用的基线往上累加，等价于「校准取 max」。
-	s.used = used + written
+	// 只加本次写入的字节，不把判定用的基线写回（见 used 字段注释）。
+	s.used += written
 	opt.Quota.add(written)
 	return &Result{SHA256: sum, Size: written, Path: dest}, nil
 }

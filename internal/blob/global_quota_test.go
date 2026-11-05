@@ -68,19 +68,59 @@ func TestConcurrentTrackersShareGlobalQuota(t *testing.T) {
 	}
 }
 
-// 调用方传入的数据库基线比进程内视图大时以基线为准（取 max）。
-func TestGlobalUsedCalibratesWithBaseline(t *testing.T) {
+// 调用方传入的数据库基线比磁盘视图大时，当次判定以基线为准（取 max），
+// 但基线不写回全局用量。
+func TestBaselineAppliesToCheckButIsNotPersisted(t *testing.T) {
 	s := newStore(t, Options{Quota: 100})
 	ctx := context.Background()
+	if _, err := s.Put(ctx, strings.NewReader(strings.Repeat("x", 41)), PutOptions{Ext: "bin", Used: 60}); !errors.Is(err, ErrQuotaExceeded) {
+		t.Fatalf("err = %v, want ErrQuotaExceeded（基线 60 + 41 > 100）", err)
+	}
 	if _, err := s.Put(ctx, strings.NewReader("0123456789"), PutOptions{Ext: "bin", Used: 50}); err != nil {
 		t.Fatal(err)
 	}
-	if got := s.UsedBytes(); got != 60 {
-		t.Fatalf("UsedBytes = %d, want 60（基线 50 + 10）", got)
+	if got := s.UsedBytes(); got != 10 {
+		t.Fatalf("UsedBytes = %d, want 10（只记磁盘实际）", got)
 	}
-	// 之后即使调用方给的快照是 0，全局视图仍记得 60。
-	if _, err := s.Put(ctx, strings.NewReader(strings.Repeat("x", 41)), PutOptions{Ext: "bin"}); !errors.Is(err, ErrQuotaExceeded) {
-		t.Fatalf("err = %v, want ErrQuotaExceeded", err)
+}
+
+// 回归：本轮开始后 GC 删了文件，过期的 tracker 基线不能把全局用量
+// 永久抬高——修复前 UsedBytes 会停在「已删字节 + 新写字节」。
+func TestStaleTrackerDoesNotRatchetUsage(t *testing.T) {
+	s := newStore(t, Options{Quota: 1000})
+	ctx := context.Background()
+	r, err := s.Put(ctx, strings.NewReader(strings.Repeat("a", 600)), PutOptions{Ext: "bin"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tr := NewQuotaTracker(600) // 本轮开始时的数据库快照
+	if err := s.Delete(r.SHA256, "bin"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Put(ctx, strings.NewReader("b"), PutOptions{Ext: "bin", Quota: tr}); err != nil {
+		t.Fatal(err)
+	}
+	if got := s.UsedBytes(); got != 1 {
+		t.Fatalf("UsedBytes = %d, want 1（磁盘实际）", got)
+	}
+}
+
+// 重新打开时全局用量从磁盘恢复，未入库的孤儿文件也计入。
+func TestOpenMeasuresExistingFiles(t *testing.T) {
+	dir := t.TempDir()
+	s1, err := Open(Options{Root: dir, Quota: 100})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s1.Put(context.Background(), strings.NewReader(strings.Repeat("z", 30)), PutOptions{Ext: "bin"}); err != nil {
+		t.Fatal(err)
+	}
+	s2, err := Open(Options{Root: dir, Quota: 100})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := s2.UsedBytes(); got != 30 {
+		t.Fatalf("重开后 UsedBytes = %d, want 30", got)
 	}
 }
 
