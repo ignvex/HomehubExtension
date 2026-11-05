@@ -128,6 +128,9 @@ type FeedStore interface {
 type EntryStore interface {
 	// InsertIfNew 在 (feed_id, guid) 冲突时返回 existing=true 且不修改已有行。
 	InsertIfNew(ctx context.Context, e *Entry) (bool, error)
+	// Exists 判断 (feed_id, guid) 是否已入库。抓取管线在清洗与下载之前
+	// 先调它：已存在的条目不该再消耗带宽与配额。
+	Exists(ctx context.Context, feedID int64, guid string) (bool, error)
 	// Get 按主键读取，不含正文。
 	Get(ctx context.Context, id int64) (*Entry, error)
 	// List 按查询条件分页。列表不含 content_html，避免一页几十 MB。
@@ -179,6 +182,13 @@ type BlobStore interface {
 	TotalSize(ctx context.Context) (int64, error)
 	// Count 返回 blob 行数。
 	Count(ctx context.Context) (int64, error)
+	// Known 返回给定 sha 中在 blob 表里有行的那些，供孤儿文件 GC 批量判定。
+	// 单次最多 500 个，超出返回错误。
+	Known(ctx context.Context, shas []string) (map[string]bool, error)
+	// SaveEntryMedia 在一个事务里写入一条条目的全部 blob 行、entry_blob
+	// 引用与 media_fetch 记录。语义与逐条调用 Upsert / Link / Media().Record
+	// 相同，只是合并成一次提交：每个资源三次独立写在 SQLite 上就是三次 fsync。
+	SaveEntryMedia(ctx context.Context, entryID int64, blobs []Blob, records []MediaRecord) error
 }
 
 // MediaRecord 是一条待本地化的资源。失败记录保留下来供重试任务使用。

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -29,7 +30,7 @@ func TestMigrateSetsVersion(t *testing.T) {
 		t.Fatal(err)
 	}
 	// 迁移版本只前进不回退；新增迁移时同步更新这里。
-	const wantVersion = 5
+	const wantVersion = 6
 	if v != wantVersion {
 		t.Errorf("schema version = %d, want %d", v, wantVersion)
 	}
@@ -571,5 +572,127 @@ func TestShareOwnerScopeRewritesExistingHashes(t *testing.T) {
 	}
 	if len(items) != 1 {
 		t.Errorf("新归属下 %d 条片段，want 1", len(items))
+	}
+}
+
+// Purge 的批次子查询必须命中 0006 的表达式索引，而不是全表扫描。
+// SQLite 只在表达式逐字一致时才用表达式索引，这个测试守着两处同步。
+func TestPurgeUsesExpressionIndex(t *testing.T) {
+	db := openTest(t)
+	ctx := context.Background()
+	for _, keep := range []bool{true, false} {
+		rows, err := db.ro.QueryContext(ctx, `EXPLAIN QUERY PLAN `+purgeBatch(keep), int64(0))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var plan []string
+		for rows.Next() {
+			var id, parent, notused int
+			var detail string
+			if err := rows.Scan(&id, &parent, &notused, &detail); err != nil {
+				t.Fatal(err)
+			}
+			plan = append(plan, detail)
+		}
+		rows.Close()
+		joined := strings.Join(plan, " | ")
+		t.Logf("keepStarred=%v plan: %s", keep, joined)
+		if !strings.Contains(joined, "idx_entry_age") {
+			t.Errorf("keepStarred=%v 未命中 idx_entry_age: %s", keep, joined)
+		}
+		if strings.Contains(joined, "TEMP B-TREE") {
+			t.Errorf("keepStarred=%v ORDER BY 未走索引: %s", keep, joined)
+		}
+	}
+}
+
+func TestPurgeOldestFirst(t *testing.T) {
+	db := openTest(t)
+	ctx := context.Background()
+	feed, _, _ := db.Feed().Upsert(ctx, &store.Feed{
+		URL: "https://example.com/purge", Source: "hub", Enabled: true,
+		FetchInterval: 1800, CreatedAt: 1,
+	})
+	pub := int64(100)
+	for i, e := range []*store.Entry{
+		{FeedID: feed.ID, GUID: "old-pub", PublishedAt: &pub, FetchedAt: 5000},
+		{FeedID: feed.ID, GUID: "old-fetch", FetchedAt: 200},
+		{FeedID: feed.ID, GUID: "new", FetchedAt: 9000},
+	} {
+		if _, err := db.Entry().InsertIfNew(ctx, e); err != nil {
+			t.Fatal(i, err)
+		}
+	}
+	n, err := db.Entry().Purge(ctx, 1000, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 2 {
+		t.Fatalf("purged %d, want 2", n)
+	}
+	if ok, _ := db.Entry().Exists(ctx, feed.ID, "new"); !ok {
+		t.Error("未超期条目被误删")
+	}
+}
+
+func TestEntryExists(t *testing.T) {
+	db := openTest(t)
+	ctx := context.Background()
+	feed, _, _ := db.Feed().Upsert(ctx, &store.Feed{
+		URL: "https://example.com/exists", Source: "hub", Enabled: true,
+		FetchInterval: 1800, CreatedAt: 1,
+	})
+	if ok, err := db.Entry().Exists(ctx, feed.ID, "g"); err != nil || ok {
+		t.Fatalf("空库 Exists = %v, %v", ok, err)
+	}
+	if _, err := db.Entry().InsertIfNew(ctx, &store.Entry{FeedID: feed.ID, GUID: "g", FetchedAt: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := db.Entry().Exists(ctx, feed.ID, "g"); err != nil || !ok {
+		t.Fatalf("Exists = %v, %v, want true", ok, err)
+	}
+	if ok, _ := db.Entry().Exists(ctx, feed.ID+1, "g"); ok {
+		t.Error("不同 feed 的同名 guid 不应命中")
+	}
+}
+
+func TestSaveEntryMediaAndKnown(t *testing.T) {
+	db := openTest(t)
+	ctx := context.Background()
+	feed, _, _ := db.Feed().Upsert(ctx, &store.Feed{
+		URL: "https://example.com/media", Source: "hub", Enabled: true,
+		FetchInterval: 1800, CreatedAt: 1,
+	})
+	e := &store.Entry{FeedID: feed.ID, GUID: "m", FetchedAt: 1}
+	if _, err := db.Entry().InsertIfNew(ctx, e); err != nil {
+		t.Fatal(err)
+	}
+	sha := strings.Repeat("c", 64)
+	err := db.Blob().SaveEntryMedia(ctx, e.ID,
+		[]store.Blob{{SHA256: sha, Size: 10, MIME: "image/png", Ext: "png", Kind: "image", CreatedAt: 1, LastSeenAt: 1}},
+		[]store.MediaRecord{
+			{EntryID: e.ID, SourceURL: "https://cdn/a.png", SHA256: sha, Status: "ok", UpdatedAt: 1},
+			{EntryID: e.ID, SourceURL: "https://cdn/b.png", Status: "failed", Error: "x", UpdatedAt: 1},
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := db.Blob().Get(ctx, sha)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b.RefCount != 1 {
+		t.Errorf("ref_count = %d, want 1", b.RefCount)
+	}
+	recs, _ := db.Media().ByEntry(ctx, e.ID)
+	if len(recs) != 2 {
+		t.Errorf("media 记录 %d 条, want 2", len(recs))
+	}
+	known, err := db.Blob().Known(ctx, []string{sha, strings.Repeat("d", 64)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !known[sha] || len(known) != 1 {
+		t.Errorf("Known = %v", known)
 	}
 }
