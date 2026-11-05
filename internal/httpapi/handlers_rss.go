@@ -13,8 +13,22 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-func contextWithTimeout(d time.Duration) (context.Context, context.CancelFunc) {
-	return context.WithTimeout(context.Background(), d)
+// refreshContext 给同步刷新（手动刷新、宿主触发刷新）一个独立时限的 ctx。
+//
+// 不继承请求的取消：客户端断开时抓取已经写到一半，半途中止只会留下
+// 没有 blob 行的文件。但必须随进程关停取消：请求 ctx 带着 app 注入的
+// Background（见 BaseContext），关停时它先于数据库关闭被取消，
+// 抓取据此提前返回，不会在 db.Close 之后继续写库。
+func refreshContext(req context.Context, d time.Duration) (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(req), d)
+	if bg := BackgroundFrom(req); bg != nil {
+		stop := context.AfterFunc(bg.ctx, cancel)
+		return ctx, func() {
+			stop()
+			cancel()
+		}
+	}
+	return ctx, cancel
 }
 
 // handleMedia 提供本地化后的媒体文件。
@@ -151,7 +165,7 @@ func (s *server) handleFeedRefresh(c *gin.Context) {
 		failWith(c, http.StatusBadRequest, "invalid_request", "id 必须是整数")
 		return
 	}
-	ctx, cancel := contextWithTimeout(2 * time.Minute)
+	ctx, cancel := refreshContext(c.Request.Context(), 2*time.Minute)
 	defer cancel()
 	res, err := s.RSS.Fetch(ctx, id)
 	if err != nil {

@@ -51,3 +51,41 @@ func TestBackgroundFromContext(t *testing.T) {
 		t.Fatal("BackgroundFrom lost the Background")
 	}
 }
+
+// 同步刷新不随客户端断开中止，但必须随进程关停取消。
+func TestRefreshContextDetachedFromRequestButStopsOnShutdown(t *testing.T) {
+	b := NewBackground(context.Background())
+	req, cancelReq := context.WithCancel(WithBackground(context.Background(), b))
+
+	ctx, cancel := refreshContext(req, time.Minute)
+	defer cancel()
+
+	cancelReq()
+	select {
+	case <-ctx.Done():
+		t.Fatal("客户端断开不应取消刷新")
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	sctx, scancel := context.WithTimeout(context.Background(), time.Second)
+	defer scancel()
+	if err := b.Shutdown(sctx); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+	select {
+	case <-ctx.Done():
+	case <-time.After(time.Second):
+		t.Fatal("关停后刷新 ctx 仍未取消")
+	}
+}
+
+// 没有注入 Background 时退回独立时限，不 panic。
+func TestRefreshContextWithoutBackground(t *testing.T) {
+	ctx, cancel := refreshContext(context.Background(), 10*time.Millisecond)
+	defer cancel()
+	select {
+	case <-ctx.Done():
+	case <-time.After(time.Second):
+		t.Fatal("超时未生效")
+	}
+}

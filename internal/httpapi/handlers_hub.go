@@ -333,7 +333,7 @@ func (s *server) handleHubRefresh(c *gin.Context) {
 		failWith(c, http.StatusBadRequest, "invalid_request", "id 必须是整数")
 		return
 	}
-	ctx, cancel := contextWithTimeout(2 * time.Minute)
+	ctx, cancel := refreshContext(c.Request.Context(), 2*time.Minute)
 	defer cancel()
 	res, err := s.RSS.Fetch(ctx, id)
 	if err != nil {
