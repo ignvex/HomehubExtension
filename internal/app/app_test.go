@@ -15,6 +15,8 @@ import (
 
 	"github.com/ignvex/HomehubExtension/internal/config"
 	"github.com/ignvex/HomehubExtension/internal/httpapi"
+	"github.com/ignvex/HomehubExtension/internal/scheduler"
+	"github.com/ignvex/HomehubExtension/internal/store/sqlite"
 )
 
 // TestSdNotifyReadiness 锁定 systemd 的就绪契约。
@@ -218,4 +220,70 @@ func loadTestConfig(t *testing.T, dir, addr string) config.Config {
 		t.Fatalf("load config: %v", err)
 	}
 	return cfg
+}
+
+// TestShutdownDrainsBackgroundBeforeDBClose 锁定关停顺序：轮询器 / 补跑
+// （workers）、请求触发的后台任务（bg）与调度任务都要先被取消并返回，
+// 数据库才关闭。后台任务收到取消后再写一次库，模拟「取消后的收尾写入」：
+// 若关库早于它返回，写入会撞上已关闭的连接。
+//
+// 每个子测试只放一种来源：shutdown 的几步等待是串行的，混在一起时
+// 省掉其中一步也可能被另一步更长的等待掩盖。
+func TestShutdownDrainsBackgroundBeforeDBClose(t *testing.T) {
+	cases := map[string]func(a *App, task func(context.Context)){
+		"workers": func(a *App, task func(context.Context)) {
+			a.goWorker(func() { task(a.rootCtx) })
+		},
+		"request-background": func(a *App, task func(context.Context)) {
+			a.bg.Go(task)
+		},
+		"scheduler": func(a *App, task func(context.Context)) {
+			a.sched.Register(scheduler.Task{Name: "rss-prune", Timeout: time.Hour,
+				Run: func(ctx context.Context, _ map[string]any) (string, error) {
+					task(ctx)
+					return "", ctx.Err()
+				}})
+			go func() { _, _ = a.sched.RunByName(context.Background(), "rss-prune") }()
+		},
+	}
+	for name, start := range cases {
+		t.Run(name, func(t *testing.T) {
+			db, err := sqlite.Open(context.Background(), filepath.Join(t.TempDir(), "s.db"), sqlite.Options{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			a := &App{log: slog.New(slog.NewTextHandler(io.Discard, nil)), db: db}
+			a.rootCtx, a.rootCancel = context.WithCancel(context.Background())
+			a.bg = httpapi.NewBackground(a.rootCtx)
+			a.sched = scheduler.New(db.Job(), time.UTC, a.log)
+
+			ready := make(chan struct{})
+			result := make(chan error, 1)
+			start(a, func(ctx context.Context) {
+				close(ready)
+				<-ctx.Done()
+				time.Sleep(200 * time.Millisecond)
+				_, err := db.Job().Start(context.Background(), "late-write", time.Now().Unix())
+				result <- err
+			})
+			<-ready
+
+			begin := time.Now()
+			a.shutdown()
+			if took := time.Since(begin); took > 5*time.Second {
+				t.Fatalf("shutdown took %v; background work was not cancelled", took)
+			}
+			if a.db != nil {
+				t.Error("shutdown should clear a.db so closeInfra does not close twice")
+			}
+			select {
+			case err := <-result:
+				if err != nil {
+					t.Errorf("write after cancel failed (db closed too early?): %v", err)
+				}
+			default:
+				t.Fatal("background task had not returned when the database was closed")
+			}
+		})
+	}
 }

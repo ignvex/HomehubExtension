@@ -37,7 +37,21 @@ type Scheduler struct {
 	running  map[string]bool
 	planned  []plannedTask
 	onFinish func(job, status, detail string)
+
+	// ctx 是全部任务的根 context，Stop 时取消。
+	//
+	// 以前定时任务用 context.Background()：关停时 Stop 只能干等，
+	// 超时后放弃——任务还在后台写库，而 app 紧接着就关闭了数据库。
+	ctx    context.Context
+	cancel context.CancelFunc
+	// wg 跟踪所有经 RunNow 的执行（定时、手动、补跑）。
+	// stopped 与 wg.Add 在同一把 mu 下判断，保证 Stop 开始等待后不会再有新的 Add。
+	wg      sync.WaitGroup
+	stopped bool
 }
+
+// ErrStopped 表示调度器已停止，不再接受新的执行。
+var ErrStopped = errors.New("scheduler stopped")
 
 // plannedTask 保存调度项与其解析后的 schedule，
 // 供启动补跑时计算「多久跑一次」。
@@ -60,12 +74,15 @@ func New(jobs store.JobStore, loc *time.Location, log *slog.Logger) *Scheduler {
 	if log == nil {
 		log = slog.Default()
 	}
+	ctx, cancel := context.WithCancel(context.Background())
 	return &Scheduler{
 		cron:    cron.New(cron.WithLocation(loc)),
 		jobs:    jobs,
 		log:     log,
 		tasks:   make(map[string]Task),
 		running: make(map[string]bool),
+		ctx:     ctx,
+		cancel:  cancel,
 	}
 }
 
@@ -127,11 +144,27 @@ func (s *Scheduler) Apply(plans []Plan) error {
 // Start 启动 cron 循环。已注册的任务按各自的表达式触发。
 func (s *Scheduler) Start() { s.cron.Start() }
 
-// Stop 停止调度并等待运行中的任务，超出 wait 后放弃。
+// Stop 停止调度、取消所有运行中任务的 context，并等待它们返回，
+// 超出 wait 后放弃。
+//
+// 先取消再等：清理任务都是幂等的，关停时中断比让它们跑完更重要——
+// 调用方在 Stop 返回之后就会关闭数据库。
 func (s *Scheduler) Stop(wait time.Duration) {
-	ctx := s.cron.Stop()
+	cronDone := s.cron.Stop()
+
+	s.mu.Lock()
+	s.stopped = true
+	s.mu.Unlock()
+	s.cancel()
+
+	done := make(chan struct{})
+	go func() {
+		<-cronDone.Done()
+		s.wg.Wait()
+		close(done)
+	}()
 	select {
-	case <-ctx.Done():
+	case <-done:
 	case <-time.After(wait):
 		s.log.Warn("scheduler stop timed out", "waited", wait)
 	}
@@ -154,7 +187,7 @@ func (s *Scheduler) runOnce(task Task) {
 		s.mu.Unlock()
 	}()
 
-	s.RunNow(context.Background(), task)
+	s.RunNow(s.ctx, task)
 }
 
 // RunNow 同步执行一次任务并写 job_run。手动触发也走这条路径。
@@ -162,7 +195,19 @@ func (s *Scheduler) runOnce(task Task) {
 // 任务的 panic 必须在这里挡住：cron 在自己的 goroutine 里跑任务，
 // 未恢复的 panic 会终止整个进程（cron/v3 默认不带 Recover chain）。
 // 同时无论正常还是 panic，job_run 都要落终态，否则任务永远显示为运行中。
+//
+// 任务 context 同时受调用方 ctx 与调度器根 context 约束：手动触发走的是
+// 请求 context，Stop 时也必须能把它取消。
 func (s *Scheduler) RunNow(ctx context.Context, task Task) (detail string, runErr error) {
+	s.mu.Lock()
+	if s.stopped {
+		s.mu.Unlock()
+		return "", ErrStopped
+	}
+	s.wg.Add(1)
+	s.mu.Unlock()
+	defer s.wg.Done()
+
 	started := time.Now()
 	runID, err := s.jobs.Start(ctx, task.Name, started.Unix())
 	if err != nil {
@@ -171,6 +216,8 @@ func (s *Scheduler) RunNow(ctx context.Context, task Task) (detail string, runEr
 
 	runCtx, cancel := context.WithTimeout(ctx, task.Timeout)
 	defer cancel()
+	stopCancel := context.AfterFunc(s.ctx, cancel)
+	defer stopCancel()
 
 	status := "ok"
 	defer func() {
@@ -188,7 +235,11 @@ func (s *Scheduler) RunNow(ctx context.Context, task Task) (detail string, runEr
 		}
 
 		finish := time.Now()
-		if err := s.jobs.Finish(ctx, runID, status, detail, finish.Unix()); err != nil {
+		// 终态记录不能跟着 ctx 一起被取消：关停中断的任务也要落终态，
+		// 否则 job_run 里会永远留着一条「运行中」。
+		fctx, fcancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		defer fcancel()
+		if err := s.jobs.Finish(fctx, runID, status, detail, finish.Unix()); err != nil {
 			s.log.Error("record job finish", "job", task.Name, "err", err)
 		}
 		s.log.Info("job finished", "job", task.Name, "status", status,

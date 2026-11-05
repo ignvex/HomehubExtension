@@ -12,6 +12,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/ignvex/HomehubExtension/internal/auth"
@@ -52,10 +53,30 @@ type App struct {
 	server  *http.Server
 	srvErr  chan error
 	started time.Time
+
+	// rootCtx 是全部后台工作（轮询、启动补跑）的根，shutdown 第一步取消。
+	// 它不派生自 Run 的 ctx：后台工作的停止时机由 shutdown 的顺序决定，
+	// 而不是信号到达的那一刻，这样等待与关库的先后才可控。
+	rootCtx    context.Context
+	rootCancel context.CancelFunc
+	// workers 跟踪 rootCtx 下的 goroutine；关库前必须全部返回。
+	workers sync.WaitGroup
+	// bg 跟踪 HTTP 请求触发的后台任务（如首推抓取）。
+	bg *httpapi.Background
 }
 
 // 关闭总预算。systemd 的 TimeoutStopSec 必须大于它。
 const shutdownBudget = 20 * time.Second
+
+// serverReadTimeout 是读取整个请求（头 + body）的上限，防慢速 body 攻击。
+//
+// 暂用常量而不是配置项（server.read_timeout），默认值 30s 已覆盖 pastebin
+// 与 OPML 上传的正常场景。它不会切断 SSE：net/http 在 handler 开始前
+// （无 body 的 GET）或 body 读完时启动后台读，并在那一刻把读 deadline 清零
+// （net/http/server.go connReader.startBackgroundRead 的
+// SetReadDeadline(time.Time{})），ReadTimeout 之后不再作用于该连接。
+// internal/httpapi/readtimeout_test.go 锁定这一行为。
+const serverReadTimeout = 30 * time.Second
 
 // Run 启动完整服务，阻塞直到 ctx 取消，然后按序关闭。
 // Run 启动完整服务，阻塞直到 ctx 取消，然后按序关闭。
@@ -74,6 +95,9 @@ func Run(ctx context.Context, opts Options) error {
 		started: time.Now(),
 		bus:     events.Default,
 	}
+	a.rootCtx, a.rootCancel = context.WithCancel(context.Background())
+	defer a.rootCancel()
+	a.bg = httpapi.NewBackground(a.rootCtx)
 
 	if err := a.openInfra(ctx); err != nil {
 		return err
@@ -92,7 +116,7 @@ func Run(ctx context.Context, opts Options) error {
 	// 已经不干活」的情况，这是 Restart=on-failure 看不到的一类故障。
 	go systemd.KeepWatchdog(ctx, log)
 
-	if err := a.startServers(ctx, opts); err != nil {
+	if err := a.startServers(opts); err != nil {
 		return err
 	}
 
@@ -270,7 +294,7 @@ func (a *App) setupScheduler() error {
 }
 
 // startServers 构造路由、启动调度器与轮询器，然后开始监听。
-func (a *App) startServers(ctx context.Context, opts Options) error {
+func (a *App) startServers(opts Options) error {
 	router := httpapi.NewRouter(httpapi.Deps{
 		Cfg:         a.cfg,
 		Store:       a.db,
@@ -292,11 +316,17 @@ func (a *App) startServers(ctx context.Context, opts Options) error {
 	a.server = &http.Server{
 		Addr:    a.cfg.Server.Addr,
 		Handler: router,
-		// 读头超时防慢速攻击；写超时必须为 0，否则 SSE 会被周期性切断。
+		// 读超时防慢速攻击；写超时必须为 0，否则 SSE 会被周期性切断。
+		// ReadTimeout 不影响 SSE，依据见 serverReadTimeout 的注释。
 		ReadHeaderTimeout: a.cfg.Server.ReadHeaderTimeout.Duration,
 		IdleTimeout:       a.cfg.Server.IdleTimeout.Duration,
 		WriteTimeout:      0,
-		ReadTimeout:       0,
+		ReadTimeout:       serverReadTimeout,
+		// 请求 context 携带后台任务组：handler 触发的、比请求活得久的
+		// goroutine 经它登记，关停时在关库之前取消并等待。
+		BaseContext: func(net.Listener) context.Context {
+			return httpapi.WithBackground(context.Background(), a.bg)
+		},
 	}
 
 	// 先显式 bind 再 Serve。
@@ -318,7 +348,7 @@ func (a *App) startServers(ctx context.Context, opts Options) error {
 		}
 	}()
 
-	a.startBackgroundWorkers(ctx)
+	a.startBackgroundWorkers(a.rootCtx)
 
 	a.log.Info("http server listening",
 		"addr", a.cfg.Server.Addr,
@@ -346,7 +376,7 @@ func (a *App) startBackgroundWorkers(ctx context.Context) {
 			_, err := a.rss.Fetch(ctx, id)
 			return err
 		}, cfg.RSS.FetchConcurrency, a.log)
-		go poller.Run(ctx)
+		a.goWorker(func() { poller.Run(ctx) })
 		a.log.Info("feed poller started",
 			"interval", pollInterval.String(),
 			"concurrency", cfg.RSS.FetchConcurrency)
@@ -362,7 +392,7 @@ func (a *App) startBackgroundWorkers(ctx context.Context) {
 	if !cfg.Cleanup.CatchUp {
 		return
 	}
-	go func() {
+	a.goWorker(func() {
 		// 延迟 30 秒：先让服务可用，再跑清理。
 		select {
 		case <-time.After(30 * time.Second):
@@ -373,11 +403,37 @@ func (a *App) startBackgroundWorkers(ctx context.Context) {
 		if len(ran) > 0 {
 			a.log.Info("startup catch-up completed", "jobs", ran)
 		}
+	})
+}
+
+// goWorker 在 rootCtx 生命周期内启动一个受 workers 跟踪的 goroutine。
+func (a *App) goWorker(fn func()) {
+	a.workers.Add(1)
+	go func() {
+		defer a.workers.Done()
+		fn()
 	}()
+}
+
+// waitWorkers 等待 rootCtx 下的 goroutine 返回，超出 d 后放弃并返回 false。
+func (a *App) waitWorkers(d time.Duration) bool {
+	done := make(chan struct{})
+	go func() {
+		a.workers.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return true
+	case <-time.After(d):
+		return false
+	}
 }
 
 // closeInfra 回收基础设施。只用于启动失败时的清理；
 // 正常关闭走 shutdown，那条路径还会处理 HTTP 与调度器。
+//
+// 正常路径下 shutdown 已经关过库并把 a.db 置 nil，这里不会重复关闭。
 func (a *App) closeInfra() {
 	if a.db != nil {
 		if err := a.db.Close(); err != nil {
@@ -401,6 +457,16 @@ func (a *App) shutdown() {
 	ctx, cancel := context.WithTimeout(context.Background(), shutdownBudget)
 	defer cancel()
 
+	// 顺序：
+	//  1. 取消根 context：轮询器停止取新任务，在途 fetch 与启动补跑收到取消；
+	//  2. 停调度器：取消并等待运行中的清理任务；
+	//  3. 关事件总线，再 Shutdown HTTP（等在途请求）；
+	//  4. 取消并等待请求触发的后台任务（必须在 HTTP Shutdown 之后，
+	//     否则 Shutdown 期间仍在跑的请求还能登记新任务）；
+	//  5. 等轮询器 / 补跑 goroutine 返回；
+	//  6. 最后才关数据库——此时所有后台写都已返回或已放弃等待。
+	a.rootCancel()
+
 	if a.sched != nil {
 		a.sched.Stop(10 * time.Second)
 	}
@@ -421,12 +487,33 @@ func (a *App) shutdown() {
 		}
 	}
 
+	if a.bg != nil {
+		if err := a.bg.Shutdown(ctx); err != nil {
+			a.log.Warn("background tasks did not finish before shutdown budget", "err", err)
+		}
+	}
+
+	if !a.waitWorkers(remaining(ctx)) {
+		a.log.Warn("background workers did not finish before shutdown budget")
+	}
+
 	if a.db != nil {
 		if err := a.db.Close(); err != nil {
 			a.log.Warn("close database", "err", err)
 		}
+		a.db = nil
 	}
 	a.log.Info("shutdown complete")
+}
+
+// remaining 返回 ctx 截止前的剩余时间；至少 1 秒，给已取消的任务留出返回的余地。
+func remaining(ctx context.Context) time.Duration {
+	if dl, ok := ctx.Deadline(); ok {
+		if d := time.Until(dl); d > time.Second {
+			return d
+		}
+	}
+	return time.Second
 }
 
 func toSet(list []string) map[string]bool {

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/ignvex/HomehubExtension/internal/store"
@@ -123,7 +124,7 @@ func (s *server) handleHubUpsert(c *gin.Context) {
 
 	// 首推默认立即抓一次，让 Homehub 侧不必再等一个周期。
 	if req.FetchNow == nil || *req.FetchNow {
-		s.kickInitialFetch(saved.ID)
+		s.kickInitialFetch(ctx, saved.ID)
 	}
 
 	c.JSON(status, toHubSubscription(&saved))
@@ -179,16 +180,97 @@ func (s *server) reviveFeed(ctx context.Context, saved *store.Feed) {
 
 // kickInitialFetch 在请求返回后异步抓一次。
 //
-// 用独立 context：请求结束后仍要跑完，否则宿主推完第一次就再也
-// 看不到内容。
-func (s *server) kickInitialFetch(feedID int64) {
-	go func(id int64) {
-		ctx, cancel := contextWithTimeout(5 * time.Minute)
+// 不能用请求 context：请求结束后仍要跑完，否则宿主推完第一次就再也
+// 看不到内容。但也不能完全脱离进程生命周期——关停时它必须被取消并
+// 等它返回，否则会在数据库关闭之后继续写库。所以 goroutine 交给
+// 请求 context 里携带的 Background（由 app 经 http.Server.BaseContext
+// 注入）管理；没有注入时（测试）退回独立 context。
+func (s *server) kickInitialFetch(reqCtx context.Context, feedID int64) {
+	run := func(ctx context.Context) {
+		ctx, cancel := context.WithTimeout(ctx, 5*time.Minute)
 		defer cancel()
-		if _, err := s.RSS.Fetch(ctx, id); err != nil {
-			s.Log.Warn("initial fetch failed", "feed_id", id, "err", err)
+		if _, err := s.RSS.Fetch(ctx, feedID); err != nil {
+			s.Log.Warn("initial fetch failed", "feed_id", feedID, "err", err)
 		}
-	}(feedID)
+	}
+	if bg := BackgroundFrom(reqCtx); bg != nil {
+		if !bg.Go(run) {
+			s.Log.Info("initial fetch skipped, shutting down", "feed_id", feedID)
+		}
+		return
+	}
+	go run(context.Background())
+}
+
+// Background 跟踪请求触发、但比请求活得更久的后台任务。
+//
+// 它是 httpapi 与 app 之间的关停契约：app 用 NewBackground 创建，
+// 经 WithBackground 放进 http.Server.BaseContext，关停时在关闭数据库
+// 之前调用 Shutdown——取消全部任务并等待它们返回。
+// 走 context 而不是 Deps 字段，是为了不改动路由层的依赖结构。
+type Background struct {
+	ctx    context.Context
+	cancel context.CancelFunc
+
+	mu      sync.Mutex
+	wg      sync.WaitGroup
+	stopped bool
+}
+
+// NewBackground 构造一个派生自 parent 的后台任务组。
+func NewBackground(parent context.Context) *Background {
+	ctx, cancel := context.WithCancel(parent)
+	return &Background{ctx: ctx, cancel: cancel}
+}
+
+// Go 在后台运行 fn，fn 收到的 context 在 Shutdown 时取消。
+// 已进入关停时不再启动，返回 false。
+func (b *Background) Go(fn func(ctx context.Context)) bool {
+	b.mu.Lock()
+	if b.stopped {
+		b.mu.Unlock()
+		return false
+	}
+	b.wg.Add(1)
+	b.mu.Unlock()
+	go func() {
+		defer b.wg.Done()
+		fn(b.ctx)
+	}()
+	return true
+}
+
+// Shutdown 取消全部后台任务并等待返回；ctx 到期时放弃等待并返回其错误。
+func (b *Background) Shutdown(ctx context.Context) error {
+	b.mu.Lock()
+	b.stopped = true
+	b.mu.Unlock()
+	b.cancel()
+
+	done := make(chan struct{})
+	go func() {
+		b.wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+type backgroundKey struct{}
+
+// WithBackground 把 b 挂到 ctx 上，供 http.Server.BaseContext 使用。
+func WithBackground(ctx context.Context, b *Background) context.Context {
+	return context.WithValue(ctx, backgroundKey{}, b)
+}
+
+// BackgroundFrom 取出 ctx 上的 Background；没有时返回 nil。
+func BackgroundFrom(ctx context.Context) *Background {
+	b, _ := ctx.Value(backgroundKey{}).(*Background)
+	return b
 }
 
 // resolveInterval 决定这条推送用哪个抓取间隔，并夹到配置区间内。
