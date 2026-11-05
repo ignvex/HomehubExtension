@@ -97,3 +97,42 @@ func TestBlobGCRemovesOrphanFiles(t *testing.T) {
 		t.Error("有 blob 行的文件被误删")
 	}
 }
+
+// 无引用的旧 blob 正常回收：文件与行都删掉。
+// 如果在 GC 判定前它被新条目去重复用（文件 mtime 刷新、行 last_seen_at 刷新），
+// 两处复检都必须让它留下。
+func TestBlobGCRechecksBeforeDeleting(t *testing.T) {
+	j, db, blobs := newGCJobs(t)
+	ctx := context.Background()
+	old := time.Now().Add(-2 * time.Hour).Unix()
+
+	stale := putFile(t, blobs, "stale", 2*time.Hour)
+	reused := putFile(t, blobs, "reused", 2*time.Hour)
+	for _, r := range []*blob.Result{stale, reused} {
+		if err := db.Blob().Upsert(ctx, &store.Blob{
+			SHA256: r.SHA256, Size: r.Size, Ext: "png", Kind: "image", CreatedAt: old, LastSeenAt: old,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// reused 被新抓取去重命中：place 刷新 mtime，SaveEntryMedia 刷新 last_seen_at。
+	if _, err := blobs.Put(ctx, strings.NewReader("reused"), blob.PutOptions{Ext: "png"}); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := j.BlobGC(ctx, map[string]any{}); err != nil {
+		t.Fatal(err)
+	}
+	if exists(stale.Path) {
+		t.Error("无引用的旧文件没被回收")
+	}
+	if _, err := db.Blob().Get(ctx, stale.SHA256); err == nil {
+		t.Error("无引用的旧 blob 行没被回收")
+	}
+	if !exists(reused.Path) {
+		t.Error("刚被复用的文件被 GC 删除")
+	}
+	if _, err := db.Blob().Get(ctx, reused.SHA256); err != nil {
+		t.Errorf("刚被复用的文件还在，它的行却被删了: %v", err)
+	}
+}

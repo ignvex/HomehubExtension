@@ -178,6 +178,11 @@ type BlobStore interface {
 	Unreferenced(ctx context.Context, before int64, limit int) ([]Blob, error)
 	// Delete 删除 blob 行与全部 entry_blob 引用。
 	Delete(ctx context.Context, sha string) error
+	// DeleteUnreferenced 仅当该 blob 此刻仍无引用、且 last_seen_at 不晚于
+	// before 时删除它的行，返回是否删除。供 GC 在删完文件后使用：
+	// 查询 Unreferenced 与删除之间若有新条目复用了它（Upsert 会刷新
+	// last_seen_at，Link 会抬高 ref_count），这里就不再删除。
+	DeleteUnreferenced(ctx context.Context, sha string, before int64) (bool, error)
 	// TotalSize 汇总占用字节，用于配额校准。
 	TotalSize(ctx context.Context) (int64, error)
 	// Count 返回 blob 行数。

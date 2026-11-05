@@ -155,6 +155,16 @@ func (s blobStore) Unreferenced(ctx context.Context, before int64, limit int) ([
 	return out, rows.Err()
 }
 
+func (s blobStore) DeleteUnreferenced(ctx context.Context, sha string, before int64) (bool, error) {
+	res, err := s.d.rw.ExecContext(ctx,
+		`DELETE FROM blob WHERE sha256 = ? AND ref_count = 0 AND last_seen_at <= ?`, sha, before)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	return n > 0, err
+}
+
 func (s blobStore) Delete(ctx context.Context, sha string) error {
 	return s.d.withTx(ctx, func(tx *sql.Tx) error {
 		if _, err := tx.ExecContext(ctx, `DELETE FROM entry_blob WHERE sha256 = ?`, sha); err != nil {

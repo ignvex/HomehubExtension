@@ -136,7 +136,8 @@ func (j *Jobs) BlobGC(ctx context.Context, p map[string]any) (string, error) {
 	}
 	grace := durParam(p, "grace", def)
 	dryRun := boolParam(p, "dry_run", false)
-	cutoff := j.now().Add(-grace).Unix()
+	cutoffTime := j.now().Add(-grace)
+	cutoff := cutoffTime.Unix()
 
 	// 先校准：任何遗漏的删除路径都会让 ref_count 偏高，
 	// 校准之后本轮 GC 才能把这些 blob 捞出来。
@@ -154,7 +155,7 @@ func (j *Jobs) BlobGC(ctx context.Context, p map[string]any) (string, error) {
 		return "", err
 	}
 	if dryRun {
-		orphans, orphanBytes, err := j.sweepOrphans(ctx, j.now().Add(-grace), true)
+		orphans, orphanBytes, err := j.sweepOrphans(ctx, cutoffTime, true)
 		if err != nil {
 			return "", err
 		}
@@ -168,10 +169,20 @@ func (j *Jobs) BlobGC(ctx context.Context, p map[string]any) (string, error) {
 		if ctx.Err() != nil {
 			break
 		}
-		if err := j.Blobs.Delete(b.SHA256, b.Ext); err != nil && !os.IsNotExist(err) {
-			continue // 删不掉就留着，下一轮再试，不要因为一个文件中断整轮
+		// 查询之后、删除之前，新条目可能去重命中了这份文件（会刷新 mtime）。
+		// 文件按 mtime 复检、行按 ref_count 与 last_seen_at 复检，
+		// 任何一处显示它刚被用过就跳过，留给下一轮重新判断。
+		// 文件已经不在（上一轮删了文件、删行失败）时直接去删行。
+		removed, _, err := j.Blobs.RemoveIfOlder(b.SHA256, b.Ext, cutoffTime)
+		if err != nil {
+			continue
 		}
-		if err := j.Store.Blob().Delete(ctx, b.SHA256); err != nil {
+		if !removed {
+			if _, statErr := os.Stat(j.Blobs.Path(b.SHA256, b.Ext)); !os.IsNotExist(statErr) {
+				continue
+			}
+		}
+		if ok, err := j.Store.Blob().DeleteUnreferenced(ctx, b.SHA256, cutoff); err != nil || !ok {
 			continue
 		}
 		purged++
@@ -180,7 +191,7 @@ func (j *Jobs) BlobGC(ctx context.Context, p map[string]any) (string, error) {
 
 	// 孤儿文件放在行级 GC 之后：上面刚删掉行、但文件删除失败的那些，
 	// 这里会作为孤儿再被捞一次。
-	orphans, orphanBytes, err := j.sweepOrphans(ctx, j.now().Add(-grace), false)
+	orphans, orphanBytes, err := j.sweepOrphans(ctx, cutoffTime, false)
 	if err != nil {
 		return "", err
 	}
