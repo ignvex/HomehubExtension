@@ -6,6 +6,11 @@ export interface ApiOptions {
   method?: string;
   body?: unknown;
   signal?: AbortSignal;
+  /** 以下透传给 send()，用于非 JSON 的请求/响应（OPML）。 */
+  rawBody?: string;
+  contentType?: string;
+  accept?: string;
+  responseType?: "json" | "text";
 }
 
 const WRITE_METHODS = new Set(["POST", "PUT", "PATCH", "DELETE"]);
@@ -34,6 +39,10 @@ export async function api<T>(path: string, options: ApiOptions = {}): Promise<T>
 
     const init: HttpInit = { method, headers };
     if (options.body !== undefined) init.body = options.body;
+    if (options.rawBody !== undefined) init.rawBody = options.rawBody;
+    if (options.contentType !== undefined) init.contentType = options.contentType;
+    if (options.accept !== undefined) init.accept = options.accept;
+    if (options.responseType !== undefined) init.responseType = options.responseType;
     if (options.signal) init.signal = options.signal;
     return send<T>(path, init);
   };

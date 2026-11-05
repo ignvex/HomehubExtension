@@ -143,10 +143,18 @@ export const factory: ToolFactory = (ctx) => {
   let fileBytes: Uint8Array | null = null;
   let fileName = "";
   let running = false;
+  // 计算期间又有新输入时置位：本轮结束后补算一次，保证最终显示的是最后一次输入的摘要。
+  let dirty = false;
+  // 每次选文件自增；旧文件的 FileReader 晚到时据此丢弃。
+  let fileGeneration = 0;
 
   const run = async (): Promise<void> => {
-    if (running) return;
+    if (running) {
+      dirty = true;
+      return;
+    }
     running = true;
+    dirty = false;
     try {
       let data: Uint8Array;
       if (mode.value === "file") {
@@ -167,12 +175,13 @@ export const factory: ToolFactory = (ctx) => {
         }
       }
 
-      showError(error, "");
       const lines: string[] = [];
       for (const [algo, label] of ALGORITHMS) {
         const hex = await digest(algo, data);
+        if (dirty || ctx.signal.aborted) return;
         lines.push(`${label.padEnd(8)} ${hex}`);
       }
+      showError(error, "");
       output.value = lines.join("\n");
 
       setStats(statLine, [
@@ -180,9 +189,10 @@ export const factory: ToolFactory = (ctx) => {
         ...(fileName ? ([["文件", fileName]] as const) : []),
       ]);
     } catch (e) {
-      showError(error, e instanceof Error ? e.message : String(e));
+      if (!dirty) showError(error, e instanceof Error ? e.message : String(e));
     } finally {
       running = false;
+      if (dirty && !ctx.signal.aborted) void run();
     }
   };
 
@@ -198,20 +208,24 @@ export const factory: ToolFactory = (ctx) => {
 
   fileInput.addEventListener("change", () => {
     const file = fileInput.files?.[0];
+    fileGeneration += 1;
+    const generation = fileGeneration;
     if (!file) {
       fileBytes = null;
       fileName = "";
       void run();
       return;
     }
-    fileName = file.name;
     const reader = new FileReader();
     reader.onload = () => {
+      if (generation !== fileGeneration) return;
+      fileName = file.name;
       // FileReader 的 result 是 ArrayBuffer。
       fileBytes = new Uint8Array(reader.result as ArrayBuffer);
       void run();
     };
     reader.onerror = () => {
+      if (generation !== fileGeneration) return;
       showError(error, "读取文件失败");
     };
     reader.readAsArrayBuffer(file);

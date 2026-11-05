@@ -1,9 +1,9 @@
+import { api } from "./client";
 import { ApiError } from "./errors";
-import { getAccessToken, getCsrfToken } from "../auth/session";
 
-// OPML 走的是 XML/二进制，与 JSON 的 send() 路径不同，
-// 所以单独一个小模块而不是硬塞进 http.ts。
-// 认证与 CSRF 的规则保持一致：Bearer 在头里、写操作带 X-CSRF-Token。
+// OPML 的请求体与导出响应是 XML 文本，但仍走统一请求层 api()：
+// 这样 Bearer、CSRF、X-Owner-Token、X-Request-ID、401 刷新重放与
+// 服务端 JSON 错误信封的解析都与其它接口一致，不再各写一份。
 
 export interface OPMLFailure {
   url: string;
@@ -17,82 +17,47 @@ export interface OPMLImportResult {
   failed: OPMLFailure[];
 }
 
-function authHeaders(): Record<string, string> {
-  const headers: Record<string, string> = {};
-  const token = getAccessToken();
-  if (token) headers.Authorization = `Bearer ${token}`;
-  return headers;
+function isCount(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
 }
 
-/** 导出全部订阅为 OPML 文本。 */
-export async function exportOPML(signal?: AbortSignal): Promise<string> {
-  const init: RequestInit = {
-    method: "GET",
-    headers: { ...authHeaders(), Accept: "text/x-opml" },
-    credentials: "same-origin",
-    cache: "no-store",
-  };
-  if (signal) init.signal = signal;
+function invalidResponse(): ApiError {
+  return new ApiError(0, "invalid_response", "服务端返回的导入结果格式不正确", null, null);
+}
 
-  const response = await fetch("/api/v1/feeds/export", init);
-  if (!response.ok) {
-    throw new ApiError(
-      response.status,
-      "export_failed",
-      `导出失败（HTTP ${response.status}）`,
-      null,
-      response.headers.get("X-Request-ID"),
-    );
+/** 服务端返回值的形状校验：不对就当成协议错误，而不是让视图读到 undefined。 */
+function parseImportResult(payload: unknown): OPMLImportResult {
+  const record = typeof payload === "object" && payload !== null ? (payload as Record<string, unknown>) : null;
+  if (!record || !isCount(record.created) || !isCount(record.updated) || !isCount(record.total)) {
+    throw invalidResponse();
   }
-  return response.text();
+  const failedRaw = record.failed ?? [];
+  if (!Array.isArray(failedRaw)) throw invalidResponse();
+  const failed: OPMLFailure[] = [];
+  for (const item of failedRaw as unknown[]) {
+    const entry = typeof item === "object" && item !== null ? (item as Record<string, unknown>) : null;
+    if (!entry || typeof entry.url !== "string") throw invalidResponse();
+    failed.push({ url: entry.url, reason: typeof entry.reason === "string" ? entry.reason : "" });
+  }
+  return { created: record.created, updated: record.updated, total: record.total, failed };
+}
+
+/** 导出全部订阅为 OPML 文本。失败时抛出带服务端错误码与消息的 ApiError。 */
+export async function exportOPML(signal?: AbortSignal): Promise<string> {
+  return api<string>("/feeds/export", {
+    accept: "text/x-opml, application/json",
+    responseType: "text",
+    ...(signal ? { signal } : {}),
+  });
 }
 
 /** 导入 OPML 文本，返回逐条结果。 */
 export async function importOPML(text: string, signal?: AbortSignal): Promise<OPMLImportResult> {
-  const headers: Record<string, string> = {
-    ...authHeaders(),
-    "Content-Type": "text/x-opml; charset=utf-8",
-    Accept: "application/json",
-  };
-  // 与 client.ts 同一规则：写操作带 CSRF。
-  const csrf = getCsrfToken();
-  if (csrf) headers["X-CSRF-Token"] = csrf;
-
-  const init: RequestInit = {
+  const payload = await api<unknown>("/feeds/import", {
     method: "POST",
-    headers,
-    body: text,
-    credentials: "same-origin",
-    cache: "no-store",
-  };
-  if (signal) init.signal = signal;
-
-  const response = await fetch("/api/v1/feeds/import", init);
-  const raw = await response.text();
-
-  let payload: unknown = null;
-  if (raw !== "") {
-    try {
-      payload = JSON.parse(raw) as unknown;
-    } catch {
-      payload = raw;
-    }
-  }
-
-  if (!response.ok) {
-    const record = typeof payload === "object" && payload !== null ? (payload as Record<string, unknown>) : null;
-    const detail =
-      typeof record?.error === "object" && record.error !== null
-        ? (record.error as Record<string, unknown>)
-        : null;
-    throw new ApiError(
-      response.status,
-      typeof detail?.code === "string" ? detail.code : "import_failed",
-      typeof detail?.message === "string" ? detail.message : `导入失败（HTTP ${response.status}）`,
-      detail?.details ?? null,
-      response.headers.get("X-Request-ID"),
-    );
-  }
-
-  return payload as OPMLImportResult;
+    rawBody: text,
+    contentType: "text/x-opml; charset=utf-8",
+    ...(signal ? { signal } : {}),
+  });
+  return parseImportResult(payload);
 }

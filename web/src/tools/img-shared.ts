@@ -22,7 +22,8 @@ export const FORMATS: readonly FormatOption[] = [
   { mime: "image/png", label: "PNG（无损）", ext: "png", lossy: false },
   { mime: "image/jpeg", label: "JPEG", ext: "jpg", lossy: true },
   { mime: "image/webp", label: "WebP", ext: "webp", lossy: true },
-  { mime: "image/bmp", label: "BMP", ext: "bmp", lossy: false },
+  // 多数浏览器的 canvas 不能导出 BMP，会静默回退成 PNG；交给 supportsFormat 探测。
+  { mime: "image/bmp", label: "BMP", ext: "bmp", lossy: false, maybeUnsupported: true },
   { mime: "image/x-icon", label: "ICO", ext: "ico", lossy: false, maybeUnsupported: true },
 ];
 
@@ -117,8 +118,9 @@ export async function encode(
     throw new Error(`浏览器不支持导出 ${format.label}`);
   }
   // 有些浏览器对不支持的格式会回退成 PNG 而不是返回 null，
-  // 那样扩展名与内容就不一致了。
-  if (!format.maybeUnsupported && blob.type !== format.mime && format.mime !== "image/bmp") {
+  // 那样扩展名与内容就不一致了。对所有格式都校验：探测结果可能过期，
+  // 回退的产物绝不能以 .bmp / .ico 之类的扩展名交给用户。
+  if (blob.type !== format.mime) {
     throw new Error(`导出格式回退成了 ${blob.type}，当前浏览器不支持 ${format.label}`);
   }
   return blob;

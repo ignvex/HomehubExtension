@@ -66,6 +66,13 @@ export const factory: ToolFactory = (ctx) => {
   let resultBlob: Blob | null = null;
   let previewUrl: string | null = null;
 
+  // 每次编码自增；await 回来时不是最新的一次就丢弃结果（不创建 object URL）。
+  let generation = 0;
+  // 每次选图自增；旧图晚到的 bitmap 直接关闭。
+  let loadGeneration = 0;
+  // 卸载后仍在跑的 encode 回来时不能再 createObjectURL，否则 URL 永远不会被 revoke。
+  let disposed = false;
+
   const cleanupPreview = (): void => {
     if (previewUrl) {
       URL.revokeObjectURL(previewUrl);
@@ -74,6 +81,9 @@ export const factory: ToolFactory = (ctx) => {
   };
 
   const compress = async (): Promise<void> => {
+    generation += 1;
+    const current = generation;
+    const isStale = (): boolean => disposed || current !== generation;
     if (!bitmap || !sourceFile) {
       preview.replaceChildren(h("p", { class: "muted small" }, "先选一张图片。"));
       return;
@@ -81,18 +91,21 @@ export const factory: ToolFactory = (ctx) => {
     const format = formatByMime(formatSelect.value);
     if (!format) return;
 
+    const image = bitmap;
     try {
       const longest = Number(edgeSelect.value) || 0;
       // 「最长边」比宽高更贴合实际：照片横竖不一，用户只关心多大。
       const size =
         longest > 0
-          ? bitmap.width >= bitmap.height
-            ? computeSize(bitmap, { width: longest, height: 0, keepAspect: true })
-            : computeSize(bitmap, { width: 0, height: longest, keepAspect: true })
-          : { width: bitmap.width, height: bitmap.height };
+          ? image.width >= image.height
+            ? computeSize(image, { width: longest, height: 0, keepAspect: true })
+            : computeSize(image, { width: 0, height: longest, keepAspect: true })
+          : { width: image.width, height: image.height };
 
       const quality = Number(qualityInput.value) / 100;
-      const blob = await encode(bitmap, size, format, quality);
+      const source = sourceFile;
+      const blob = await encode(image, size, format, quality);
+      if (isStale()) return;
       resultBlob = blob;
 
       cleanupPreview();
@@ -105,15 +118,16 @@ export const factory: ToolFactory = (ctx) => {
       );
 
       showError(error, "");
-      const saved = sourceFile.size - blob.size;
-      const ratio = Math.round((blob.size / sourceFile.size) * 100);
+      const saved = source.size - blob.size;
+      const ratio = Math.round((blob.size / source.size) * 100);
       setStats(statLine, [
-        ["原始", `${fmtBytes(sourceFile.size)} · ${bitmap.width}×${bitmap.height}`],
+        ["原始", `${fmtBytes(source.size)} · ${image.width}×${image.height}`],
         ["压缩后", `${fmtBytes(blob.size)} · ${size.width}×${size.height}`],
         ["比例", `${ratio}%`],
         ["节省", saved > 0 ? fmtBytes(saved) : "反而变大"],
       ]);
     } catch (e) {
+      if (isStale()) return;
       showError(error, e instanceof Error ? e.message : String(e));
       resultBlob = null;
       preview.replaceChildren();
@@ -124,13 +138,22 @@ export const factory: ToolFactory = (ctx) => {
   fileInput.addEventListener("change", () => {
     const file = fileInput.files?.[0];
     if (!file) return;
-    sourceFile = file;
+    loadGeneration += 1;
+    const current = loadGeneration;
     void (async () => {
       try {
+        // 先成功解码新图再关闭旧图：解码失败时旧图与旧结果仍然可用。
+        const next = await loadImage(file);
+        if (disposed || current !== loadGeneration) {
+          next.close();
+          return;
+        }
         bitmap?.close();
-        bitmap = await loadImage(file);
+        bitmap = next;
+        sourceFile = file;
         await compress();
       } catch (e) {
+        if (disposed || current !== loadGeneration) return;
         showError(error, `无法读取这张图片：${e instanceof Error ? e.message : String(e)}`);
       }
     })();
@@ -155,7 +178,9 @@ export const factory: ToolFactory = (ctx) => {
         ctx.toast.show("还没有可下载的结果", "error");
         return;
       }
-      const ext = formatByMime(formatSelect.value)?.ext ?? "bin";
+      // 扩展名按结果 blob 的实际类型取，而不是按当前下拉框：
+      // 新一轮编码还没完成时下拉框已变，浏览器回退格式时类型也会不同。
+      const ext = formatByMime(resultBlob.type)?.ext ?? "bin";
       download(resultBlob, replaceExt(sourceFile.name, ext));
     },
     "primary",
@@ -183,6 +208,8 @@ export const factory: ToolFactory = (ctx) => {
   return {
     element,
     unmount: () => {
+      disposed = true;
+      generation += 1;
       cleanupPreview();
       bitmap?.close();
       bitmap = null;

@@ -111,6 +111,8 @@ export const factory: ToolFactory = (ctx) => {
     }
     showError(error, "");
     tsInput.value = String(Math.floor(date.getTime() / 1000));
+    // 写入的是秒：单位若停在"毫秒"，之后改动单位或时间戳时会按毫秒解读，差 1000 倍。
+    unit.value = "s";
     setStats(statLine, [
       ["秒", String(Math.floor(date.getTime() / 1000))],
       ["毫秒", String(date.getTime())],
