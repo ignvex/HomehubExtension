@@ -9,9 +9,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/gin-gonic/gin"
-
 	"github.com/ignvex/HomehubExtension/internal/auth"
+
+	"github.com/gin-gonic/gin"
 )
 
 // 同一 IP 的 50 个并发失败请求：真正到达处理器并以 401 结束的次数

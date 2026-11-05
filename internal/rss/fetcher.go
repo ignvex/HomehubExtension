@@ -245,11 +245,24 @@ func (s *Service) FetchFeed(ctx context.Context, feed *store.Feed) (*Result, err
 		feed.SiteURL = SafeHTTPURL(parsed.Link)
 	}
 
+	s.ingestItems(ctx, feed, parsed, now, res)
+
+	res.Status = doc.Status
+	s.markSuccess(ctx, feed, now, doc.Status, doc.ETag, doc.LastMod)
+	if s.cfg.OnFeedFetched != nil {
+		s.cfg.OnFeedFetched(feed.ID, doc.Status, res.NewEntries, "")
+	}
+	return res, nil
+}
+
+// ingestItems 逐条入库一轮解析结果，把计数累加到 res。
+//
+// 整轮只查一次 SUM(size)：之前每个条目查一次，一个 50 条的源就是
+// 50 次聚合查询。本轮的新增用量由 tracker 累加，跨轮、跨 tracker 的
+// 并发由 blob.Store 的全局视图兜底。
+func (s *Service) ingestItems(ctx context.Context, feed *store.Feed, parsed *gofeed.Feed, now time.Time, res *Result) {
 	base := baseURL(parsed, feed)
 
-	// 整轮只查一次 SUM(size)：之前每个条目查一次，一个 50 条的源就是
-	// 50 次聚合查询。本轮的新增用量由 tracker 累加，跨轮、跨 tracker 的
-	// 并发由 blob.Store 的全局视图兜底。
 	used, err := s.st.Blob().TotalSize(ctx)
 	if err != nil {
 		// 不能把查询失败当成 0 而不留痕：blob.Store 的全局视图仍在兜底，
@@ -276,13 +289,6 @@ func (s *Service) FetchFeed(ctx context.Context, feed *store.Feed) (*Result, err
 		res.MediaOK += outcome.MediaOK
 		res.MediaFail += outcome.MediaFail
 	}
-
-	res.Status = doc.Status
-	s.markSuccess(ctx, feed, now, doc.Status, doc.ETag, doc.LastMod)
-	if s.cfg.OnFeedFetched != nil {
-		s.cfg.OnFeedFetched(feed.ID, doc.Status, res.NewEntries, "")
-	}
-	return res, nil
 }
 
 // fetchDocument 发条件请求，返回正文与缓存验证器。
@@ -411,40 +417,13 @@ func (s *Service) ingestItem(
 		return ingestOutcome{}, nil
 	}
 
-	raw := item.Content
-	if raw == "" {
-		raw = item.Description
-	}
-	if int64(len(raw)) > s.cfg.MaxEntryBytes {
-		raw = raw[:s.cfg.MaxEntryBytes]
-	}
-	if raw == "" {
-		raw = "<p></p>"
-	}
-
-	// 条目自己的链接优先作为 base：它通常比站点首页更精确。
 	link := SafeHTTPURL(item.Link)
-	itemBase := base
-	if link != "" {
-		if u, err := url.Parse(link); err == nil {
-			itemBase = u
-		}
-	}
-
-	doc, err := Sanitize(raw, SanitizeOptions{Base: itemBase})
+	doc, err := Sanitize(s.itemBody(item), SanitizeOptions{Base: itemBase(base, link)})
 	if err != nil {
 		return ingestOutcome{}, err
 	}
 
-	referer := ""
-	switch s.cfg.RefererMode {
-	case "auto":
-		referer = link
-	case "site":
-		referer = feed.SiteURL
-	}
-
-	results := s.dl.DownloadAll(ctx, doc.Targets, referer, quota)
+	results := s.dl.DownloadAll(ctx, doc.Targets, s.refererFor(feed, link), quota)
 
 	// 重写必须在 Render 之前：落库的 HTML 就是读者最终看到的形态。
 	doc.Rewrite(results)
@@ -476,6 +455,43 @@ func (s *Service) ingestItem(
 	defer cancel()
 	mediaOK, mediaFail := s.persistMedia(wctx, entry.ID, doc.Targets, results)
 	return ingestOutcome{Created: true, MediaOK: mediaOK, MediaFail: mediaFail}, nil
+}
+
+// itemBody 取条目正文：content 优先，退回 description，按上限截断。
+func (s *Service) itemBody(item *gofeed.Item) string {
+	raw := item.Content
+	if raw == "" {
+		raw = item.Description
+	}
+	if int64(len(raw)) > s.cfg.MaxEntryBytes {
+		raw = raw[:s.cfg.MaxEntryBytes]
+	}
+	if raw == "" {
+		raw = "<p></p>"
+	}
+	return raw
+}
+
+// itemBase 决定相对地址的解析基准：条目自己的链接优先，
+// 它通常比站点首页更精确。link 已经过 SafeHTTPURL。
+func itemBase(base *url.URL, link string) *url.URL {
+	if link != "" {
+		if u, err := url.Parse(link); err == nil {
+			return u
+		}
+	}
+	return base
+}
+
+// refererFor 按 referer_mode 决定下载媒体时带的 Referer。
+func (s *Service) refererFor(feed *store.Feed, link string) string {
+	switch s.cfg.RefererMode {
+	case "auto":
+		return link
+	case "site":
+		return feed.SiteURL
+	}
+	return ""
 }
 
 // buildEntry 把抓取到的条目映射成待入库的值对象。
