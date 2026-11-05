@@ -279,3 +279,62 @@ func TestLoadExplainsRemovedField(t *testing.T) {
 		t.Errorf("error should name both the old and the new field: %v", err)
 	}
 }
+
+func TestValidateNonceTTLCoversClockSkew(t *testing.T) {
+	cfg := validBase(t)
+	cfg.Auth.Hub.Enabled = true
+	cfg.Auth.Hub.ClockSkew = Duration{60 * time.Second}
+	cfg.Auth.Hub.NonceTTL = Duration{90 * time.Second}
+
+	errs := cfg.Validate()
+	found := false
+	for _, e := range errs {
+		if strings.Contains(e.Error(), "auth.hub.nonce_ttl") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("nonce_ttl < 2*clock_skew 应报错，got %v", errs)
+	}
+
+	// 恰好等于 2*clock_skew 是允许的边界。
+	cfg.Auth.Hub.NonceTTL = Duration{120 * time.Second}
+	for _, e := range cfg.Validate() {
+		if strings.Contains(e.Error(), "nonce_ttl") {
+			t.Fatalf("nonce_ttl == 2*clock_skew 不应报错: %v", e)
+		}
+	}
+
+	// Hub 通道关闭时不校验。
+	cfg.Auth.Hub.Enabled = false
+	cfg.Auth.Hub.NonceTTL = Duration{time.Second}
+	for _, e := range cfg.Validate() {
+		if strings.Contains(e.Error(), "nonce_ttl") {
+			t.Fatalf("hub 关闭时不应校验 nonce_ttl: %v", e)
+		}
+	}
+}
+
+func TestDefaultConfigValidates(t *testing.T) {
+	cfg := validBase(t)
+	if errs := cfg.Validate(); len(errs) != 0 {
+		t.Fatalf("默认配置应通过校验: %v", errs)
+	}
+}
+
+// 示例配置的 hub 时间参数也必须满足 nonce_ttl >= 2*clock_skew，
+// 否则照抄示例的部署启动即失败。
+func TestExampleConfigHubTimingValid(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join("..", "..", "config.example.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := validBase(t)
+	if err := json.Unmarshal(raw, &cfg); err != nil {
+		t.Fatal(err)
+	}
+	hub := cfg.Auth.Hub
+	if hub.NonceTTL.Duration < 2*hub.ClockSkew.Duration {
+		t.Fatalf("example: nonce_ttl=%s < 2*clock_skew=%s", hub.NonceTTL.Duration, hub.ClockSkew.Duration)
+	}
+}

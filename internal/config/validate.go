@@ -114,6 +114,14 @@ func (c *Config) validateAuth() []error {
 	if c.Auth.FailedAttemptLimit <= 0 {
 		add("auth.failed_attempt_limit: must be positive")
 	}
+
+	// nonce 去重表必须覆盖整个可接受的时间戳窗口：时间戳在 now±clock_skew
+	// 内都会被接受，窗口宽 2*clock_skew。nonce 若先于窗口过期，
+	// 同一条签名请求在窗口后段可以被原样重放。
+	if hub := c.Auth.Hub; hub.Enabled && hub.NonceTTL.Duration < 2*hub.ClockSkew.Duration {
+		add("auth.hub.nonce_ttl: must be >= 2 * auth.hub.clock_skew (got nonce_ttl=%s, clock_skew=%s)",
+			hub.NonceTTL.Duration, hub.ClockSkew.Duration)
+	}
 	return errs
 }
 
