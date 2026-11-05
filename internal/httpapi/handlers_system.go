@@ -3,6 +3,7 @@ package httpapi
 import (
 	"net/http"
 	"runtime"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -122,8 +123,9 @@ func (s *server) handleReady(c *gin.Context) {
 			checks["storage"] = "low_disk"
 			ready = false
 		} else {
+			// 不回显剩余字节数：/readyz 不鉴权，磁盘容量属于运维信息，
+			// 探针只需要就绪与否。具体数字登录后看 /system/stats。
 			checks["storage"] = "ok"
-			checks["free_bytes"] = space.Free
 		}
 	}
 
@@ -138,7 +140,16 @@ func (s *server) handleReady(c *gin.Context) {
 	})
 }
 
+// handleInfo 返回构建与运行信息。
+//
+// 路由挂在 OptionalAuth 下，匿名也能访问。版本、commit、Go 版本与
+// schema 版本对攻击者是现成的指纹（对照已知漏洞版本），匿名时只返回
+// 前端渲染必需的 public_url；登录后行为不变。
 func (s *server) handleInfo(c *gin.Context) {
+	if clientFrom(c) == nil {
+		c.JSON(http.StatusOK, gin.H{"public_url": s.Cfg.Server.PublicURL})
+		return
+	}
 	schema, _ := s.Store.SchemaVersion(c.Request.Context())
 	c.JSON(http.StatusOK, gin.H{
 		"version":        s.Build.Version,
@@ -167,16 +178,24 @@ func (s *server) handleStats(c *gin.Context) {
 		return
 	}
 	loggedIn := clientFrom(c) != nil
-	feeds, entries, unread := stats.Feeds, stats.Entries, stats.Unread
 	if !loggedIn {
-		feeds, entries, unread = 0, 0, 0
+		// 匿名只给首页概览需要的四个计数（web/src/views/home.ts）。
+		// blob 数量与字节、待处理媒体、磁盘容量是运维信息，
+		// 只有登录后的设置页才用得到。
+		c.JSON(http.StatusOK, gin.H{
+			"pastes":  myPastes,
+			"feeds":   0,
+			"entries": 0,
+			"unread":  0,
+		})
+		return
 	}
 
 	out := gin.H{
 		"pastes":        myPastes,
-		"feeds":         feeds,
-		"entries":       entries,
-		"unread":        unread,
+		"feeds":         stats.Feeds,
+		"entries":       stats.Entries,
+		"unread":        stats.Unread,
 		"blobs":         stats.Blobs,
 		"blob_bytes":    stats.BlobBytes,
 		"pending_media": stats.PendingMedia,
@@ -207,7 +226,22 @@ func (s *server) handleRunJob(c *gin.Context) {
 	}
 	detail, err := s.Scheduler.RunByName(c.Request.Context(), name)
 	if err != nil {
-		failWith(c, http.StatusBadRequest, "invalid_request", err.Error())
+		// 不回显 err.Error()：任务执行失败的原因可能带路径、SQL 或
+		// 外部地址。已知的两类调用方错误给固定文案，其余只进日志，
+		// 详情可在任务历史里查看。
+		//
+		// scheduler 没有导出哨兵错误，这里按 RunByName 的错误文案判别；
+		// 改动那边的措辞时要同步这里（system_test.go 有用例兜底）。
+		msg := err.Error()
+		switch {
+		case strings.HasPrefix(msg, "unknown job "):
+			failWith(c, http.StatusNotFound, "not_found", "任务不存在")
+		case strings.HasSuffix(msg, " is already running"):
+			failWith(c, http.StatusConflict, "conflict", "任务正在运行")
+		default:
+			logFrom(c).Error("manual job run failed", "job", name, "err", err)
+			failWith(c, http.StatusInternalServerError, "internal", "任务执行失败")
+		}
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"job": name, "detail": detail})
