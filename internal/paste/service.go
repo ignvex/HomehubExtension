@@ -12,6 +12,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/ignvex/HomehubExtension/internal/auth"
 	"github.com/ignvex/HomehubExtension/internal/store"
 
 	"github.com/oklog/ulid/v2"
@@ -25,7 +26,22 @@ var (
 	ErrBadExpiry   = errors.New("expiry out of range")
 	ErrForbidden   = errors.New("public pastes are disabled")
 	ErrLang        = errors.New("unsupported language")
+	// ErrBadVisibility 表示可见性不在白名单内。handler 映射为 400。
+	ErrBadVisibility = errors.New("invalid visibility")
+	// ErrPermanentNeedsAuth 包装 ErrBadExpiry，因此沿用其 400 映射。
+	// 匿名片段没有人能在事后清理（owner token 丢了就找不回），
+	// 允许永久保存等于让匿名调用方往磁盘里无限追加内容。
+	ErrPermanentNeedsAuth = fmt.Errorf("%w: permanent pastes require login", ErrBadExpiry)
 )
+
+// validVisibility 是可见性白名单。
+func validVisibility(v string) bool {
+	switch v {
+	case VisPublic, VisUnlisted, VisPrivate:
+		return true
+	}
+	return false
+}
 
 const (
 	VisPublic   = "public"
@@ -52,6 +68,12 @@ type Service struct {
 	st  store.Store
 	cfg Config
 	now func() time.Time
+
+	// createLimit 限制匿名创建速率，pwAttempts 限制口令猜测。
+	// 挂在 Service 上而不是包变量：每个实例（含测试里的多个 harness）
+	// 各自计数，互不干扰。
+	createLimit *fixedWindow
+	pwAttempts  *auth.AttemptLimiter
 }
 
 // NewService 构造片段服务。SlugLength 过小时回落到 6。
@@ -59,11 +81,14 @@ func NewService(st store.Store, cfg Config) *Service {
 	if cfg.SlugLength < 4 {
 		cfg.SlugLength = 6
 	}
-	return &Service{st: st, cfg: cfg, now: time.Now}
+	s := &Service{st: st, cfg: cfg, now: time.Now}
+	s.createLimit = newFixedWindow(AnonCreatePerMinute, time.Minute, maxRateKeys, func() time.Time { return s.now() })
+	s.pwAttempts = auth.NewAttemptLimiter(PasswordAttemptLimit, PasswordAttemptWindow)
+	return s
 }
 
 // CreateRequest 是创建片段的输入。ExpiresIn 为 nil 表示用默认值，
-// 显式传 0 表示永久。
+// 显式传 0 表示永久——仅限有登录身份（OwnerID 或 OwnerClientID 非空）的调用方。
 type CreateRequest struct {
 	Title         string
 	Body          string
@@ -114,7 +139,7 @@ func resolveOwner(req CreateRequest) (string, string, error) {
 
 // Create 生成 slug 并落库。slug 冲突时重试，5 次仍失败则报错。
 func (s *Service) Create(ctx context.Context, req CreateRequest) (*store.Paste, string, error) {
-	p, ownerToken, err := s.buildPaste(req)
+	p, ownerToken, err := s.buildPaste(ctx, req)
 	if err != nil {
 		return nil, "", err
 	}
@@ -142,7 +167,7 @@ func (s *Service) Create(ctx context.Context, req CreateRequest) (*store.Paste, 
 // 独立出来是为了让 Create 只承担"生成 slug 并处理冲突"这一件事：
 // 参数校验、默认值填充、过期时间解析与口令哈希都属于纯计算，
 // 混在一起会让主流程读不出骨架。
-func (s *Service) buildPaste(req CreateRequest) (*store.Paste, string, error) {
+func (s *Service) buildPaste(ctx context.Context, req CreateRequest) (*store.Paste, string, error) {
 	if int64(len(req.Body)) > s.cfg.MaxBodyBytes {
 		return nil, "", fmt.Errorf("%w: limit is %d bytes", ErrTooLarge, s.cfg.MaxBodyBytes)
 	}
@@ -153,6 +178,9 @@ func (s *Service) buildPaste(req CreateRequest) (*store.Paste, string, error) {
 	vis := req.Visibility
 	if vis == "" {
 		vis = VisUnlisted
+	}
+	if !validVisibility(vis) {
+		return nil, "", ErrBadVisibility
 	}
 	if vis == VisPublic && !s.cfg.AllowPublic {
 		return nil, "", ErrForbidden
@@ -168,6 +196,12 @@ func (s *Service) buildPaste(req CreateRequest) (*store.Paste, string, error) {
 		lang = "text"
 	}
 
+	// 匿名调用方不能显式要求永久：见 ErrPermanentNeedsAuth。
+	anonymous := req.OwnerID == "" && req.OwnerClientID == ""
+	if anonymous && req.ExpiresIn != nil && *req.ExpiresIn == 0 {
+		return nil, "", ErrPermanentNeedsAuth
+	}
+
 	now := s.now()
 	expiresAt, err := s.resolveExpiry(req.ExpiresIn, now)
 	if err != nil {
@@ -176,7 +210,7 @@ func (s *Service) buildPaste(req CreateRequest) (*store.Paste, string, error) {
 
 	hash := ""
 	if req.Password != "" {
-		h, err := HashPassword(req.Password)
+		h, err := HashPassword(ctx, req.Password)
 		if err != nil {
 			return nil, "", err
 		}
@@ -217,7 +251,7 @@ func (s *Service) resolveExpiry(in *time.Duration, now time.Time) (*int64, error
 		return &v, nil
 
 	case *in == 0:
-		// 显式传 0 表示永久。尊重用户意图，不再额外限制。
+		// 显式传 0 表示永久。匿名调用方已在 buildPaste 中被拦下。
 		return nil, nil
 
 	case *in < 0:
@@ -274,7 +308,15 @@ func (s *Service) Read(ctx context.Context, slug, password, ownerHash string) (*
 		return nil, store.ErrNotFound
 	}
 	if p.PasswordHash != "" {
-		if !VerifyPassword(p.PasswordHash, password) {
+		// 空口令不可能匹配，直接拒绝，不占用 argon2 名额。
+		if password == "" {
+			return nil, ErrBadPassword
+		}
+		ok, err := VerifyPassword(ctx, p.PasswordHash, password)
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
 			return nil, ErrBadPassword
 		}
 	}
@@ -318,6 +360,9 @@ type UpdateRequest struct {
 	Visibility *string
 	Password   *string
 	ExpiresIn  *time.Duration
+	// Authenticated 由 handler 注入：调用方有登录身份时为 true。
+	// 匿名调用方不能把片段改成永久，否则创建侧的限制形同虚设。
+	Authenticated bool
 }
 
 // Update 覆盖可变字段。已过期或已删除的片段返回 ErrExpired。
@@ -354,6 +399,9 @@ func (s *Service) Update(ctx context.Context, slug string, req UpdateRequest, ow
 		}
 	}
 	if req.Visibility != nil {
+		if !validVisibility(*req.Visibility) {
+			return nil, ErrBadVisibility
+		}
 		if *req.Visibility == VisPublic && !s.cfg.AllowPublic {
 			return nil, ErrForbidden
 		}
@@ -363,7 +411,7 @@ func (s *Service) Update(ctx context.Context, slug string, req UpdateRequest, ow
 		if *req.Password == "" {
 			p.PasswordHash = ""
 		} else {
-			h, err := HashPassword(*req.Password)
+			h, err := HashPassword(ctx, *req.Password)
 			if err != nil {
 				return nil, err
 			}
@@ -373,6 +421,9 @@ func (s *Service) Update(ctx context.Context, slug string, req UpdateRequest, ow
 	if req.ExpiresIn != nil {
 		switch {
 		case *req.ExpiresIn == 0:
+			if !req.Authenticated {
+				return nil, ErrPermanentNeedsAuth
+			}
 			p.ExpiresAt = nil
 		case s.cfg.MaxExpiry > 0 && *req.ExpiresIn > s.cfg.MaxExpiry:
 			return nil, fmt.Errorf("%w: max is %s", ErrBadExpiry, s.cfg.MaxExpiry)
@@ -405,7 +456,14 @@ func (s *Service) Delete(ctx context.Context, slug, ownerHash string) error {
 }
 
 // List 分页返回未删除且未过期的片段，不含正文。
+//
+// ownerHash 为空（完全匿名、没有 owner token）时直接返回空列表，不查库：
+// 存储层按字面值过滤，空字符串会匹配迁移前 owner_hash=” 的历史片段，
+// 那些片段不属于任何当前调用方。
 func (s *Service) List(ctx context.Context, ownerHash string, limit int, cursor string) ([]store.Paste, string, error) {
+	if ownerHash == "" {
+		return []store.Paste{}, "", nil
+	}
 	items, next, err := s.st.Paste().List(ctx, ownerHash, limit, cursor)
 	if err != nil {
 		return nil, "", err
@@ -451,12 +509,13 @@ func randomSlug(n int) (string, error) {
 
 // ---- 口令 ----
 
-// 参数取自 OWASP 对交互式登录的建议值。
-// 片段口令校验是低频操作，16MB / 3 轮的代价在 1C2G 上可以接受。
+// 参数取自 OWASP Password Storage Cheat Sheet 的 argon2id 最低建议：
+// m=19 MiB（19456 KiB）、t=2、p=1。部署环境是 1 vCPU、进程上限 512 MB，
+// 单次计算约 19 MiB，配合 argonSem 的并发上限 2，argon2 峰值内存不超过 ~38 MiB。
 const (
-	argonTime    = 3
-	argonMemory  = 64 * 1024
-	argonThreads = 2
+	argonTime    = 2
+	argonMemory  = 19456
+	argonThreads = 1
 	argonKeyLen  = 32
 	argonSaltLen = 16
 )
@@ -469,10 +528,11 @@ const (
 // m=4294967295 就是 4 TiB 分配——在 MemoryMax=512M 的容器里
 // 直接 OOM kill，而触发它只需要一次带口令的读请求。
 //
-// 区间取宽是为了以后调参不失效：当前 64 MiB / 3 轮落在中间。
+// 上限 64 MiB / 10 轮：旧版本用 m=65536,t=3,p=2 生成的 hash 仍然可验证，
+// 超出这个范围的参数一律视为异常。
 var (
-	argonMinMemory  uint32 = 8 * 1024    // 8 MiB
-	argonMaxMemory  uint32 = 1024 * 1024 // 1 GiB
+	argonMinMemory  uint32 = 8 * 1024  // 8 MiB
+	argonMaxMemory  uint32 = 64 * 1024 // 64 MiB
 	argonMaxTime    uint32 = 10
 	argonMaxThreads uint8  = 16
 )
@@ -482,12 +542,39 @@ const (
 	argonMaxKeyLen  = 64
 )
 
+// argonSem 限制同时进行的 argon2 计算数。
+//
+// 每次计算按 m 分配内存且吃满 CPU；不设上限时，并发的带口令请求
+// 可以把 512 MB 的进程撞上 OOM。容量 2 意味着最坏情况两份
+// argonMaxMemory（128 MiB）。
+var argonSem = make(chan struct{}, 2)
+
+// acquireArgon 获取一个计算名额，等待期间尊重 ctx 取消。
+func acquireArgon(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	select {
+	case argonSem <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func releaseArgon() { <-argonSem }
+
 // HashPassword 产出 PHC 格式字符串，自描述参数，将来调参不会让旧口令失效。
-func HashPassword(pw string) (string, error) {
+// 等待计算名额时 ctx 被取消则返回 ctx.Err()。
+func HashPassword(ctx context.Context, pw string) (string, error) {
 	salt := make([]byte, argonSaltLen)
 	if _, err := rand.Read(salt); err != nil {
 		return "", err
 	}
+	if err := acquireArgon(ctx); err != nil {
+		return "", err
+	}
+	defer releaseArgon()
 	key := argon2.IDKey([]byte(pw), salt, argonTime, argonMemory, argonThreads, argonKeyLen)
 	return fmt.Sprintf("$argon2id$v=%d$m=%d,t=%d,p=%d$%s$%s",
 		argon2.Version, argonMemory, argonTime, argonThreads,
@@ -495,20 +582,24 @@ func HashPassword(pw string) (string, error) {
 		base64.RawStdEncoding.EncodeToString(key)), nil
 }
 
-// VerifyPassword 用常量时间比较，避免通过响应时间猜测口令。
-func VerifyPassword(encoded, pw string) bool {
+// VerifyPassword 按 hash 里编码的参数重新计算并用常量时间比较，
+// 避免通过响应时间猜测口令。
+//
+// 返回 (false, nil) 表示口令不对或 hash 不合法；error 只在等待计算名额时
+// ctx 被取消才出现——调用方不应把它当成一次口令失败来计数。
+func VerifyPassword(ctx context.Context, encoded, pw string) (bool, error) {
 	parts := strings.Split(encoded, "$")
 	if len(parts) != 6 || parts[1] != "argon2id" {
-		return false
+		return false, nil
 	}
 	var version int
 	if _, err := fmt.Sscanf(parts[2], "v=%d", &version); err != nil {
-		return false
+		return false, nil
 	}
 	var memory, timeCost uint32
 	var threads uint8
 	if _, err := fmt.Sscanf(parts[3], "m=%d,t=%d,p=%d", &memory, &timeCost, &threads); err != nil {
-		return false
+		return false, nil
 	}
 	// 参数必须落在合理区间。argon2.IDKey 按 m 分配内存（KiB），
 	// 不校验就是一个可以从 hash 字符串触发的 OOM：
@@ -517,20 +608,24 @@ func VerifyPassword(encoded, pw string) bool {
 	if memory < argonMinMemory || memory > argonMaxMemory ||
 		timeCost == 0 || timeCost > argonMaxTime ||
 		threads == 0 || threads > argonMaxThreads {
-		return false
+		return false, nil
 	}
 	salt, err := base64.RawStdEncoding.DecodeString(parts[4])
 	if err != nil || len(salt) == 0 || len(salt) > argonMaxSaltLen {
-		return false
+		return false, nil
 	}
 	want, err := base64.RawStdEncoding.DecodeString(parts[5])
 	if err != nil || len(want) < 16 || len(want) > argonMaxKeyLen {
-		return false
+		return false, nil
 	}
+	if err := acquireArgon(ctx); err != nil {
+		return false, err
+	}
+	defer releaseArgon()
 	// len(want) 已在上面限定在 [16, argonMaxKeyLen]，
 	// 转 uint32 不会截断。
 	got := argon2.IDKey([]byte(pw), salt, timeCost, memory, threads, uint32(len(want))) // #nosec G115 -- 上方已限定长度
-	return subtle.ConstantTimeCompare(got, want) == 1
+	return subtle.ConstantTimeCompare(got, want) == 1, nil
 }
 
 func truncate(s string, n int) string {

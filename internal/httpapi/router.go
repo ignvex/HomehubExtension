@@ -223,6 +223,7 @@ func (s *server) registerPaste(r *gin.Engine) {
 
 	// 公开分享页不鉴权：分享链接必须能被 curl 与爬虫读取。
 	r.GET("/p/:slug", OptionalAuth(s.Auth), s.handlePublicPaste)
+	r.POST("/p/:slug", OptionalAuth(s.Auth), s.handlePublicPaste)
 }
 
 func (s *server) registerRSS(r *gin.Engine) {

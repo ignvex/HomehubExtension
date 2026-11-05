@@ -101,12 +101,14 @@ func (s pasteStore) List(
 	// 空游标表示从头开始：不加 id 条件，而不是与空字符串比较（那会返回空集）。
 	query := `SELECT ` + pasteCols + ` FROM paste WHERE deleted_at IS NULL`
 	args := []any{}
-	// 始终按归属过滤，空字符串也一样。
+	// 始终按归属精确过滤，空字符串也一样。
 	//
-	// 早先的写法是「ownerHash 为空则不过滤」，本意是留给管理员看全部。
-	// 但匿名调用方拿到的正是空字符串，结果匿名列表会返回所有人的片段。
-	// 归属过滤必须 fail-closed：空字符串匹配 owner_hash='' 的历史数据，
-	// 而不是匹配一切。
+	// 早先的写法是「ownerHash 为空则不过滤」，结果匿名列表会返回所有人的片段。
+	// 现在空字符串按字面值匹配 owner_hash=''，即迁移前没有归属的历史片段——
+	// 这些片段不属于任何当前调用方，所以这里**不是** fail-closed 的终点：
+	// 面向请求的调用方（paste.Service.List）必须在 ownerHash 为空时
+	// 自行返回空集，不能把空值传进来。存储层保留字面匹配只是为了
+	// 运维/测试能按值查询。
 	query += ` AND owner_hash = ?`
 	args = append(args, ownerHash)
 	if cursor != "" {
@@ -176,9 +178,14 @@ func (s pasteStore) ClaimBurn(ctx context.Context, slug string, nowSec int64) (b
 
 // CountByOwner 统计某归属下未删除的片段数。
 //
-// 与 List 用同一套过滤条件：工具台的角标必须和列表里的条数一致，
+// 与 paste.Service.List 口径一致：工具台的角标必须和列表里的条数一致，
 // 否则会出现「首页说 2 条、列表是空的」这种自相矛盾的界面。
+// ownerHash 为空（完全匿名）时直接返回 0，不查库：Service.List 对空归属
+// 返回空列表，而 handler 是直接调用这里的，没有 service 层兜底。
 func (s pasteStore) CountByOwner(ctx context.Context, ownerHash string) (int64, error) {
+	if ownerHash == "" {
+		return 0, nil
+	}
 	var n int64
 	err := s.d.ro.QueryRowContext(ctx,
 		`SELECT COUNT(*) FROM paste WHERE deleted_at IS NULL AND owner_hash = ?`,

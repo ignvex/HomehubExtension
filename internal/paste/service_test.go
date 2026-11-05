@@ -90,7 +90,8 @@ func TestExpiryBeyondMax(t *testing.T) {
 func TestZeroExpiryMeansPermanent(t *testing.T) {
 	s := newService(t)
 	zero := time.Duration(0)
-	p, _, err := s.Create(context.Background(), CreateRequest{Body: "x", ExpiresIn: &zero})
+	// 永久片段需要登录身份。
+	p, _, err := s.Create(context.Background(), CreateRequest{Body: "x", ExpiresIn: &zero, OwnerClientID: "device-1"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -313,21 +314,21 @@ func TestListOmitsBody(t *testing.T) {
 }
 
 func TestPasswordHashRoundTrip(t *testing.T) {
-	hash, err := HashPassword("correct horse battery staple")
+	hash, err := HashPassword(context.Background(), "correct horse battery staple")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !strings.HasPrefix(hash, "$argon2id$") {
 		t.Errorf("unexpected hash format: %s", hash)
 	}
-	if !VerifyPassword(hash, "correct horse battery staple") {
+	if ok, _ := VerifyPassword(context.Background(), hash, "correct horse battery staple"); !ok {
 		t.Error("correct password rejected")
 	}
-	if VerifyPassword(hash, "wrong") {
+	if ok, _ := VerifyPassword(context.Background(), hash, "wrong"); ok {
 		t.Error("wrong password accepted")
 	}
 	// 同一口令两次哈希必须不同（盐随机）。
-	hash2, _ := HashPassword("correct horse battery staple")
+	hash2, _ := HashPassword(context.Background(), "correct horse battery staple")
 	if hash == hash2 {
 		t.Error("salt does not appear to be random")
 	}
@@ -409,7 +410,7 @@ func TestVerifyPasswordRejectsHostileParams(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			// 只要返回 false 就算通过：关键是不能分配 4 TiB、
 			// 不能跑几十亿轮、不能 panic。
-			if VerifyPassword(tc.hash, "anything") {
+			if ok, _ := VerifyPassword(context.Background(), tc.hash, "anything"); ok {
 				t.Error("恶意参数应当验证失败")
 			}
 		})
@@ -418,11 +419,11 @@ func TestVerifyPasswordRejectsHostileParams(t *testing.T) {
 
 // 正常参数必须仍然能通过：加范围校验不能误伤合法 hash。
 func TestVerifyPasswordAcceptsCurrentParams(t *testing.T) {
-	hash, err := HashPassword("still works")
+	hash, err := HashPassword(context.Background(), "still works")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !VerifyPassword(hash, "still works") {
+	if ok, _ := VerifyPassword(context.Background(), hash, "still works"); !ok {
 		t.Error("当前参数生成的 hash 被误判为非法")
 	}
 }
