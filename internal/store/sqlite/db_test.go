@@ -580,8 +580,8 @@ func TestShareOwnerScopeRewritesExistingHashes(t *testing.T) {
 func TestPurgeUsesExpressionIndex(t *testing.T) {
 	db := openTest(t)
 	ctx := context.Background()
-	for _, keep := range []bool{true, false} {
-		rows, err := db.ro.QueryContext(ctx, `EXPLAIN QUERY PLAN `+purgeBatch(keep), int64(0))
+	for keep, batch := range map[bool]string{true: purgeKeepStarredBatch, false: purgeBatch} {
+		rows, err := db.ro.QueryContext(ctx, `EXPLAIN QUERY PLAN `+batch, int64(0))
 		if err != nil {
 			t.Fatal(err)
 		}

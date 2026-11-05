@@ -215,45 +215,57 @@ func (s entryStore) UnreadCount(ctx context.Context, feedID int64) (int64, error
 	return n, err
 }
 
-// purgeBatchSQL 选出一批超期条目的 id。
+// purgeBatch 与 purgeKeepStarredBatch 选出一批超期条目的 id。
 //
 // COALESCE(published_at, fetched_at) 必须与 0006 迁移的 idx_entry_age
 // 定义逐字一致，SQLite 才会用表达式索引；ORDER BY 同一表达式让每批
 // 沿索引从最旧的开始取，且同一事务里三次子查询选中的是同一批 id。
-// %s 只会是 purgeStarredCond 或空串，不含任何外部输入。
-const purgeBatchSQL = `SELECT id FROM entry
-					 WHERE COALESCE(published_at, fetched_at) < ? %s
-					 ORDER BY COALESCE(published_at, fetched_at)
-					 LIMIT 500`
+//
+// 两种变体都写成完整的常量而不是运行时拼接：语句里没有任何可变片段，
+// 静态检查（G202）也就没有需要人工担保的地方。
+const (
+	purgeBatch = `SELECT id FROM entry
+	 WHERE COALESCE(published_at, fetched_at) < ?
+	 ORDER BY COALESCE(published_at, fetched_at) LIMIT 500`
+	purgeKeepStarredBatch = `SELECT id FROM entry
+	 WHERE COALESCE(published_at, fetched_at) < ? AND starred_at IS NULL
+	 ORDER BY COALESCE(published_at, fetched_at) LIMIT 500`
+)
 
-const purgeStarredCond = `AND starred_at IS NULL`
+// purgeStmts 是一轮分批删除的三条语句：先删关联，让 AFTER DELETE
+// 触发器把 ref_count 减回去，最后删条目本身。
+type purgeStmts struct{ links, media, entries string }
 
-func purgeBatch(keepStarred bool) string {
-	cond := ""
-	if keepStarred {
-		cond = purgeStarredCond
+var (
+	purgeAll = purgeStmts{
+		links:   `DELETE FROM entry_blob WHERE entry_id IN (` + purgeBatch + `)`,
+		media:   `DELETE FROM media_fetch WHERE entry_id IN (` + purgeBatch + `)`,
+		entries: `DELETE FROM entry WHERE id IN (` + purgeBatch + `)`,
 	}
-	return fmt.Sprintf(purgeBatchSQL, cond)
-}
+	purgeKeepStarred = purgeStmts{
+		links:   `DELETE FROM entry_blob WHERE entry_id IN (` + purgeKeepStarredBatch + `)`,
+		media:   `DELETE FROM media_fetch WHERE entry_id IN (` + purgeKeepStarredBatch + `)`,
+		entries: `DELETE FROM entry WHERE id IN (` + purgeKeepStarredBatch + `)`,
+	}
+)
 
 func (s entryStore) Purge(ctx context.Context, before int64, keepStarred bool) (int64, error) {
 	var total int64
-	batch := purgeBatch(keepStarred)
+	stmts := purgeAll
+	if keepStarred {
+		stmts = purgeKeepStarred
+	}
 	// 分批删除：一次删几万行会长时间持有写锁，1C2G 上会把接口卡住。
 	for {
 		var deleted int64
 		err := s.d.withTx(ctx, func(tx *sql.Tx) error {
-			// 先删关联，让 AFTER DELETE 触发器把 ref_count 减回去。
-			if _, err := tx.ExecContext(ctx,
-				`DELETE FROM entry_blob WHERE entry_id IN (`+batch+`)`, before); err != nil {
+			if _, err := tx.ExecContext(ctx, stmts.links, before); err != nil {
 				return err
 			}
-			if _, err := tx.ExecContext(ctx,
-				`DELETE FROM media_fetch WHERE entry_id IN (`+batch+`)`, before); err != nil {
+			if _, err := tx.ExecContext(ctx, stmts.media, before); err != nil {
 				return err
 			}
-			res, err := tx.ExecContext(ctx,
-				`DELETE FROM entry WHERE id IN (`+batch+`)`, before)
+			res, err := tx.ExecContext(ctx, stmts.entries, before)
 			if err != nil {
 				return err
 			}

@@ -184,7 +184,7 @@ func (s *server) reviveFeed(ctx context.Context, saved *store.Feed) {
 // 看不到内容。但也不能完全脱离进程生命周期——关停时它必须被取消并
 // 等它返回，否则会在数据库关闭之后继续写库。所以 goroutine 交给
 // 请求 context 里携带的 Background（由 app 经 http.Server.BaseContext
-// 注入）管理；没有注入时（测试）退回独立 context。
+// 注入）管理；没有注入时（测试）退回脱离取消的请求 context。
 func (s *server) kickInitialFetch(reqCtx context.Context, feedID int64) {
 	run := func(ctx context.Context) {
 		ctx, cancel := context.WithTimeout(ctx, 5*time.Minute)
@@ -199,7 +199,8 @@ func (s *server) kickInitialFetch(reqCtx context.Context, feedID int64) {
 		}
 		return
 	}
-	go run(context.Background())
+	// 没有注入 Background（测试）：脱离请求取消，但保留请求上的值。
+	go run(context.WithoutCancel(reqCtx))
 }
 
 // Background 跟踪请求触发、但比请求活得更久的后台任务。
