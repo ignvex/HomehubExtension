@@ -60,6 +60,9 @@ function pasteRow(
     remove.replaceChildren(icon("trash"));
     remove.setAttribute("aria-label", "删除片段");
     if (timer !== null) {
+      // 第二次点击走到这里时定时器还在跑：必须真的 clear，
+      // 否则它已从 timers 集合移除，卸载时也清不掉。
+      window.clearTimeout(timer);
       timers.delete(timer);
       timer = null;
     }

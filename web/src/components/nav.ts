@@ -74,8 +74,16 @@ export class Nav {
   setUnread(count: number): void {
     const visible = count > 0;
     this.badge.hidden = !visible;
-    this.badge.textContent = visible ? (count > 99 ? "99+" : String(count)) : "";
-    this.badge.setAttribute("aria-label", visible ? `${count} 条未读` : "");
+    // span 不是可交互元素，aria-label 在它上面不可靠（多数读屏忽略）。
+    // 视觉上只显示数字，读屏读隐藏的完整说明。
+    if (visible) {
+      this.badge.replaceChildren(
+        h("span", { attrs: { "aria-hidden": "true" } }, count > 99 ? "99+" : String(count)),
+        h("span", { class: "visually-hidden" }, `${count} 条未读`),
+      );
+    } else {
+      this.badge.replaceChildren();
+    }
   }
 
   destroy(): void {

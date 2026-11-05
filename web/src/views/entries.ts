@@ -9,6 +9,7 @@ import {
   formatDateTime,
   formatRelative,
   nowSeconds,
+  parseTime,
 } from "../lib/format";
 import { describeError } from "../lib/strings";
 import type { ViewContext, ViewFactory } from "../router";
@@ -61,6 +62,7 @@ function entryRow(
   const title = entry.title.trim() === "" ? "（无标题）" : entry.title;
   const read = entry.read_at !== null;
   const starred = entry.starred_at !== null;
+  const when = entry.published_at ?? entry.fetched_at;
 
   const starButton = h(
     "button",
@@ -95,7 +97,8 @@ function entryRow(
         { class: "entry-meta" },
         h("span", {}, feedName(feeds, entry.feed_id)),
         h("span", { attrs: { "aria-hidden": "true" } }, "·"),
-        h("time", { attrs: { datetime: entry.published_at ?? entry.fetched_at, title: formatDateTime(entry.published_at ?? entry.fetched_at) } }, formatRelative(entry.published_at ?? entry.fetched_at)),
+        // datetime 属性要求 ISO 8601；直接塞 Unix 秒是无效值。换算走 parseTime（唯一的 ×1000 处）。
+        h("time", { attrs: { datetime: parseTime(when)?.toISOString(), title: formatDateTime(when) } }, formatRelative(when)),
         entry.author.trim() !== "" ? h("span", { class: "entry-author" }, `· ${entry.author}`) : null,
       ),
       entry.summary.trim() !== ""
@@ -191,6 +194,9 @@ export const entriesView: ViewFactory = (ctx: ViewContext) => {
   let cursor: string | null = null;
   let count = 0;
   let loading = false;
+  // 每次重置加载自增。搜索词变化或 SSE 触发的重置不能因为上一轮还在途就被丢掉，
+  // 否则列表停在旧搜索词的结果上；改为让新一轮接管、旧一轮回来时丢弃。
+  let generation = 0;
 
   const fillFeedSelect = (): void => {
     const options: HTMLElement[] = [
@@ -336,7 +342,10 @@ export const entriesView: ViewFactory = (ctx: ViewContext) => {
   };
 
   const load = async (reset: boolean): Promise<void> => {
-    if (loading) return;
+    if (loading && !reset) return;
+    if (reset) generation += 1;
+    const current = generation;
+    const isStale = (): boolean => ctx.signal.aborted || current !== generation;
     loading = true;
     refresh.disabled = true;
     refresh.classList.add("is-busy");
@@ -363,7 +372,7 @@ export const entriesView: ViewFactory = (ctx: ViewContext) => {
 
     try {
       const [feedResponse, entryResponse] = await Promise.all([feedsPromise, entriesPromise]);
-      if (ctx.signal.aborted) return;
+      if (isStale()) return;
 
       if (feedResponse) {
         feeds.clear();
@@ -387,7 +396,7 @@ export const entriesView: ViewFactory = (ctx: ViewContext) => {
       if (count === 0) showEmpty();
       updateFooter();
     } catch (error) {
-      if (ctx.signal.aborted) return;
+      if (isStale()) return;
       if (reset) {
         list.replaceChildren(
           errorState(describeError(error), () => {
@@ -398,9 +407,12 @@ export const entriesView: ViewFactory = (ctx: ViewContext) => {
         ctx.toast.show(describeError(error), "error");
       }
     } finally {
-      loading = false;
-      refresh.disabled = false;
-      refresh.classList.remove("is-busy");
+      // 过期的一轮不能清掉接管它的那一轮的 loading 状态。
+      if (current === generation) {
+        loading = false;
+        refresh.disabled = false;
+        refresh.classList.remove("is-busy");
+      }
     }
   };
 

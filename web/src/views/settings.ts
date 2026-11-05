@@ -272,9 +272,11 @@ export const settingsView: ViewFactory = (ctx) => {
     void forgetDevice()
       .then(() => {
         ctx.toast.show("已清除本机设备", "success");
-        ctx.router.navigate("/pair", { replace: true });
+        // 用户已离开设置页时不再强行跳回 /pair。
+        if (!ctx.signal.aborted) ctx.router.navigate("/pair", { replace: true });
       })
       .catch((error: unknown) => {
+        if (ctx.signal.aborted) return;
         ctx.toast.show(describeError(error), "error");
         forget.disabled = false;
       });

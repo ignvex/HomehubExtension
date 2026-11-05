@@ -13,11 +13,20 @@ import { icon } from "../components/icons";
 import { h } from "../lib/dom";
 import { suggestDeviceName } from "../lib/device";
 import { APP_NAME, describeError } from "../lib/strings";
+import { isSameOriginPath } from "../lib/url";
 import type { ViewFactory } from "../router";
 
 function safeReturnTo(value: string | null): string {
-  if (!value || !value.startsWith("/") || value.startsWith("//")) return "/";
-  return value;
+  // 反斜杠会被浏览器当成 /，/\evil.example 解析后就是跨源地址；直接拒绝。
+  if (!value || !isSameOriginPath(value)) return "/";
+  let url: URL;
+  try {
+    url = new URL(value, window.location.origin);
+  } catch {
+    return "/";
+  }
+  if (url.origin !== window.location.origin) return "/";
+  return `${url.pathname}${url.search}${url.hash}`;
 }
 
 /**
@@ -66,8 +75,27 @@ function brand(): HTMLElement {
 
 export const pairView: ViewFactory = (ctx) => {
   const returnTo = safeReturnTo(ctx.query.get("returnTo"));
-  const panelHost = h("div", { class: "auth-panel", attrs: { "aria-live": "polite" } });
+  // 不在整张卡片上挂 aria-live：卡片整体替换时读屏会把全部内容念一遍。
+  // 改为切换面板后把焦点移到新卡片标题，读屏从标题开始读。
+  const panelHost = h("div", { class: "auth-panel" });
   const element = h("div", { class: "auth-page" }, brand(), panelHost);
+
+  // 首次渲染不抢焦点（路由已把焦点放在 main 上）；之后每次切换面板才移动焦点。
+  let firstPanel = true;
+  const cardTitle = (text: string): HTMLElement =>
+    h("h2", { class: "auth-card-title", attrs: { tabindex: "-1" } }, text);
+  const showCard = (card: HTMLElement, title: HTMLElement): void => {
+    panelHost.replaceChildren(card);
+    if (firstPanel) {
+      firstPanel = false;
+      return;
+    }
+    if (!ctx.signal.aborted) title.focus();
+  };
+
+  // 视图卸载时由 renderSignedIn 注册的清理（目前只有"确认清除"倒计时）。
+  let disposePanel: (() => void) | null = null;
+  ctx.signal.addEventListener("abort", () => disposePanel?.(), { once: true });
 
   const go = (): void => {
     ctx.router.navigate(returnTo, { replace: true });
@@ -99,8 +127,7 @@ export const pairView: ViewFactory = (ctx) => {
         "dl",
         { class: "detail-list detail-list--compact" },
         h("div", {}, h("dt", {}, "设备名称"), h("dd", {}, client?.name ?? "—")),
-        h("dt", {}, "设备 ID"),
-        h("dd", { class: "mono break-all" }, client?.id ?? "—"),
+        h("div", {}, h("dt", {}, "设备 ID"), h("dd", { class: "mono break-all" }, client?.id ?? "—")),
       ),
       keyExists
         ? null
@@ -140,7 +167,10 @@ export const pairView: ViewFactory = (ctx) => {
             ctx.toast.show("已重新登录", "success");
             go();
           })
-          .catch((error: unknown) => ctx.toast.show(describeError(error), "error"))
+          .catch((error: unknown) => {
+            if (ctx.signal.aborted) return;
+            ctx.toast.show(describeError(error), "error");
+          })
           .finally(() => {
             relogin.disabled = false;
           });
@@ -156,34 +186,43 @@ export const pairView: ViewFactory = (ctx) => {
     );
     let armed = false;
     let timer: number | null = null;
+    const stopTimer = (): void => {
+      if (timer !== null) window.clearTimeout(timer);
+      timer = null;
+    };
+    const disarm = (): void => {
+      stopTimer();
+      armed = false;
+      forget.replaceChildren(icon("trash"), "清除本机设备");
+    };
+    disposePanel = stopTimer;
     forget.addEventListener("click", () => {
       if (!armed) {
         armed = true;
-        forget.textContent = "确认清除本机密钥";
-        timer = window.setTimeout(() => {
-          armed = false;
-          forget.replaceChildren(icon("trash"), "清除本机设备");
-        }, 4000);
+        forget.replaceChildren(icon("trash"), "确认清除本机密钥");
+        timer = window.setTimeout(disarm, 4000);
         return;
       }
-      if (timer !== null) window.clearTimeout(timer);
+      stopTimer();
       forget.disabled = true;
       void forgetDevice()
         .then(() => {
+          if (ctx.signal.aborted) return;
           ctx.toast.show("已清除本机密钥", "success");
           renderEnroll();
         })
         .catch((error: unknown) => {
+          if (ctx.signal.aborted) return;
           ctx.toast.show(describeError(error), "error");
           forget.disabled = false;
+          disarm();
         });
     });
     actions.append(forget);
 
     body.append(actions, notice("设备在服务端仍然有效；清除后需要用新的配对码重新登记密钥。"));
-    panelHost.replaceChildren(
-      h("div", { class: "auth-card" }, h("h2", { class: "auth-card-title" }, "已配对"), body),
-    );
+    const title = cardTitle("已配对");
+    showCard(h("div", { class: "auth-card" }, title, body), title);
   };
 
   const renderLogin = (): void => {
@@ -222,18 +261,22 @@ export const pairView: ViewFactory = (ctx) => {
     forget.addEventListener("click", () => {
       forget.disabled = true;
       void forgetDevice()
-        .then(() => renderEnroll())
+        .then(() => {
+          if (!ctx.signal.aborted) renderEnroll();
+        })
         .catch((reason: unknown) => {
+          if (ctx.signal.aborted) return;
           setError(error, describeError(reason));
           forget.disabled = false;
         });
     });
 
-    panelHost.replaceChildren(
+    const title = cardTitle("本设备已登记");
+    showCard(
       h(
         "div",
         { class: "auth-card" },
-        h("h2", { class: "auth-card-title" }, "本设备已登记"),
+        title,
         h(
           "p",
           { class: "auth-lead" },
@@ -243,6 +286,7 @@ export const pairView: ViewFactory = (ctx) => {
         h("div", { class: "form-actions form-actions--stack" }, login, forget),
         notice("私钥保存在 IndexedDB 中，JavaScript 无法读取其字节。"),
       ),
+      title,
     );
   };
 
@@ -393,11 +437,12 @@ export const pairView: ViewFactory = (ctx) => {
       })();
     });
 
-    panelHost.replaceChildren(
+    const title = cardTitle("登记这台设备");
+    showCard(
       h(
         "div",
         { class: "auth-card" },
-        h("h2", { class: "auth-card-title" }, "登记这台设备"),
+        title,
         h(
           "p",
           { class: "auth-lead" },
@@ -406,6 +451,7 @@ export const pairView: ViewFactory = (ctx) => {
         form,
         notice("本机密钥以不可导出 CryptoKey 形式存放在 IndexedDB；清除站点数据会一并删除。"),
       ),
+      title,
     );
   };
 
