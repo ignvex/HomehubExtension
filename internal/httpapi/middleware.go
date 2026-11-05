@@ -317,19 +317,44 @@ func RequireHubSignature(verifier *auth.HubVerifier, maxBody int64) gin.HandlerF
 	}
 }
 
-// RequireAttemptLimit 对认证端点按来源限制失败次数。
+// RequireAttemptLimit 对认证端点按来源限制失败次数，成功时不清空计数。
 //
-// 计数发生在请求处理完之后：只有 401/403 才算一次失败。
-// 成功会清空计数（否则正常用户会被自己的历史失误误伤），
-// 5xx 不计数（那是服务端的问题，不该惩罚客户端）。
+// 用于只发放材料、并不真正校验凭证的端点（如 /auth/challenge）：
+// 对已知 client_id 索取 nonce 一定成功，若成功就清零，攻击者可以
+// 每次失败后插一个 challenge 把计数刷回去，限流形同虚设。
+//
+// 计数方式见 attemptLimit：进入前原子预占一次，401/403 保留，
+// 其它状态退还。
 func RequireAttemptLimit(limiter *auth.AttemptLimiter, log *slog.Logger) gin.HandlerFunc {
+	return attemptLimit(limiter, log, false)
+}
+
+// RequireAttemptLimitResetting 与 RequireAttemptLimit 相同，但 2xx 会清空
+// 该来源的计数。只用于凭证真正被验证过的端点（enroll/token/key）：
+// 否则正常用户会被自己之前的失误误伤。
+func RequireAttemptLimitResetting(limiter *auth.AttemptLimiter, log *slog.Logger) gin.HandlerFunc {
+	return attemptLimit(limiter, log, true)
+}
+
+// attemptLimit 是两种限流中间件的共同实现。
+//
+// 进入处理器之前用 Reserve 原子地预占一次失败配额：若先 Allow 再在
+// 处理完成后 Fail，同一来源的并发请求能同时通过检查，实际放行的
+// 失败次数可以远超上限。预占之后：
+//   - 401/403：算一次失败，保留预占
+//   - 2xx 且 reset=true：凭证已验证，清空计数
+//   - 其它（含 5xx、非鉴权 4xx）：退还预占，不惩罚客户端
+func attemptLimit(limiter *auth.AttemptLimiter, log *slog.Logger, reset bool) gin.HandlerFunc {
+	if log == nil {
+		log = slog.Default()
+	}
 	return func(c *gin.Context) {
 		if limiter == nil {
 			c.Next()
 			return
 		}
 		key := c.ClientIP()
-		if !limiter.Allow(key) {
+		if !limiter.Reserve(key) {
 			_, resetIn := limiter.Remaining(key)
 			seconds := int(resetIn.Seconds())
 			if seconds < 1 {
@@ -345,15 +370,19 @@ func RequireAttemptLimit(limiter *auth.AttemptLimiter, log *slog.Logger) gin.Han
 
 		c.Next()
 
-		switch c.Writer.Status() {
-		case http.StatusUnauthorized, http.StatusForbidden:
-			if justBlocked := limiter.Fail(key); justBlocked {
-				// 只在刚进入限流状态时记一条：持续的暴力尝试不该刷满日志。
+		switch status := c.Writer.Status(); {
+		case status == http.StatusUnauthorized || status == http.StatusForbidden:
+			// 保留预占。只在刚好用完配额时记一条：持续的暴力尝试
+			// 会被 Reserve 直接拦成 429，不会走到这里刷日志。
+			// 并发边界上可能有少数几条重复，数量受在途请求数限制。
+			if remaining, _ := limiter.Remaining(key); remaining == 0 {
 				log.Warn("auth attempts blocked",
 					"ip", key, "path", c.Request.URL.Path)
 			}
-		case http.StatusOK, http.StatusCreated, http.StatusNoContent:
+		case reset && status >= 200 && status < 300:
 			limiter.Reset(key)
+		default:
+			limiter.Release(key)
 		}
 	}
 }

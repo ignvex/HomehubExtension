@@ -12,8 +12,9 @@ import (
 // 约 2.5e17 种），但 challenge 端点允许对已知 client_id 反复索取 nonce，
 // 而 token 端点接受签名——两者都值得设一道闸。
 //
-// 计数只在失败时增加。成功不消耗配额，5xx 也不惩罚客户端
-// （那是服务端自己的问题）。
+// 计数只在失败时保留。成功不消耗配额，5xx 也不惩罚客户端
+// （那是服务端自己的问题）。HTTP 中间件用 Reserve/Release 原子预占，
+// Allow/Fail 保留给不存在并发问题的调用方。
 type AttemptLimiter struct {
 	mu        sync.Mutex
 	attempts  map[string]*attemptRecord
@@ -89,6 +90,61 @@ func (l *AttemptLimiter) Fail(key string) bool {
 
 	rec.count++
 	return rec.count == l.limit
+}
+
+// Reserve 原子地检查并预占一次失败配额。
+//
+// 与 Allow + Fail 的"先查后计"不同：Allow 与 Fail 之间存在窗口，
+// 同一来源的并发请求可以全部通过 Allow，再各自计一次失败，
+// 实际放行的失败次数会远超 limit。Reserve 在同一把锁里完成检查与计数，
+// 任意时刻已预占（含进行中）的次数都不会超过 limit。
+//
+// 返回 false 表示配额已满，调用方应直接返回 429。返回 true 后，
+// 若请求最终不算失败，调用方必须调用 Release 退还；算失败则什么都不做，
+// 计数就此保留。
+func (l *AttemptLimiter) Reserve(key string) bool {
+	if key == "" {
+		return true
+	}
+	now := time.Now()
+
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	l.sweepLocked(now)
+
+	rec, ok := l.attempts[key]
+	if !ok || now.Sub(rec.first) > l.window {
+		l.attempts[key] = &attemptRecord{count: 1, first: now}
+		return true
+	}
+	if rec.count >= l.limit {
+		return false
+	}
+	rec.count++
+	return true
+}
+
+// Release 退还一次 Reserve 预占的配额，用于请求最终没有失败的情况
+// （成功、4xx 非鉴权错误、5xx）。计数降到 0 时删除条目。
+//
+// 若预占之后窗口已过期、条目已被清掉或被 Reset，这里什么都不做：
+// 不会把计数减成负数，也不会凭空制造新条目。
+func (l *AttemptLimiter) Release(key string) {
+	if key == "" {
+		return
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	rec, ok := l.attempts[key]
+	if !ok {
+		return
+	}
+	rec.count--
+	if rec.count <= 0 {
+		delete(l.attempts, key)
+	}
 }
 
 // Reset 在认证成功后清空该来源的计数。

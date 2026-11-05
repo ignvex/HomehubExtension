@@ -145,14 +145,19 @@ func (s *server) registerAuth(r *gin.Engine) {
 	// 三个接受未认证输入的端点都过限流。
 	// me/logout/refresh 不需要：它们要么已认证，要么依赖 cookie。
 	g := r.Group("/api/v1/auth")
+	//
+	// challenge 只发 nonce、不验证凭证，它的成功不能清空失败计数：
+	// 否则每次失败后插一个 challenge 就能把计数刷回零。
+	// enroll/token/key 的 2xx 代表凭证确实通过了校验，才允许清零。
 	limited := RequireAttemptLimit(s.Limiter, s.Log)
-	g.POST("/enroll", limited, s.handleEnroll)
+	verified := RequireAttemptLimitResetting(s.Limiter, s.Log)
+	g.POST("/enroll", verified, s.handleEnroll)
 	g.POST("/challenge", limited, s.handleChallenge)
-	g.POST("/token", limited, s.handleToken)
+	g.POST("/token", verified, s.handleToken)
 	// 密钥兑换也要限流：它是一把长期共享凭证，一旦泄露就是可以
 	// 反复尝试的口令。99 bit 熵下爆破不现实，但限流能让"某个 IP
 	// 在狂试"变成一个看得见的信号，而不是静默的噪音。
-	g.POST("/key", limited, s.handleKeyLogin)
+	g.POST("/key", verified, s.handleKeyLogin)
 	g.POST("/refresh", s.handleRefresh)
 	g.POST("/logout", s.handleLogout)
 	g.GET("/server-key", s.handleServerKey)

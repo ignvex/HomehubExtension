@@ -1,6 +1,8 @@
 package auth
 
 import (
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -104,5 +106,66 @@ func TestAttemptLimiterEmptyKeyAllowed(t *testing.T) {
 	l.Fail("")
 	if !l.Allow("") {
 		t.Error("空 key 不该被计数")
+	}
+}
+
+func TestAttemptLimiterReserveRelease(t *testing.T) {
+	l := NewAttemptLimiter(2, time.Minute)
+	const k = "9.9.9.9"
+
+	if !l.Reserve(k) || !l.Reserve(k) {
+		t.Fatal("前两次预占应成功")
+	}
+	if l.Reserve(k) {
+		t.Fatal("配额用完后预占应失败")
+	}
+	// 退还一次后又能预占一次。
+	l.Release(k)
+	if !l.Reserve(k) {
+		t.Fatal("退还后应能再次预占")
+	}
+	l.Release(k)
+	l.Release(k)
+	if l.Size() != 0 {
+		t.Errorf("计数归零后应删除条目，size=%d", l.Size())
+	}
+	// 多余的 Release 不能把计数减成负数、也不能制造条目。
+	l.Release(k)
+	if l.Size() != 0 {
+		t.Errorf("多余的 Release 不应制造条目，size=%d", l.Size())
+	}
+	if rem, _ := l.Remaining(k); rem != 2 {
+		t.Errorf("remaining = %d, want 2", rem)
+	}
+	// 空 key 永远放行。
+	if !l.Reserve("") {
+		t.Error("空 key 应放行")
+	}
+}
+
+// 并发预占：无论多少 goroutine 同时到达，成功预占（且不退还）的次数
+// 都不能超过 limit。这正是 Allow+Fail 先查后计做不到的。
+func TestAttemptLimiterReserveConcurrent(t *testing.T) {
+	const limit, workers = 5, 50
+	l := NewAttemptLimiter(limit, time.Minute)
+
+	var wg sync.WaitGroup
+	var granted atomic.Int64
+	start := make(chan struct{})
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			if l.Reserve("1.2.3.4") {
+				granted.Add(1)
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	if got := granted.Load(); got != limit {
+		t.Fatalf("granted = %d, want exactly %d", got, limit)
 	}
 }
