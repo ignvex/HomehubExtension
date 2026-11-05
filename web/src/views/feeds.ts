@@ -7,6 +7,7 @@ import { icon } from "../components/icons";
 import { h } from "../lib/dom";
 import { formatCount, formatDateTime, formatInterval, formatRelative } from "../lib/format";
 import { describeError } from "../lib/strings";
+import { safeHref } from "../lib/url";
 import type { ViewFactory } from "../router";
 
 interface FeedCallbacks {
@@ -25,12 +26,13 @@ function feedCard(feed: Feed, cb: FeedCallbacks): HTMLElement {
       ? `HTTP ${feed.last_status}`
       : "尚未抓取";
 
-  const siteLink = feed.site_url.trim()
+  const siteHref = safeHref(feed.site_url);
+  const siteLink = siteHref
     ? h(
         "a",
         {
           class: "feed-site",
-          attrs: { href: feed.site_url, target: "_blank", rel: "noopener noreferrer" },
+          attrs: { href: siteHref, target: "_blank", rel: "noopener noreferrer" },
         },
         icon("external"),
         "站点",

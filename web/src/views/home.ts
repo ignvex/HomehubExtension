@@ -6,6 +6,7 @@ import { appIcon, icon } from "../components/icons";
 import { h } from "../lib/dom";
 import { formatCount } from "../lib/format";
 import { describeError } from "../lib/strings";
+import { isSameOriginPath, safeHref } from "../lib/url";
 import type { ViewFactory } from "../router";
 import { unreadCount } from "../state/app-state";
 
@@ -60,13 +61,20 @@ function appCard(app: AppInfo): HTMLElement {
     );
   }
 
-  const external = !app.path.startsWith("/");
+  // path 来自服务端：站内路径原样使用，其它只放行 http(s) 绝对地址；
+  // 不安全时渲染成不可点击的卡片，而不是带着 javascript: 之类的 href。
+  const internal = isSameOriginPath(app.path);
+  const href = internal ? app.path : safeHref(app.path);
+  if (href === null) {
+    return h("div", { class: "app-card" }, ...body, badge);
+  }
+  const external = !internal;
   return h(
     "a",
     {
       class: "app-card",
       attrs: {
-        href: app.path,
+        href,
         ...(external ? { target: "_blank", rel: "noopener noreferrer" } : {}),
       },
     },

@@ -8,8 +8,10 @@ import {
   formatDateTime,
   formatRelative,
   nowSeconds,
+  parseTime,
 } from "../lib/format";
 import { describeError } from "../lib/strings";
+import { safeHref } from "../lib/url";
 import type { ViewFactory } from "../router";
 import { refreshUnreadCount } from "../state/app-state";
 
@@ -111,12 +113,13 @@ export const readerView: ViewFactory = (ctx) => {
         });
     });
 
-    const originalLink = entry.url.trim()
+    const originalHref = safeHref(entry.url);
+    const originalLink = originalHref
       ? h(
           "a",
           {
             class: "btn btn--sm",
-            attrs: { href: entry.url, target: "_blank", rel: "noopener noreferrer" },
+            attrs: { href: originalHref, target: "_blank", rel: "noopener noreferrer" },
           },
           icon("external"),
           "原文",
@@ -184,7 +187,8 @@ export const readerView: ViewFactory = (ctx) => {
             "time",
             {
               attrs: {
-                datetime: entry.published_at ?? entry.fetched_at,
+                // datetime 要求 ISO 8601，不能直接放 Unix 秒。
+                datetime: parseTime(entry.published_at ?? entry.fetched_at)?.toISOString(),
                 title: formatDateTime(entry.published_at ?? entry.fetched_at),
               },
             },
